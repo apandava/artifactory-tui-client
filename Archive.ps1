@@ -730,6 +730,7 @@ function Show-ArchiveTree([object]$item) {
     $forceKey    = $null   # when set, position the cursor on this key after a rebuild
     $notice      = @{ Message = ''; At = [DateTime]::MinValue }
     $previewMode = $false  # 'v' toggles the preview pane under file details
+    $pendingKc   = $null   # non-row key handed back by a coalesced up/down burst
 
     # Connector glyphs (char codes keep the file ASCII).
     $vert = "$([char]0x2502)   "; $gapS = '    '
@@ -772,6 +773,7 @@ function Show-ArchiveTree([object]$item) {
             Restrict-PreviewPrefetch $keepPv
             Start-PreviewPrefetch $tw.Reqs
             $tvKeys = $tw.Keys
+            Restrict-PreviewCache $keepPv   # bound the cache; the window is protected
             if (-not $script:CanRawKey -and $cur) {
                 $selKey = Get-NodePreviewKey $cur.Node
                 if (Test-PreviewLoading $selKey) { Wait-Preview $selKey 5000 }
@@ -946,14 +948,26 @@ function Show-ArchiveTree([object]$item) {
         # Poll (non-blocking) while a windowed preview is still loading so the pane
         # and badges fill in live; otherwise block for the next key. A timeout just
         # reaps and loops, redrawing with whatever has landed.
-        $kc = if ($previewMode -and $script:CanRawKey -and (Get-PreviewLoadingCount $tvKeys) -gt 0) {
-                  Read-KeyTimeoutCased 120
-              } else { Read-KeyCased }
+        if ($pendingKc) {
+            $kc = $pendingKc; $pendingKc = $null
+        } elseif ($previewMode -and $script:CanRawKey -and (Get-PreviewLoadingCount $tvKeys) -gt 0) {
+            $kc = Read-KeyTimeoutCased 120
+        } else {
+            # Idle: about to block for the next key. Free the background pools'
+            # runspaces if nothing is in flight; they reopen lazily on next use.
+            Receive-PreviewPrefetch
+            if ($script:PvJobs.Count -eq 0) { Close-PrefetchPools }
+            $kc = Read-KeyCased
+        }
         if ($null -eq $kc) { Receive-PreviewPrefetch; continue }
 
         switch -regex -casesensitive ($kc) {
-            '^(up|k)$'   { if ($cursor -gt 0)               { $cursor-- } }
-            '^(down|j)$' { if ($cursor -lt $rows.Count - 1) { $cursor++ } }
+            '^(up|k|down|j)$' {
+                # Coalesce a held up/down burst into one net cursor move so holding
+                # the key doesn't backlog renders (see Invoke-TreeRowBurst).
+                $d = if ($kc -cmatch '^(down|j)$') { 1 } else { -1 }
+                Invoke-TreeRowBurst ([ref]$cursor) $rows.Count ([ref]$pendingKc) $d
+            }
             '^home$'     { $cursor = 0 }
             '^end$'      { $cursor = $rows.Count - 1 }
             '^g$'        { $cursor = 0 }

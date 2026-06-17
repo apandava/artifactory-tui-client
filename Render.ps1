@@ -161,6 +161,59 @@ function Invoke-NavBurst([ref]$Page, [int]$TotalPages, [ref]$Pending) {
     }
 }
 
+# Coalesce a held-key row-movement burst (up/down, k/j) — the cursor-level analogue
+# of Invoke-NavBurst, and the fix for hold-to-scroll lag. Holding an arrow fills the
+# input buffer with repeats; applying and rendering every intermediate row builds a
+# backlog that keeps scrolling for a moment after the key is released. So we drain
+# all *buffered* row keys and apply their NET movement in one go, leaving a single
+# destination to render and warm. Movement is computed on the absolute item index
+# (page*PageSize + row), so a burst crosses page boundaries exactly like a single
+# step does and clamps at the ends. $InitialDelta is the move from the keypress that
+# triggered the burst (+1 down, -1 up), already counted so the caller needn't apply
+# it first. The first non-row key encountered is handed back via $Pending.
+function Invoke-RowBurst([ref]$Page, [ref]$SelRow, [int]$PageSize, [int]$TotalItems, [ref]$Pending, [int]$InitialDelta) {
+    $delta = $InitialDelta
+    $stop  = $false
+    while (-not $stop) {
+        $k = Read-KeyNow            # non-blocking; drains key-up events
+        if ($null -eq $k) { break }
+        switch -regex ($k) {
+            '^(down|j)$' { $delta++ }
+            '^(up|k)$'   { $delta-- }
+            default      { $Pending.Value = $k; $stop = $true }
+        }
+    }
+    if ($TotalItems -le 0 -or $PageSize -le 0) { return }
+    $abs = ($Page.Value * $PageSize) + $SelRow.Value + $delta
+    if ($abs -lt 0)                  { $abs = 0 }
+    if ($abs -gt ($TotalItems - 1))  { $abs = $TotalItems - 1 }
+    $Page.Value   = [int][Math]::Floor($abs / $PageSize)
+    $SelRow.Value = $abs - ($Page.Value * $PageSize)
+}
+
+# Flat-cursor analogue of Invoke-RowBurst for the archive tree (no paging — the
+# cursor just moves within $RowCount rows). Same coalescing so holding up/down
+# doesn't backlog. Uses the case-preserving poll since the tree distinguishes
+# shifted keys; the first non-row key is handed back via $Pending.
+function Invoke-TreeRowBurst([ref]$Cursor, [int]$RowCount, [ref]$Pending, [int]$InitialDelta) {
+    $delta = $InitialDelta
+    $stop  = $false
+    while (-not $stop) {
+        $k = Read-KeyNowCased       # non-blocking; drains key-up events
+        if ($null -eq $k) { break }
+        switch -regex -casesensitive ($k) {
+            '^(down|j)$' { $delta++ }
+            '^(up|k)$'   { $delta-- }
+            default      { $Pending.Value = $k; $stop = $true }
+        }
+    }
+    if ($RowCount -le 0) { return }
+    $c = $Cursor.Value + $delta
+    if ($c -lt 0)                 { $c = 0 }
+    if ($c -gt ($RowCount - 1))   { $c = $RowCount - 1 }
+    $Cursor.Value = $c
+}
+
 function Clear-Screen { Clear-Host }
 
 # Visible length of a string, ignoring ANSI SGR/escape sequences — so colored

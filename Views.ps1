@@ -12,8 +12,25 @@
 # url so a later download reuses it instead of re-fetching.
 $script:Visited      = New-Object 'System.Collections.Generic.HashSet[string]'
 $script:MemFiles     = @{}                                              # url -> [byte[]]
+$script:MemOrder     = [Collections.Generic.List[string]]::new()        # insertion order, for eviction
+$script:MemFilesCap  = 32                                               # max files held for download reuse
 $script:PreviewOK    = New-Object 'System.Collections.Generic.HashSet[string]'  # large files user opted to preview
 $script:PreviewLimit = 512000                                           # 0.5 MB preview cap
+
+# Cache a file's raw bytes by url so a later download can reuse them instead of
+# re-fetching, bounded to $MemFilesCap entries (oldest evicted first). The bytes
+# are the SAME array the preview cache holds (shared by reference, not copied), so
+# this adds only a dictionary entry, never a second copy of the file. Eviction
+# only means a re-fetch on a later download, which is user-initiated and rare.
+function Add-MemFile([string]$url, [byte[]]$bytes) {
+    if (-not $url -or $null -eq $bytes -or $script:MemFiles.ContainsKey($url)) { return }
+    $script:MemFiles[$url] = $bytes
+    $script:MemOrder.Add($url)
+    while ($script:MemOrder.Count -gt $script:MemFilesCap) {
+        $old = $script:MemOrder[0]; $script:MemOrder.RemoveAt(0)
+        [void]$script:MemFiles.Remove($old)
+    }
+}
 
 # Sentinel emitted by Get-PreviewLines in place of the preview's horizontal rule.
 # Two-pane compositors recognise it and draw a rule that joins the vertical pane
@@ -191,7 +208,7 @@ function Get-PreviewLines([string]$name, [string]$url, [long]$sizeBytes, [int]$p
     $bytes = $res.Bytes
     if ($null -eq $bytes) { $L.Add("${RD}Could not load file for preview.${R}"); return $L.ToArray() }
     # Seed the byte cache so a later download of this file reuses the fetch.
-    if (-not $script:MemFiles.ContainsKey($url)) { $script:MemFiles[$url] = $bytes }
+    Add-MemFile $url $bytes
     $text  = Convert-BytesToText $bytes
     $wrapped = Wrap-Text $text $paneW
     $shown = [Math]::Min($wrapped.Count, [Math]::Max(1, $maxLines))

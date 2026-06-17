@@ -237,7 +237,8 @@ $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
             Stop-Lookahead
         }
     } else {
-        Stop-Lookahead   # back in simple view
+        Stop-Lookahead    # back in simple view
+        Close-MetaPool    # simple view warms no metadata; free the pool's runspaces
     }
 
     # Background-warm previews (preview mode only), tiered like the page prefetch:
@@ -254,10 +255,15 @@ $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
         Start-PreviewLookahead $plan.RestReqs  # the rest, trickled nearest-first
         $pvKeys     = $plan.WindowKeys
         $pvPageKeys = $plan.AllKeys
+        # Trim the preview cache so a long skim doesn't pin every file ever viewed;
+        # this page's keys are protected from eviction.
+        $keepPvCache = @{}; foreach ($k in $pvPageKeys) { $keepPvCache[$k] = $true }
+        Restrict-PreviewCache $keepPvCache
     } else {
         Restrict-PreviewPrefetch @{}          # left preview mode: drop pending work
         Stop-PreviewLookahead
         Receive-PreviewPrefetch
+        Close-PreviewPool                     # free the preview pool's runspaces
     }
 
     # ISE / non-console hosts can't poll the keyboard, so the live fill-in loop
@@ -333,6 +339,8 @@ $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
                     }
                     $pvKeys     = $plan.WindowKeys
                     $pvPageKeys = $plan.AllKeys
+                    $keepPvCache = @{}; foreach ($k in $pvPageKeys) { $keepPvCache[$k] = $true }
+                    Restrict-PreviewCache $keepPvCache
                     $pvNow      = Get-PreviewLoadedCount $pvPageKeys
                     if ($pvNow -ne $pvLoaded) { $pvLoaded = $pvNow; $redraw = $true }
                 }
@@ -346,6 +354,12 @@ $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
             }
             $idleTicks = 0   # a real keypress interrupts the chase
         } else {
+            # Idle: nothing left to poll for, about to block for the next key.
+            # Release the background pools' worker runspaces (tens of MB each in
+            # PS 5.1); they reopen lazily on the next page turn. Gated on no pooled
+            # fetch in flight so an active ahead-prefetch is never aborted.
+            Receive-Prefetch; Receive-PreviewPrefetch
+            if ($script:PfJobs.Count -eq 0 -and $script:PvJobs.Count -eq 0) { Close-PrefetchPools }
             $key = Read-Key
         }
 
@@ -366,14 +380,12 @@ $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
                 if ($page -ne $before) { $selRow = 0 }
                 if ($page -ne $before -or $pendingKey) { break nav }
             }
-            '^(up|k)$' {
-                if ($selRow -gt 0)            { $selRow-- }
-                elseif ($page -gt 0)          { $page--; $selRow = $PageSize - 1 }
-                break nav
-            }
-            '^(down|j)$' {
-                if ($selRow -lt $pageItems.Count - 1)  { $selRow++ }
-                elseif ($page -lt $totalPages - 1)     { $page++; $selRow = 0 }
+            '^(up|k|down|j)$' {
+                # Coalesce a held up/down burst into one net move (see Invoke-RowBurst)
+                # so holding the key doesn't backlog renders. The move that triggered
+                # this case is passed as the initial delta.
+                $d = if ($key -match '^(down|j)$') { 1 } else { -1 }
+                Invoke-RowBurst ([ref]$page) ([ref]$selRow) $PageSize $totalItems ([ref]$pendingKey) $d
                 break nav
             }
             '^(enter|o)$' {
@@ -417,5 +429,6 @@ $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
 
 Stop-Lookahead          # signal the background trickles to stop (process exit reclaims the rest)
 Stop-PreviewLookahead
+Close-PrefetchPools     # release the pools' worker runspaces
 
 Clear-Screen

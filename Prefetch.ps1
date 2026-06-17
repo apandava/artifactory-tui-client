@@ -77,7 +77,11 @@ function Start-Prefetch([object[]]$Items) {
         $u = $it.Uri
         if ($script:MetaCache.ContainsKey($u) -or $script:PfQueued.ContainsKey($u)) { continue }
         if ($null -eq $script:PfPool) {
-            $script:PfPool = [RunspaceFactory]::CreateRunspacePool(1, 10)
+            # Ceiling kept modest: each open worker runspace is a near-complete
+            # engine copy (tens of MB in PS 5.1), and metadata fetches are short,
+            # so a handful of concurrent requests fills the current page about as
+            # fast as ten would while holding far less memory.
+            $script:PfPool = [RunspaceFactory]::CreateRunspacePool(1, 4)
             $script:PfPool.Open()
         }
         $ps = [PowerShell]::Create()
@@ -175,6 +179,17 @@ $script:PreviewCache = [hashtable]::Synchronized(@{})   # key -> result (bg-writ
 $script:PvPool   = $null
 $script:PvJobs   = [Collections.Generic.List[object]]::new()
 $script:PvQueued = @{}   # keys in flight (main-thread only)
+
+# Bound on resolved preview entries kept in $PreviewCache. Each entry can hold a
+# file's bytes (up to the 512 KB cap, or larger if the user opted in via [y]) or
+# an archive's node listing; without a cap the cache grows for the whole session
+# as the user skims pages, pinning tens of MB that will never be looked at again.
+# Restrict-PreviewCache (below) trims it to this many entries. Insertion order is
+# tracked main-thread-side in $PvOrder so the oldest, off-screen entries are the
+# ones evicted; $PvOrderSet mirrors it for O(1) membership tests.
+$script:PreviewCap = 48
+$script:PvOrder    = [Collections.Generic.List[string]]::new()
+$script:PvOrderSet = New-Object 'System.Collections.Generic.HashSet[string]'
 
 function Get-FilePreviewKey([string]$url) { "F|$url" }
 function Get-ArcPreviewKey([string]$uri)  { "A|$uri" }
@@ -288,7 +303,10 @@ function Start-PreviewPrefetch($Requests) {
         $k = $rq.Key
         if ($script:PreviewCache.ContainsKey($k) -or $script:PvQueued.ContainsKey($k)) { continue }
         if ($null -eq $script:PvPool) {
-            $script:PvPool = [RunspaceFactory]::CreateRunspacePool(1, 6)
+            # Modest ceiling for the same reason as the metadata pool (see there):
+            # the highlighted row plus its nearest neighbours warm fast enough with
+            # a few workers, and the lookahead trickle covers the rest of the page.
+            $script:PvPool = [RunspaceFactory]::CreateRunspacePool(1, 3)
             $script:PvPool.Open()
         }
         $ps = [PowerShell]::Create()
@@ -304,6 +322,49 @@ function Start-PreviewPrefetch($Requests) {
         $script:PvJobs.Add([PSCustomObject]@{ PS = $ps; Handle = $ps.BeginInvoke(); Key = $k })
         $script:PvQueued[$k] = $true
     }
+}
+
+# Trim the resolved-preview cache to $PreviewCap entries, evicting oldest-first
+# but never a key in $Keep (the on-screen page/window), so what the user is
+# looking at is always retained and only off-screen history is reclaimed. The
+# cache is written by background workers, so keys they added since the last call
+# are reconciled into the order tracker first; the .Keys snapshot is taken under
+# the sync root because enumerating a synchronized hashtable while a worker is
+# adding to it can otherwise throw. Call from the main thread.
+#
+# Order note: a plain hashtable doesn't preserve insertion order, so keys added
+# between two calls reconcile in arbitrary (hash) order *relative to each other*.
+# Because this runs on every render/tick, those batches are one page at a time,
+# and the keep-set protects the whole current page — so eviction only ever reaches
+# keys from earlier batches (older pages), which is correct oldest-page-first. The
+# arbitrary order applies only within a batch, where the keys are either all kept
+# or all evictable, so it never changes which page is dropped.
+function Restrict-PreviewCache([hashtable]$Keep) {
+    $snapshot = $null
+    $sr = $script:PreviewCache.SyncRoot
+    [System.Threading.Monitor]::Enter($sr)
+    try { $snapshot = @($script:PreviewCache.Keys) } finally { [System.Threading.Monitor]::Exit($sr) }
+
+    foreach ($k in $snapshot) {
+        if (-not $script:PvOrderSet.Contains($k)) {
+            [void]$script:PvOrderSet.Add($k); $script:PvOrder.Add($k)
+        }
+    }
+    if ($script:PvOrder.Count -le $script:PreviewCap) { return }
+
+    $keep    = if ($Keep) { $Keep } else { @{} }
+    $evictBy = $script:PvOrder.Count - $script:PreviewCap
+    $kept    = [Collections.Generic.List[string]]::new()
+    foreach ($k in $script:PvOrder) {
+        if ($evictBy -gt 0 -and -not $keep.ContainsKey($k)) {
+            [void]$script:PreviewCache.Remove($k)   # synchronized: atomic
+            [void]$script:PvOrderSet.Remove($k)
+            $evictBy--
+        } else {
+            $kept.Add($k)
+        }
+    }
+    $script:PvOrder = $kept
 }
 
 # True if $key names a preview that's loadable but not yet resolved (in flight or
@@ -485,4 +546,44 @@ function Get-NodePreviewWindow($rows, [int]$cursor, [int]$radius = 4) {
     }
     return [PSCustomObject]@{ Reqs = @($reqs.ToArray()); Keys = @($keys.ToArray()) }
 }
+
+# ── POOL LIFECYCLE ────────────────────────────────────────────────────────────
+# Each open worker runspace in a pool is a near-complete engine copy (tens of MB
+# of working set in PS 5.1), and under fast skimming the pools grow to their
+# ceiling and then sit open for the rest of the session. These helpers release a
+# pool when its view no longer needs it: simple view warms nothing, leaving
+# preview mode frees the preview pool, and pausing on a fully-warmed page frees
+# both. Any in-flight pooled jobs are aborted first (aborting a mid-flight fetch
+# just frees a slot); the cancel flag / cache are untouched. Both pools reopen
+# lazily on next use (Start-Prefetch / Start-PreviewPrefetch), so teardown is
+# always safe — the only cost is a one-time pool-open (~tens of ms) on the next
+# page that needs it, invisible next to the network fetch it precedes.
+
+function Close-MetaPool {
+    foreach ($j in $script:PfJobs) {
+        try { [void]$j.PS.Stop() } catch { }
+        try { $j.PS.Dispose() }    catch { }
+    }
+    $script:PfJobs.Clear(); $script:PfQueued.Clear()
+    if ($script:PfPool) {
+        try { $script:PfPool.Close() }   catch { }
+        try { $script:PfPool.Dispose() } catch { }
+        $script:PfPool = $null
+    }
+}
+
+function Close-PreviewPool {
+    foreach ($j in $script:PvJobs) {
+        try { [void]$j.PS.Stop() } catch { }
+        try { $j.PS.Dispose() }    catch { }
+    }
+    $script:PvJobs.Clear(); $script:PvQueued.Clear()
+    if ($script:PvPool) {
+        try { $script:PvPool.Close() }   catch { }
+        try { $script:PvPool.Dispose() } catch { }
+        $script:PvPool = $null
+    }
+}
+
+function Close-PrefetchPools { Close-MetaPool; Close-PreviewPool }
 
