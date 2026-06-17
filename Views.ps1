@@ -1,0 +1,594 @@
+# Views.ps1 — part of the ARTCA Artifactory TUI (see StartTui.ps1).
+#
+# This file holds function and $script:-state definitions only; nothing here runs
+# on its own. It is loaded two ways:
+#   · dot-sourced automatically by StartTui.ps1 when the tool is run as a file, or
+#   · pasted directly into the PowerShell console (paste the component files first,
+#     then StartTui.ps1 last) to run the tool without executing the .ps1 files.
+# Load order among the component files does not matter.
+# ── VISITED + PREVIEW STATE ───────────────────────────────────────────────────
+# Items the user has opened/viewed/downloaded (keys: storage uri or download url),
+# rendered washed-out afterwards. Preview content is cached in memory by download
+# url so a later download reuses it instead of re-fetching.
+$script:Visited      = New-Object 'System.Collections.Generic.HashSet[string]'
+$script:MemFiles     = @{}                                              # url -> [byte[]]
+$script:PreviewOK    = New-Object 'System.Collections.Generic.HashSet[string]'  # large files user opted to preview
+$script:PreviewLimit = 512000                                           # 0.5 MB preview cap
+
+# Sentinel emitted by Get-PreviewLines in place of the preview's horizontal rule.
+# Two-pane compositors recognise it and draw a rule that joins the vertical pane
+# separator with a T-junction (instead of a bare dash row floating beside it).
+# NUL-wrapped so it can never collide with real content.
+$script:PaneRuleTag = "$([char]0)PANE_RULE$([char]0)"
+
+# Sentinel placed in the LEFT pane (after the column header) to request a header
+# divider that joins the vertical pane separator from the left with a ┤. Mirror of
+# $PaneRuleTag for the opposite pane; NUL-wrapped for the same reason.
+$script:HeaderRuleTag = "$([char]0)HDR_RULE$([char]0)"
+
+function Mark-Visited([string]$key) { if ($key) { [void]$script:Visited.Add($key) } }
+function Test-Visited([string]$key) { return ($key -and $script:Visited.Contains($key)) }
+
+# Apply a background to a whole row so the highlight survives the per-cell resets:
+# re-assert the background after every reset, then pad to width under it. No-op on
+# non-VT hosts (where $R is empty and the regex would misbehave).
+function Highlight-Row([string]$s, [int]$width) {
+    if (-not $script:Vt) { return $s }
+    # Fit to exactly $width first (ANSI-safe), then re-assert the background after
+    # every reset so the highlight spans the whole row without overflowing it.
+    $t = (Fit-Vis $s $width) -replace ([regex]::Escape($R)), "$R$SB"
+    return "$SB$t$R"
+}
+
+# Constructed download URL for a search item (repo/path/name under the REST base).
+function Get-ItemUrl($item) {
+    $repo = if ($item.Repo) { $item.Repo } else { '' }
+    $seg  = if ($item.Path) { "$($item.Path)/" } else { '' }
+    return "$(Get-ArtBase)/$repo/$seg$($item.Name)"
+}
+
+# Extensions we treat as human-readable text (previewable).
+$script:TextExts = @(
+    'txt','text','log','md','markdown','rst','adoc','asciidoc','me','readme','nfo',
+    'html','htm','xhtml','xml','xsl','xslt','svg','rss','atom','wsdl','plist',
+    'json','json5','jsonl','ndjson','yaml','yml','toml','ini','cfg','conf','config',
+    'properties','props','env','editorconfig','gitignore','gitattributes','dockerignore',
+    'csv','tsv','tab',
+    'cmd','bat','ps1','psm1','psd1','sh','bash','zsh','fish','ksh','command',
+    'py','pyw','rb','pl','pm','php','phtml','tcl','lua','r','jl','groovy','gradle',
+    'js','mjs','cjs','jsx','ts','tsx','vue','svelte','coffee',
+    'css','scss','sass','less','styl',
+    'java','kt','kts','scala','clj','cljs','cljc','edn','go','rs','swift','m','mm',
+    'c','h','cc','cpp','cxx','hpp','hh','hxx','cs','fs','fsx','vb','d','dart','nim','zig',
+    'ex','exs','erl','hrl','hs','lhs','ml','mli','elm','rkt','scm','lisp','el',
+    'sql','graphql','gql','proto','thrift','avsc',
+    'tf','tfvars','hcl','bicep','tpl','jinja','j2','mustache','hbs','ejs','erb','haml','slim',
+    'make','mk','mak','cmake','am','in','spec','rake','gemspec','podspec','cabal',
+    'asm','s','vhd','vhdl','v','sv','verilog',
+    'tex','bib','sty','cls','rtf','org','textile','wiki','pod',
+    'srt','vtt','sub','ass','ssa','lrc','cue','m3u','m3u8','pls',
+    'diff','patch','reg','desktop','service','manifest','mf','sf','classpath','project',
+    'pom','sbt','lock','sum','mod','gradle','npmrc','yarnrc','babelrc','eslintrc',
+    'prettierrc','dockerfile','procfile','makefile','jenkinsfile','vagrantfile','gemfile'
+)
+
+function Get-IsPreviewable([string]$name) {
+    $ext = (Get-Ext $name).ToLower()
+    if ($ext -and ($script:TextExts -contains $ext)) { return $true }
+    # Extensionless but well-known text filenames.
+    $bare = $name.ToLower()
+    return @('dockerfile','makefile','jenkinsfile','vagrantfile','procfile','gemfile',
+             'license','readme','changelog','authors','notice','copying','install',
+             'manifest','rakefile','gemfile.lock') -contains $bare
+}
+
+# Fetch raw bytes for a url (no caching). $null on failure.
+function Get-FileBytes([string]$url) {
+    $old = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+    try {
+        $resp = Invoke-WebRequest -Uri $url -Headers (Get-AuthHeaders) -UseBasicParsing -ErrorAction Stop
+        if ($resp.RawContentStream) { return $resp.RawContentStream.ToArray() }
+        if ($resp.Content -is [byte[]]) { return [byte[]]$resp.Content }
+        return [Text.Encoding]::UTF8.GetBytes([string]$resp.Content)
+    } catch { return $null }
+    finally { $ProgressPreference = $old }
+}
+
+
+# Decode bytes to text (UTF-8, BOM-aware).
+function Convert-BytesToText([byte[]]$bytes) {
+    if ($null -eq $bytes -or $bytes.Length -eq 0) { return '' }
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        return [Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+    }
+    return [Text.Encoding]::UTF8.GetString($bytes)
+}
+
+# Word-wrap text to $width columns, hard-breaking tokens longer than the width and
+# stripping control chars. Returns an array of lines.
+function Wrap-Text([string]$s, [int]$width) {
+    if ($width -lt 1) { $width = 1 }
+    $out = [Collections.Generic.List[string]]::new()
+    $s = ($s -replace "`t", '    ') -replace "`r", ''
+    foreach ($line in ($s -split "`n")) {
+        $clean = ($line -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', '')
+        if ($clean -eq '') { $out.Add(''); continue }
+        $cur = ''
+        foreach ($word in ($clean -split ' ')) {
+            $tok = $word
+            while ($tok.Length -gt $width) {
+                if ($cur -ne '') { $out.Add($cur); $cur = '' }
+                $out.Add($tok.Substring(0, $width)); $tok = $tok.Substring($width)
+            }
+            if ($cur -eq '') { $cur = $tok }
+            elseif (($cur.Length + 1 + $tok.Length) -le $width) { $cur = "$cur $tok" }
+            else { $out.Add($cur); $cur = $tok }
+        }
+        $out.Add($cur)
+    }
+    return $out.ToArray()
+}
+
+# Render a right-pane horizontal divider that joins the vertical pane separator
+# with a T-junction (├), so it reads as one connected rule rather than a dash row
+# floating a column to the right of the separator. $leftW is the left pane width
+# (where the separator sits); $rightW is the right pane the rule spans.
+function Format-PaneRule([string]$leftCell, [int]$leftW, [int]$rightW) {
+    $tee = [char]0x251C; $hz = [char]0x2500
+    return "$(Fit-Vis $leftCell $leftW) ${DM}$tee$([string]$hz * ([Math]::Max(1, $rightW + 1)))${R}"
+}
+
+# Render a left-pane horizontal divider (between the column header and the rows)
+# that joins the vertical pane separator from the left with a ┤, so it reads as one
+# connected rule. Spans the left pane; $rightCell is whatever the right pane shows
+# on this row (drawn unchanged to the right of the junction). $leftW is the left
+# pane width (the separator sits at $leftW + 1).
+function Format-HeaderRule([string]$rightCell, [int]$leftW) {
+    $tee = [char]0x2524; $hz = [char]0x2500
+    return "${DM}$([string]$hz * ($leftW + 1))$tee${R} $rightCell"
+}
+
+# Preview-pane block showing a single explanatory message in place of contents
+# (e.g. a nested sub-archive that can't be browsed). Same shape as Get-PreviewLines
+# — a $PaneRuleTag divider, the "Preview" header, then the wrapped message — so the
+# two-pane compositor connects the divider to the pane separator.
+function Get-PreviewMessageLines([string]$msg, [int]$paneW) {
+    $L = [Collections.Generic.List[string]]::new()
+    $L.Add($script:PaneRuleTag)
+    $L.Add("${BD}${YL}Preview${R}")
+    foreach ($wl in (Wrap-Text $msg $paneW)) { $L.Add("${DM}$wl${R}") }
+    return $L.ToArray()
+}
+
+# Build the preview-section lines for a file: a "Preview" header then either the
+# wrapped contents, or a message (not previewable / large / failed). $sizeBytes is
+# -1 when unknown. Honours the size cap unless the url is in $PreviewOK.
+# The leading divider is emitted as $PaneRuleTag so the two-pane compositor can
+# connect it to the pane separator (see Format-PaneRule).
+function Get-PreviewLines([string]$name, [string]$url, [long]$sizeBytes, [int]$paneW, [int]$maxLines) {
+    $L = [Collections.Generic.List[string]]::new()
+    $L.Add($script:PaneRuleTag)
+    $L.Add("${BD}${YL}Preview${R}")
+    if (-not (Get-IsPreviewable $name)) {
+        $L.Add("${DM}This file format can't be previewed.${R}")
+        return $L.ToArray()
+    }
+    $tooBig = ($sizeBytes -gt $script:PreviewLimit) -or ($sizeBytes -lt 0)
+    if ($tooBig -and -not $script:PreviewOK.Contains($url)) {
+        $szTxt = if ($sizeBytes -ge 0) { Format-Size $sizeBytes } else { 'unknown size' }
+        $L.Add("${YL}Large file ($szTxt).${R}")
+        $L.Add("${DM}Press [y] to preview it anyway.${R}")
+        return $L.ToArray()
+    }
+    # Contents come from the background preview cache (warmed by the nav loop); the
+    # pane shows a loading line until the fetch lands, never blocking input.
+    $key = Get-FilePreviewKey $url
+    if (-not $script:PreviewCache.ContainsKey($key)) {
+        $L.Add("${DM}Loading preview...${R}"); return $L.ToArray()
+    }
+    $res = $script:PreviewCache[$key]
+    if (-not $res.Ok) { $L.Add("${RD}$($res.Error)${R}"); return $L.ToArray() }
+    $bytes = $res.Bytes
+    if ($null -eq $bytes) { $L.Add("${RD}Could not load file for preview.${R}"); return $L.ToArray() }
+    # Seed the byte cache so a later download of this file reuses the fetch.
+    if (-not $script:MemFiles.ContainsKey($url)) { $script:MemFiles[$url] = $bytes }
+    $text  = Convert-BytesToText $bytes
+    $wrapped = Wrap-Text $text $paneW
+    $shown = [Math]::Min($wrapped.Count, [Math]::Max(1, $maxLines))
+    for ($i = 0; $i -lt $shown; $i++) { $L.Add($wrapped[$i]) }
+    if ($wrapped.Count -gt $shown) { $L.Add("${DM}$script:Cut ($($wrapped.Count - $shown) more lines)${R}") }
+    return $L.ToArray()
+}
+
+# Recursively render an archive's nodes as an indented tree listing, appending
+# display lines to $acc. Folders are expanded only down to $maxDepth levels (the
+# preview is a glimpse, not the full browser — use the tree view for deeper
+# navigation); deeper folders are still listed, just not descended into. Folder
+# names are magenta, files cyan; each line is truncated to $paneW. Stops once $acc
+# reaches $cap rows so a huge archive doesn't build thousands of lines just to be
+# trimmed. (Uses the archive-node accessors defined further down; resolved at call
+# time.) $depth is the 1-based level of $nodes.
+function Add-ArcListingLines($nodes, [string]$prefix, $acc, [int]$paneW, [int]$cap, [int]$depth = 1, [int]$maxDepth = 2) {
+    $sorted = @(Sort-Nodes $nodes)
+    for ($i = 0; $i -lt $sorted.Count; $i++) {
+        if ($acc.Count -ge $cap) { return }
+        $n        = $sorted[$i]
+        $isLast   = ($i -eq $sorted.Count - 1)
+        $isFolder = Get-NodeIsFolder $n
+        $branch   = if ($isLast) { "$([char]0x2514)$([char]0x2500)$([char]0x2500) " }
+                    else         { "$([char]0x251C)$([char]0x2500)$([char]0x2500) " }
+        $name = Get-NodeName $n
+        $disp = if ($isFolder) { "$name/" } else { $name }
+        $disp = Trunc $disp ([Math]::Max(1, $paneW - $prefix.Length - $branch.Length))
+        $col  = if ($isFolder) { $MG } else { $CY }
+        $acc.Add("${DM}$prefix$branch${R}${col}$disp${R}")
+        if ($isFolder -and $depth -lt $maxDepth) {
+            $childPrefix = $prefix + $(if ($isLast) { '    ' } else { "$([char]0x2502)   " })
+            Add-ArcListingLines (Get-NodeChildren $n) $childPrefix $acc $paneW $cap ($depth + 1) $maxDepth
+        }
+    }
+}
+
+# Preview-pane lines for a listable archive: an "Archive preview" header then a
+# shallow tree listing of its entries (fetched once and cached by item uri).
+# Mirrors the shape of Get-PreviewLines (leading $PaneRuleTag so the divider
+# connects).
+function Get-ArchivePreviewLines($item, [int]$paneW, [int]$maxLines) {
+    $L = [Collections.Generic.List[string]]::new()
+    $L.Add($script:PaneRuleTag)
+    $L.Add("${BD}${YL}Archive preview${R}")
+    # Entry listing comes from the background preview cache (warmed by the nav loop).
+    $key = Get-ArcPreviewKey ([string]$item.Uri)
+    if (-not $script:PreviewCache.ContainsKey($key)) {
+        $L.Add("${DM}Loading preview...${R}"); return $L.ToArray()
+    }
+    $tree = $script:PreviewCache[$key]
+    if (-not $tree.Ok) {
+        $L.Add("${RD}Could not read archive.${R}")
+        if ($tree.Error) { foreach ($wl in (Wrap-Text ([string]$tree.Error) $paneW)) { $L.Add("${DM}$wl${R}") } }
+        return $L.ToArray()
+    }
+    $cap  = [Math]::Max(1, $maxLines)
+    $rows = [Collections.Generic.List[string]]::new()
+    Add-ArcListingLines @($tree.Nodes) '' $rows $paneW ($cap + 1)
+    if ($rows.Count -eq 0) { $L.Add("${DM}(empty archive)${R}"); return $L.ToArray() }
+    $shown = [Math]::Min($rows.Count, $cap)
+    for ($i = 0; $i -lt $shown; $i++) { $L.Add($rows[$i]) }
+    if ($rows.Count -gt $shown) { $L.Add("${DM}$script:Cut ($($rows.Count - $shown) more)${R}") }
+    return $L.ToArray()
+}
+
+# Evenly distribute footer hint segments across $width (justified), so the key
+# tooltips span the window instead of crowding the left.
+function Join-Justified([string[]]$Segments, [int]$width) {
+    $segs = @($Segments)
+    if ($segs.Count -eq 0) { return '' }
+    $lead = 2
+    $textLen = 0; foreach ($s in $segs) { $textLen += (Vis-Len $s) }
+    if ($segs.Count -eq 1) { return (' ' * $lead) + $segs[0] }
+    $gaps  = $segs.Count - 1
+    $slack = $width - $lead - $textLen
+    if ($slack -lt $gaps) { return (' ' * $lead) + ($segs -join '   ') }   # too tight; simple
+    $base  = [Math]::Floor($slack / $gaps); $extra = $slack - ($base * $gaps)
+    $sb = [Text.StringBuilder]::new(); [void]$sb.Append(' ' * $lead)
+    for ($i = 0; $i -lt $segs.Count; $i++) {
+        [void]$sb.Append($segs[$i])
+        if ($i -lt $gaps) { $g = $base; if ($i -lt $extra) { $g++ }; [void]$sb.Append(' ' * $g) }
+    }
+    return $sb.ToString()
+}
+
+# ── DISPLAY ───────────────────────────────────────────────────────────────────
+
+# Build a fixed-width ($nameW) name cell, left-aligned and padded to the column
+# edge, with an optional one-char badge placed immediately after the name text:
+# '+' for a browsable archive, '·' for a previewable file. Space for the badge is
+# reserved before truncating, so even an ellipsised long name still shows it.
+# In preview mode the badge starts dim (grey) and turns yellow once that item's
+# preview has loaded in the background; elsewhere it's always yellow.
+function Format-NameCell([object]$item, [int]$nameW, [bool]$vis, [bool]$preview = $false) {
+    $name = [string]$item.Name
+    # A preview/fetch error (e.g. blacked-out repo) flags the whole cell red.
+    $errored = Test-ItemPreviewError $item
+    $col  = if ($errored) { $RD } elseif ($vis) { $DM } else { $CY }
+    if     (Get-IsArchive $name)     { $glyph = $script:ArcGlyph }
+    elseif (Get-IsPreviewable $name) { $glyph = $script:PreviewGlyph }
+    else   { return "${col}$(Clip $name $nameW)${R}" }
+
+    $gcol = if ($errored) { $RD }
+            elseif ($vis) { $DM }
+            elseif ($preview) {
+                $k = Get-ItemPreviewKey $item
+                if ($k -and $script:PreviewCache.ContainsKey($k)) { $YL } else { $DM }
+            } else { $YL }
+
+    $avail = [Math]::Max(1, $nameW - 2)          # reserve " <glyph>"
+    $txt   = Trunc $name $avail                  # ellipsis if too long, no padding
+    $pad   = [Math]::Max(0, $nameW - $txt.Length - 2)
+    return "${col}${txt}${R}${gcol} ${glyph}${R}$(' ' * $pad)"
+}
+
+# Build one detailed-mode data row (no gutter), sized to fit $colW. Columns are
+# packed with single-space gaps to minimise wasted space. Visited rows render
+# washed-out (dim).
+# In preview mode only #, Name, Type, Size, Modified are shown (the right pane
+# carries repo/path/etc.); Name takes all the freed width.
+function Format-DetailedRow($item, [int]$Number, [int]$colW, [bool]$vis, [bool]$preview = $false) {
+    $numW = 4; $typeW = 5; $sizeW = 9; $modW = 10; $rtypeW = 6; $ptypeW = 8
+    $repoW = [Math]::Min(16, [Math]::Max(8, [int]($colW * 0.14)))
+    if ($preview) {
+        $nameW = [Math]::Max(10, $colW - ($numW + $typeW + $sizeW + $modW + 8))  # 4 gaps + 2 gutter + 2 margin
+        $pathW = 0
+    } else {
+        $fixed = $numW + $typeW + $sizeW + $modW + $repoW + $rtypeW + $ptypeW + 12  # 8 gaps + 2 gutter + 2 margin
+        $rest  = [Math]::Max(12, $colW - $fixed)
+        $nameW = [Math]::Max(10, [int]($rest * 0.55))
+        $pathW = [Math]::Max(0, $rest - $nameW)
+    }
+
+    $name = if ($item.Name) { $item.Name } else { '?' }
+    $type = [string]$item.FileType
+    $size = if ("$($item.Size)" -ne '') { Format-Size $item.Size } else { '?' }
+    $modified = if ($item.Modified) { $item.Modified.Substring(0, [Math]::Min(10, $item.Modified.Length)) } else { '?' }
+
+    # Visited rows wash the whole line out: every field (and the badge) goes dim.
+    $cType = if ($vis) { $DM } else { $YL }
+    $cDim  = if ($vis) { $DM } else { '' }      # size/rtype: normally default color
+    $cRepo = if ($vis) { $DM } else { $MG }
+
+    $nameCell = Format-NameCell $item $nameW $vis $preview
+    $cells = @(
+        "${DM}$(ClipR ([string]$Number) $numW)${R}",
+        $nameCell,
+        "${cType}$(Clip $type $typeW)${R}",
+        "${cDim}$(ClipR $size $sizeW)${R}",
+        "${DM}$(Clip $modified $modW)${R}"
+    )
+    if (-not $preview) {
+        $repo  = if ($item.Repo) { $item.Repo } else { '?' }
+        $rmeta = Resolve-Repo $repo
+        $cells += "${cRepo}$(Clip $repo $repoW)${R}"
+        $cells += "${cDim}$(Clip ([string]$rmeta.Type) $rtypeW)${R}"
+        $cells += "${cRepo}$(Clip ([string]$rmeta.PackageType) $ptypeW)${R}"
+        if ($pathW -gt 0) { $cells += "${DM}$(Clip ([string]$item.Path) $pathW)${R}" }
+    }
+    return ($cells -join ' ')
+}
+
+function Format-DetailedHeader([int]$colW, [bool]$preview = $false) {
+    $numW = 4; $typeW = 5; $sizeW = 9; $modW = 10; $rtypeW = 6; $ptypeW = 8
+    $repoW = [Math]::Min(16, [Math]::Max(8, [int]($colW * 0.14)))
+    if ($preview) {
+        $nameW = [Math]::Max(10, $colW - ($numW + $typeW + $sizeW + $modW + 8))  # match Format-DetailedRow
+        $hdr = @((ClipR '#' $numW), (Clip 'Name' $nameW), (Clip 'Type' $typeW), (ClipR 'Size' $sizeW),
+                 (Clip 'Modified' $modW))
+    } else {
+        $fixed = $numW + $typeW + $sizeW + $modW + $repoW + $rtypeW + $ptypeW + 18
+        $rest  = [Math]::Max(12, $colW - $fixed)
+        $nameW = [Math]::Max(10, [int]($rest * 0.55))
+        $pathW = [Math]::Max(0, $rest - $nameW)
+        $hdr = @((ClipR '#' $numW), (Clip 'Name' $nameW), (Clip 'Type' $typeW), (ClipR 'Size' $sizeW),
+                 (Clip 'Modified' $modW), (Clip 'Repo' $repoW), (Clip 'RType' $rtypeW), (Clip 'PType' $ptypeW))
+        if ($pathW -gt 0) { $hdr += (Clip 'Path' $pathW) }
+    }
+    return "${BD}${YL}$($hdr -join ' ')${R}"
+}
+
+function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
+                   [int]$TotalPages, [int]$TotalItems, [int]$Offset,
+                   [string]$Mode = 'simple', [int]$SelRow = -1) {
+
+    if ($null -eq $Items) { $Items = @() }
+    $w = ((Get-Width) - 1)
+    $detailed = ($Mode -eq 'detailed' -or $Mode -eq 'preview')
+    $preview  = ($Mode -eq 'preview')
+    $L = [Collections.Generic.List[string]]::new()
+
+    # Header bar.
+    $title = '  ARTCA  Artifactory Search  '
+    $url   = $BaseUrl
+    $avail = $w - $title.Length - 4
+    if ($url.Length -gt $avail) { $url = Clip $url ([Math]::Max(1, $avail)) }
+    $right = "  $url  "
+    $gap   = [Math]::Max(0, $w - $title.Length - $right.Length)
+    $L.Add("${HB}${BD}${MG}${title}${R}${HB}$(' ' * $gap)${DM}${right}${R}")
+    $L.Add("$DM$(HR $w)$R")
+    $pageStr = "Page $($Page + 1) of $TotalPages  ($TotalItems result$(if ($TotalItems -ne 1) {'s'}))"
+    $rPad    = [Math]::Max(0, $w - 9 - $Query.Length - $pageStr.Length)
+    $L.Add("  Query: ${BD}${CY}${Query}${R}$(' ' * $rPad)${DM}${pageStr}${R}")
+    $al = $script:Alert
+    if ($al.Message -and ([DateTime]::UtcNow - $al.At).TotalSeconds -lt 60) {
+        $L.Add("  ${RD}${BD}! $(Trunc $al.Message ($w - 4))${R}")
+    }
+    $fl = $script:Flash
+    if ($fl.Message -and ([DateTime]::UtcNow - $fl.At).TotalSeconds -lt 15) {
+        $L.Add("  $($fl.Message)")
+    }
+
+    # Column area width — narrower in preview mode to make room for the pane.
+    $rightW = if ($preview) { [Math]::Max(28, [int]($w * 0.40)) } else { 0 }
+    $colW   = if ($preview) { $w - $rightW - 3 } else { $w }
+
+    # Build the column header + data rows (each row already includes its gutter).
+    if ($detailed) { $hdrLine = Format-DetailedHeader $colW $preview }
+    else {
+        # Budget: gutter(2) + num + 3 single-space gaps = 5 overhead columns.
+        $numW = 4; $repoW = 22
+        $avail = [Math]::Max(20, $colW - $numW - $repoW - 8)   # 3 gaps + 2 gutter + margin
+        $nameW = [Math]::Max(16, [int]($avail * 0.55))
+        $pathW = [Math]::Max(8, $avail - $nameW)
+        $hdrLine = "${BD}${YL}$(ClipR '#' $numW) $(Clip 'Name' $nameW) $(Clip 'Repository' $repoW) $(Clip 'Path' $pathW)${R}"
+    }
+
+    $rowStrs = [Collections.Generic.List[string]]::new()
+    # NB: do NOT name the loop var $r — PowerShell is case-insensitive, so $r would
+    # alias $R (the ANSI reset) and corrupt every ${R} in this function.
+    for ($ri = 0; $ri -lt $Items.Count; $ri++) {
+        $item = $Items[$ri]
+        $vis  = Test-Visited ([string]$item.Uri)
+        $sel  = ($ri -eq $SelRow)
+        if ($detailed) {
+            $rowBody = Format-DetailedRow $item ($Offset + $ri + 1) $colW $vis $preview
+        } else {
+            # Simple view shows no archive/preview badges (detailed/preview only).
+            $name = if ($item.Name) { $item.Name } else { '?' }
+            $repo = if ($item.Repo) { $item.Repo } else { '?' }
+            $cName = if (Test-ItemPreviewError $item) { $RD } elseif ($vis) { $DM } else { $CY }
+            $cRepo = if ($vis) { $DM } else { $MG }
+            $nameCell = "${cName}$(Clip $name $nameW)${R}"
+            $rowBody = "${DM}$(ClipR ([string]($Offset + $ri + 1)) $numW)${R} $nameCell ${cRepo}$(Clip $repo $repoW)${R} ${DM}$(Clip ([string]$item.Path) $pathW)${R}"
+        }
+        $g = if ($sel) { "${BD}${YL}>${R} " } else { '  ' }
+        $line = "$g$rowBody"
+        if ($sel) { $line = Highlight-Row $line $colW }
+        $rowStrs.Add($line)
+    }
+
+    if (-not $preview) {
+        $L.Add("$DM$(HR $w)$R")
+        $L.Add("  $hdrLine")
+        $L.Add("$DM$(HR $w)$R")
+        if ($Items.Count -eq 0) { $L.Add(''); $L.Add("  ${DM}No results.${R}") }
+        else { foreach ($rs in $rowStrs) { $L.Add($rs) } }   # $rs already carries its 2-col gutter
+    } else {
+        # Two-pane: column table on the left, file preview on the right. The rule
+        # carries a ┬ at the divider column (colW+1) so it joins the vertical bar.
+        $L.Add("$DM$(HR-Join $w ($colW + 1) ([char]0x252C))$R")
+        $bodyH = [Math]::Max(4, (Get-Height) - $L.Count - 3)
+
+        # Window the rows around the cursor (2 lines reserved: column header + the
+        # header divider beneath it).
+        $rowsH = [Math]::Max(1, $bodyH - 2)
+        $sIdx = 0; $eIdx = $rowStrs.Count - 1; $indTop = $false; $indBot = $false
+        if ($rowStrs.Count -gt $rowsH) {
+            $winH = [Math]::Max(1, $rowsH - 2)
+            $cur  = [Math]::Max(0, $SelRow)
+            $sIdx = [Math]::Max(0, [Math]::Min($cur - [int]($winH / 2), $rowStrs.Count - $winH))
+            $eIdx = $sIdx + $winH - 1
+            $indTop = $true; $indBot = $true
+        }
+        $leftLines = [Collections.Generic.List[string]]::new()
+        $leftLines.Add("  $hdrLine")
+        $leftLines.Add($script:HeaderRuleTag)   # divider between header and rows
+        if ($Items.Count -eq 0) { $leftLines.Add("  ${DM}No results.${R}") }
+        else {
+            if ($indTop) { $leftLines.Add("  ${DM}$([char]0x2191) $sIdx more${R}") }
+            for ($ri = $sIdx; $ri -le $eIdx; $ri++) { $leftLines.Add($rowStrs[$ri]) }   # gutter already included
+            if ($indBot) { $leftLines.Add("  ${DM}$([char]0x2193) $($rowStrs.Count - 1 - $eIdx) more${R}") }
+        }
+
+        # Right pane: details + preview for the selected item.
+        $rightLines = @()
+        if ($SelRow -ge 0 -and $SelRow -lt $Items.Count) {
+            $sItem = $Items[$SelRow]
+            $sUrl  = Get-ItemUrl $sItem
+            $sBytes = if ("$($sItem.Size)" -ne '' -and "$($sItem.Size)" -ne '?') { [long]$sItem.Size } else { -1 }
+            $szTxt = if ($sBytes -ge 0) { Format-Size $sBytes } else { '?' }
+            $repo   = if ($sItem.Repo) { $sItem.Repo } else { '?' }
+            $rmeta  = Resolve-Repo $repo
+            $labelW = 11
+            $valMax = [Math]::Max(6, $rightW - $labelW - 1)
+            $rl = [Collections.Generic.List[string]]::new()
+            $rl.Add("${BD}${CY}$(Trunc ([string]$sItem.Name) $rightW)${R}")
+            $rl.Add('')
+            $rl.Add("${DM}$('Repository'.PadRight($labelW))${R}${MG}$(Trunc $repo $valMax)${R}")
+            $rl.Add("${DM}$('Path'.PadRight($labelW))${R}$(Trunc ([string]$sItem.Path) $valMax)")
+            $rl.Add("${DM}$('Type'.PadRight($labelW))${R}${YL}$(Trunc ([string]$sItem.FileType) $valMax)${R}")
+            $rl.Add("${DM}$('Size'.PadRight($labelW))${R}$szTxt")
+            if ($sItem.Modified) { $rl.Add("${DM}$('Modified'.PadRight($labelW))${R}$(Trunc ([string]$sItem.Modified) $valMax)") }
+            $rl.Add("${DM}$('Repo type'.PadRight($labelW))${R}$($rmeta.Type)")
+            $rl.Add("${DM}$('Pkg type'.PadRight($labelW))${R}${MG}$($rmeta.PackageType)${R}")
+            $pvMax  = [Math]::Max(1, $bodyH - $rl.Count - 2)
+            $pvLines = if (Get-IsArchive ([string]$sItem.Name)) {
+                Get-ArchivePreviewLines $sItem $rightW $pvMax
+            } else {
+                Get-PreviewLines ([string]$sItem.Name) $sUrl $sBytes $rightW $pvMax
+            }
+            foreach ($pl in $pvLines) { $rl.Add($pl) }
+            $rightLines = $rl.ToArray()
+        }
+
+        for ($i = 0; $i -lt $bodyH; $i++) {
+            $lc = if ($i -lt $leftLines.Count)  { $leftLines[$i] }  else { '' }
+            $rc = if ($i -lt $rightLines.Count) { $rightLines[$i] } else { '' }
+            if ($rc -eq $script:PaneRuleTag)        { $L.Add((Format-PaneRule $lc $colW $rightW)) }
+            elseif ($lc -eq $script:HeaderRuleTag)  { $L.Add((Format-HeaderRule $rc $colW)) }
+            else { $L.Add("$(Fit-Vis $lc $colW) ${DM}$([char]0x2502)${R} $rc") }
+        }
+        $L.Add("$DM$(HR-Join $w ($colW + 1) ([char]0x2534))$R")
+    }
+
+    # Footer
+    if (-not $preview) { $L.Add("$DM$(HR $w)$R") }
+    $arrowL = [char]0x2190; $arrowR = [char]0x2192
+    $nav = [Collections.Generic.List[string]]::new()
+    if ($SelRow -ge 0) {
+        $nav.Add("${BD}${LB}$([char]0x2191)$([char]0x2193)${RB}${R}${DM} move${R}")
+        $nav.Add("${BD}${LB}$([char]0x21B5)${RB}${R}${DM} open${R}")
+    }
+    if ($Page -gt 0)               { $nav.Add("${BD}${LB}p${RB}/${arrowL}${R}${DM} prev${R}") }
+    if ($Page -lt $TotalPages - 1) { $nav.Add("${BD}${LB}n${RB}/${arrowR}${R}${DM} next${R}") }
+    if ($TotalPages -gt 1) { $nav.Add("${BD}${LB}g${RB}${R}${DM} page${R}") }
+    if ($preview) { $nav.Add("${BD}${LB}y${RB}${R}${DM} preview big${R}") }
+    $nav.Add("${BD}${LB}#${RB}${R}${DM} view${R}")
+    $nextMode = switch ($Mode) { 'simple' { 'detailed' } 'detailed' { 'preview' } default { 'simple' } }
+    $nav.Add("${BD}${LB}d${RB}${R}${DM} $nextMode view${R}")
+    $nav.Add("${BD}${LB}s${RB}${R}${DM} search${R}")
+    $nav.Add("${BD}${LB}q${RB}${R}${DM} quit${R}")
+    $L.Add((Join-Justified $nav.ToArray() $w))
+
+    Show-Frame $L.ToArray()
+}
+
+function Show-Error([string]$Msg) {
+    $L = [Collections.Generic.List[string]]::new()
+    $L.Add(''); $L.Add("  ${RD}${BD}Error:${R} $Msg"); $L.Add('')
+    $L.Add("  ${DM}401: anonymous user lacks read/search permission - supply -Token / -Basic / -ApiKey.${R}")
+    $L.Add("  ${DM}403: authenticated but not permitted to search these repositories.${R}")
+    $L.Add("  ${DM}404: check the base URL - it should be the host (the /artifactory suffix is added for you).${R}")
+    $L.Add("  ${DM}429: server is rate-limiting - wait a moment and try again.${R}")
+    $L.Add(''); $L.Add("  ${BD}${LB}s${RB}${R}${DM} try again   ${BD}${LB}q${RB}${R}${DM} quit${R}")
+    Show-Frame $L.ToArray()
+}
+
+function Show-Loading([string]$Query) {
+    Show-Popup @('Searching', $Query)
+}
+
+# Download an artifact into $OutDir (created on demand). Returns a status line.
+# On failure, the server's response body (Artifactory returns a JSON error with
+# a human-readable reason, e.g. a "blacked out" repo) is surfaced verbatim
+# rather than the bare "(404) Not Found" from the exception message.
+function Save-Item([object]$item, [string]$url) {
+    try {
+        if (-not (Test-Path -LiteralPath $OutDir)) {
+            New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+        }
+    } catch {
+        return "${RD}${BD}Download failed:${R} cannot create folder ${CY}$OutDir${R} - $($_.Exception.Message)"
+    }
+    $dest = Join-Path $OutDir $item.Name
+    # Reuse bytes already held in memory from an earlier preview, if present.
+    if ($script:MemFiles.ContainsKey($url)) {
+        try {
+            [System.IO.File]::WriteAllBytes($dest, $script:MemFiles[$url])
+            $sz = ''; try { $sz = ' (' + (Format-Size (Get-Item $dest).Length) + ')' } catch { }
+            return "${BD}Saved${R} to ${CY}$dest${R}$sz ${DM}(from preview cache)${R}"
+        } catch { }   # fall through to a normal download on any write error
+    }
+    $old  = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try {
+        Invoke-WebRequest -Uri $url -Headers (Get-AuthHeaders) -OutFile $dest -ErrorAction Stop
+        $sz = ''
+        try { $sz = ' (' + (Format-Size (Get-Item $dest).Length) + ')' } catch { }
+        return "${BD}Saved${R} to ${CY}$dest${R}$sz"
+    } catch {
+        # A failed -OutFile request may leave an empty/partial file behind.
+        try { if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force } } catch { }
+        return "${RD}${BD}Download failed:${R} $(Get-HttpErrorDetail $_)"
+    } finally {
+        $ProgressPreference = $old
+    }
+}
+
