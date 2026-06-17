@@ -136,6 +136,8 @@ $mode       = 'simple' # 'd' cycles simple -> detailed -> preview
 $pendingKey = ''       # a non-nav key absorbed while coalescing a paging burst
 $selRow     = 0        # highlighted row within the current page (cursor)
 $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
+$pvScroll   = 0        # preview-pane scroll offset for the selected file ([ / ])
+$lastPvId   = ''       # previewed item's id last frame; changing it resets the scroll
 
 :main while ($true) {
 
@@ -186,6 +188,13 @@ $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
     $detailed = ($mode -ne 'simple')   # detailed + preview both fetch size/modified
     $preview  = ($mode -eq 'preview')  # two-pane mode: warm previews in background
 
+    # Reset the preview scroll whenever the previewed item changes (a new file
+    # always opens at the top), keyed off the selected item's storage uri.
+    $pvId = if ($preview -and $selRow -ge 0 -and $selRow -lt $pageItems.Count) {
+        [string]$pageItems[$selRow].Uri
+    } else { '' }
+    if ($pvId -ne $lastPvId) { $pvScroll = 0; $lastPvId = $pvId }
+
     # Detailed view only: load the repo map once, then show whatever detail is
     # already cached. We never block on a "Loading details..." screen — the page
     # renders immediately and rows fill in (see the nav loop below) as the
@@ -197,7 +206,7 @@ $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
     }
 
     Show-Page -Query $query -Items $pageItems -Page $page `
-              -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl
+              -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll
 
     # Background warming (non-blocking, detailed view only). Build a prefetch
     # window in priority order — current page first, then pages fanning outward
@@ -272,7 +281,7 @@ $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
     if ($detailed -and -not $script:CanRawKey -and (Get-MissingMeta $pageItems) -gt 0) {
         Wait-Meta $pageItems 5000
         Show-Page -Query $query -Items $pageItems -Page $page `
-                  -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl
+                  -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll
     }
     # Likewise block briefly for the highlighted item's preview on ISE.
     if ($preview -and -not $script:CanRawKey -and $pageItems.Count -gt 0) {
@@ -280,7 +289,7 @@ $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
         if (Test-PreviewLoading $selKey) {
             Wait-Preview $selKey 5000
             Show-Page -Query $query -Items $pageItems -Page $page `
-                      -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl
+                      -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll
         }
     }
 
@@ -348,7 +357,7 @@ $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
                 if ($redraw) {
                     Show-Page -Query $query -Items $pageItems -Page $page `
                               -TotalPages $totalPages -TotalItems $totalItems `
-                              -Offset $offset -Mode $mode -SelRow $hl
+                              -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll
                 }
                 continue nav
             }
@@ -386,6 +395,15 @@ $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
                 # this case is passed as the initial delta.
                 $d = if ($key -match '^(down|j)$') { 1 } else { -1 }
                 Invoke-RowBurst ([ref]$page) ([ref]$selRow) $PageSize $totalItems ([ref]$pendingKey) $d
+                break nav
+            }
+            '^(shift\+up|shift\+down)$' {
+                # Preview mode only: scroll the selected file/archive contents in the
+                # pane. Coalesces a held burst like the row keys (see Invoke-ScrollBurst).
+                if ($mode -eq 'preview') {
+                    $d = if ($key -eq 'shift+down') { 1 } else { -1 }
+                    Invoke-ScrollBurst ([ref]$pvScroll) $script:PvScrollMax ([ref]$pendingKey) $d
+                }
                 break nav
             }
             '^(enter|o)$' {

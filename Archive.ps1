@@ -691,8 +691,22 @@ function Show-ArchiveTree([object]$item) {
     Initialize-RepoMap
     Stop-PreviewLookahead   # halt the results-page preview trickle while browsing
 
-    Show-Popup @("Reading archive", $item.Name)
-    $tree = Get-ArchiveTree $item
+    # Reuse the listing the preview pane already fetched: the background archive
+    # preview hits the same treebrowser endpoint with the same payload and stores
+    # the identical { Ok; Nodes; Error } shape under A|<uri>. When that succeeded,
+    # open straight from the cache — no redundant round-trip and no "Reading
+    # archive" wait. A miss (never warmed, evicted, or a failed warm) falls back to
+    # a fresh fetch.
+    $tree  = $null
+    $pvKey = Get-ArcPreviewKey ([string]$item.Uri)
+    if ($script:PreviewCache.ContainsKey($pvKey)) {
+        $cached = $script:PreviewCache[$pvKey]
+        if ($cached -and $cached.Ok) { $tree = $cached }
+    }
+    if ($null -eq $tree) {
+        Show-Popup @("Reading archive", $item.Name)
+        $tree = Get-ArchiveTree $item
+    }
 
     if (-not $tree.Ok) {
         Show-Popup @("Could not read archive:", $tree.Error, '',
@@ -731,6 +745,8 @@ function Show-ArchiveTree([object]$item) {
     $notice      = @{ Message = ''; At = [DateTime]::MinValue }
     $previewMode = $false  # 'v' toggles the preview pane under file details
     $pendingKc   = $null   # non-row key handed back by a coalesced up/down burst
+    $pvScroll    = 0       # preview-pane scroll offset for the hovered file (Shift+Up/Down)
+    $lastPvKey   = ''      # hovered file last frame; changing it resets the scroll
 
     # Connector glyphs (char codes keep the file ASCII).
     $vert = "$([char]0x2502)   "; $gapS = '    '
@@ -762,6 +778,11 @@ function Show-ArchiveTree([object]$item) {
 
         $w   = ((Get-Width) - 1)
         $cur = if ($rows.Count -gt 0 -and $cursor -lt $rows.Count) { $rows[$cursor] } else { $null }
+
+        # Reset the preview scroll whenever the hovered file changes (a new file opens
+        # at the top); keyed off the row's node key, blank for folders/non-preview.
+        $pvKey = if ($previewMode -and $cur -and -not $cur.IsFolder) { [string]$cur.Key } else { '' }
+        if ($pvKey -ne $lastPvKey) { $pvScroll = 0; $lastPvKey = $pvKey }
 
         # Background-warm previews for entries around the cursor (preview mode only),
         # so the pane shows "Loading..." then fills in without blocking keys. On ISE
@@ -882,6 +903,7 @@ function Show-ArchiveTree([object]$item) {
 
         # Build the right (detail) lines for the hovered node. In preview mode a
         # file's contents are shown underneath its details.
+        $script:PvScrollMax = 0   # reset; Get-PreviewLines sets it for a scrollable file
         $detail = @()
         if ($cur) {
             if ($cur.Node.PSObject.Properties['__root']) { $detail = @(Get-ArchiveItemDetailLines $item $rootInfo $rightW) }
@@ -893,7 +915,7 @@ function Show-ArchiveTree([object]$item) {
                     } else {
                         $info = Get-NodeInfo $cur.Node
                         $sz   = if ($info -and $info.PSObject.Properties['size']) { [long]$info.size } else { -1 }
-                        $detail += @(Get-PreviewLines (Get-NodeName $cur.Node) (Get-EntryUrl $cur.Node) $sz $rightW ($bodyH - $detail.Count - 2))
+                        $detail += @(Get-PreviewLines (Get-NodeName $cur.Node) (Get-EntryUrl $cur.Node) $sz $rightW ($bodyH - $detail.Count - 2) $pvScroll)
                     }
                 }
             }
@@ -939,6 +961,7 @@ function Show-ArchiveTree([object]$item) {
         $r2.Add("${BD}${LB}/${RB}${R}${DM} search${R}")
         if ($canDownload)                  { $r2.Add("${BD}${LB}d${RB}${R}${DM} download${R}") }
         if ($previewMode -and $canDownload) { $r2.Add("${BD}${LB}y${RB}${R}${DM} preview big${R}") }
+        if ($previewMode -and $script:PvScrollMax -gt 0) { $r2.Add("${BD}${LB}Shift+$([char]0x2191)$([char]0x2193)${RB}${R}${DM} scroll${R}") }
         $r2.Add("${BD}${LB}q${RB}${R}${DM} back${R}")
         $L.Add((Join-Justified $r1.ToArray() $w))
         $L.Add((Join-Justified $r2.ToArray() $w))
@@ -967,6 +990,13 @@ function Show-ArchiveTree([object]$item) {
                 # the key doesn't backlog renders (see Invoke-TreeRowBurst).
                 $d = if ($kc -cmatch '^(down|j)$') { 1 } else { -1 }
                 Invoke-TreeRowBurst ([ref]$cursor) $rows.Count ([ref]$pendingKc) $d
+            }
+            '^(shift\+up|shift\+down)$' {
+                # Preview mode only: scroll the hovered file's contents in the pane.
+                if ($previewMode) {
+                    $d = if ($kc -eq 'shift+down') { 1 } else { -1 }
+                    Invoke-ScrollBurst ([ref]$pvScroll) $script:PvScrollMax ([ref]$pendingKc) $d
+                }
             }
             '^home$'     { $cursor = 0 }
             '^end$'      { $cursor = $rows.Count - 1 }

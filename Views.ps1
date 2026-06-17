@@ -17,6 +17,55 @@ $script:MemFilesCap  = 32                                               # max fi
 $script:PreviewOK    = New-Object 'System.Collections.Generic.HashSet[string]'  # large files user opted to preview
 $script:PreviewLimit = 512000                                           # 0.5 MB preview cap
 
+# Preview-pane scrolling. The selected file's wrapped contents (or an archive's
+# entry listing) can exceed the pane height; the user scrolls with Shift+Up/Down.
+# $PvScrollMax is the largest valid scroll offset for the current preview (set by
+# the renderer each frame, read by the nav loops to clamp). Decoding/wrapping a file
+# and building an archive listing are O(size), so the results are memoized (keyed by
+# url/uri + pane width) and reused across scroll steps and neighbour redraws instead
+# of being rebuilt on every keystroke.
+$script:PvScrollMax       = 0
+$script:WrapCacheKey      = ''
+$script:WrapCacheLines    = @()
+$script:ArcListCacheKey   = ''
+$script:ArcListCacheLines = @()
+
+# Window a list of rendered content lines around a scroll offset, adding a
+# "N more above" / "N more below" indicator row (each consuming one line) whenever
+# content lies off-pane in that direction. Sets $script:PvScrollMax so the nav loop
+# can clamp the offset; returns the lines unchanged when everything already fits.
+# The +1 in $PvScrollMax accounts for the top indicator's row, so the last content
+# line is still reachable at maximum scroll. A pane too short for indicators
+# (< 3 rows) falls back to a plain window.
+function Get-ScrolledLines([string[]]$lines, [int]$avail, [int]$scroll) {
+    if ($null -eq $lines) { $lines = @() }
+    $avail = [Math]::Max(1, $avail)
+    $total = $lines.Count
+    if ($total -le $avail) { $script:PvScrollMax = 0; return $lines }
+
+    if ($avail -lt 3) {
+        $script:PvScrollMax = $total - $avail
+        $sc  = [Math]::Max(0, [Math]::Min($scroll, $script:PvScrollMax))
+        $end = [Math]::Min($total - 1, $sc + $avail - 1)
+        $o = [Collections.Generic.List[string]]::new()
+        for ($i = $sc; $i -le $end; $i++) { $o.Add($lines[$i]) }
+        return $o.ToArray()
+    }
+
+    $script:PvScrollMax = $total - $avail + 1
+    $sc  = [Math]::Max(0, [Math]::Min($scroll, $script:PvScrollMax))
+    $top = ($sc -gt 0)
+    $contentH = $avail - $(if ($top) { 1 } else { 0 })
+    $end = [Math]::Min($total - 1, $sc + $contentH - 1)
+    if (($total - 1 - $end) -gt 0) { $contentH--; $end = $sc + $contentH - 1 }   # reserve bottom indicator
+    $below = $total - 1 - $end
+    $out = [Collections.Generic.List[string]]::new()
+    if ($top)         { $out.Add("${DM}$([char]0x2191) $sc more above${R}") }
+    for ($i = $sc; $i -le $end; $i++) { $out.Add($lines[$i]) }
+    if ($below -gt 0) { $out.Add("${DM}$([char]0x2193) $below more below${R}") }
+    return $out.ToArray()
+}
+
 # Cache a file's raw bytes by url so a later download can reuse them instead of
 # re-fetching, bounded to $MemFilesCap entries (oldest evicted first). The bytes
 # are the SAME array the preview cache holds (shared by reference, not copied), so
@@ -182,7 +231,8 @@ function Get-PreviewMessageLines([string]$msg, [int]$paneW) {
 # -1 when unknown. Honours the size cap unless the url is in $PreviewOK.
 # The leading divider is emitted as $PaneRuleTag so the two-pane compositor can
 # connect it to the pane separator (see Format-PaneRule).
-function Get-PreviewLines([string]$name, [string]$url, [long]$sizeBytes, [int]$paneW, [int]$maxLines) {
+function Get-PreviewLines([string]$name, [string]$url, [long]$sizeBytes, [int]$paneW, [int]$maxLines, [int]$scroll = 0) {
+    $script:PvScrollMax = 0   # not scrollable unless the success path below says so
     $L = [Collections.Generic.List[string]]::new()
     $L.Add($script:PaneRuleTag)
     $L.Add("${BD}${YL}Preview${R}")
@@ -209,11 +259,19 @@ function Get-PreviewLines([string]$name, [string]$url, [long]$sizeBytes, [int]$p
     if ($null -eq $bytes) { $L.Add("${RD}Could not load file for preview.${R}"); return $L.ToArray() }
     # Seed the byte cache so a later download of this file reuses the fetch.
     Add-MemFile $url $bytes
-    $text  = Convert-BytesToText $bytes
-    $wrapped = Wrap-Text $text $paneW
-    $shown = [Math]::Min($wrapped.Count, [Math]::Max(1, $maxLines))
-    for ($i = 0; $i -lt $shown; $i++) { $L.Add($wrapped[$i]) }
-    if ($wrapped.Count -gt $shown) { $L.Add("${DM}$script:Cut ($($wrapped.Count - $shown) more lines)${R}") }
+    # Decoding + wrapping is O(file size); memoize the last file's wrapped lines
+    # (keyed by url + pane width) so scrolling and neighbour redraws reuse them
+    # instead of re-wrapping on every keystroke.
+    $wrapKey = "$url|$paneW"
+    if ($script:WrapCacheKey -eq $wrapKey) {
+        $wrapped = $script:WrapCacheLines
+    } else {
+        $wrapped = Wrap-Text (Convert-BytesToText $bytes) $paneW
+        $script:WrapCacheKey = $wrapKey; $script:WrapCacheLines = $wrapped
+    }
+    # Window the wrapped lines around the scroll offset, with above/below indicators
+    # when the file overflows the pane (Shift+Up/Down scrolls; see Get-ScrolledLines).
+    foreach ($wl in (Get-ScrolledLines $wrapped $maxLines $scroll)) { $L.Add($wl) }
     return $L.ToArray()
 }
 
@@ -250,7 +308,8 @@ function Add-ArcListingLines($nodes, [string]$prefix, $acc, [int]$paneW, [int]$c
 # shallow tree listing of its entries (fetched once and cached by item uri).
 # Mirrors the shape of Get-PreviewLines (leading $PaneRuleTag so the divider
 # connects).
-function Get-ArchivePreviewLines($item, [int]$paneW, [int]$maxLines) {
+function Get-ArchivePreviewLines($item, [int]$paneW, [int]$maxLines, [int]$scroll = 0) {
+    $script:PvScrollMax = 0   # not scrollable unless the listing below overflows
     $L = [Collections.Generic.List[string]]::new()
     $L.Add($script:PaneRuleTag)
     $L.Add("${BD}${YL}Archive preview${R}")
@@ -265,13 +324,20 @@ function Get-ArchivePreviewLines($item, [int]$paneW, [int]$maxLines) {
         if ($tree.Error) { foreach ($wl in (Wrap-Text ([string]$tree.Error) $paneW)) { $L.Add("${DM}$wl${R}") } }
         return $L.ToArray()
     }
-    $cap  = [Math]::Max(1, $maxLines)
-    $rows = [Collections.Generic.List[string]]::new()
-    Add-ArcListingLines @($tree.Nodes) '' $rows $paneW ($cap + 1)
+    # Build the shallow listing once (bounded so a huge archive can't build forever)
+    # and memoize it by uri + pane width, so scrolling reuses it instead of rebuilding
+    # the tree every keystroke.
+    $listKey = "$($item.Uri)|$paneW"
+    if ($script:ArcListCacheKey -eq $listKey) {
+        $rows = $script:ArcListCacheLines
+    } else {
+        $rowsList = [Collections.Generic.List[string]]::new()
+        Add-ArcListingLines @($tree.Nodes) '' $rowsList $paneW 2000
+        $rows = $rowsList.ToArray()
+        $script:ArcListCacheKey = $listKey; $script:ArcListCacheLines = $rows
+    }
     if ($rows.Count -eq 0) { $L.Add("${DM}(empty archive)${R}"); return $L.ToArray() }
-    $shown = [Math]::Min($rows.Count, $cap)
-    for ($i = 0; $i -lt $shown; $i++) { $L.Add($rows[$i]) }
-    if ($rows.Count -gt $shown) { $L.Add("${DM}$script:Cut ($($rows.Count - $shown) more)${R}") }
+    foreach ($wl in (Get-ScrolledLines $rows $maxLines $scroll)) { $L.Add($wl) }
     return $L.ToArray()
 }
 
@@ -393,7 +459,7 @@ function Format-DetailedHeader([int]$colW, [bool]$preview = $false) {
 
 function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
                    [int]$TotalPages, [int]$TotalItems, [int]$Offset,
-                   [string]$Mode = 'simple', [int]$SelRow = -1) {
+                   [string]$Mode = 'simple', [int]$SelRow = -1, [int]$PvScroll = 0) {
 
     if ($null -eq $Items) { $Items = @() }
     $w = ((Get-Width) - 1)
@@ -495,6 +561,7 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
         }
 
         # Right pane: details + preview for the selected item.
+        $script:PvScrollMax = 0   # reset; Get-PreviewLines sets it for a scrollable file
         $rightLines = @()
         if ($SelRow -ge 0 -and $SelRow -lt $Items.Count) {
             $sItem = $Items[$SelRow]
@@ -517,9 +584,9 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
             $rl.Add("${DM}$('Pkg type'.PadRight($labelW))${R}${MG}$($rmeta.PackageType)${R}")
             $pvMax  = [Math]::Max(1, $bodyH - $rl.Count - 2)
             $pvLines = if (Get-IsArchive ([string]$sItem.Name)) {
-                Get-ArchivePreviewLines $sItem $rightW $pvMax
+                Get-ArchivePreviewLines $sItem $rightW $pvMax $PvScroll
             } else {
-                Get-PreviewLines ([string]$sItem.Name) $sUrl $sBytes $rightW $pvMax
+                Get-PreviewLines ([string]$sItem.Name) $sUrl $sBytes $rightW $pvMax $PvScroll
             }
             foreach ($pl in $pvLines) { $rl.Add($pl) }
             $rightLines = $rl.ToArray()
@@ -547,6 +614,7 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
     if ($Page -lt $TotalPages - 1) { $nav.Add("${BD}${LB}n${RB}/${arrowR}${R}${DM} next${R}") }
     if ($TotalPages -gt 1) { $nav.Add("${BD}${LB}g${RB}${R}${DM} page${R}") }
     if ($preview) { $nav.Add("${BD}${LB}y${RB}${R}${DM} preview big${R}") }
+    if ($preview -and $script:PvScrollMax -gt 0) { $nav.Add("${BD}${LB}Shift+$([char]0x2191)$([char]0x2193)${RB}${R}${DM} scroll${R}") }
     $nav.Add("${BD}${LB}#${RB}${R}${DM} view${R}")
     $nextMode = switch ($Mode) { 'simple' { 'detailed' } 'detailed' { 'preview' } default { 'simple' } }
     $nav.Add("${BD}${LB}d${RB}${R}${DM} $nextMode view${R}")
