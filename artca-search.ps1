@@ -69,8 +69,13 @@ if ($host.UI.SupportsVirtualTerminal) {
 }
 $LB = '['; $RB = ']'
 
-# Small badge flagging an archive (browsable) file in listings.
-$script:ArcGlyph = '+'
+# Small badges shown after a name in detailed/preview listings: '+' flags a
+# browsable archive, the interpunct (·) flags a previewable text file.
+$script:ArcGlyph     = '+'
+$script:PreviewGlyph = [char]0x00B7
+
+# Marker appended wherever text is truncated to fit a column (▶).
+$script:Cut = [char]0x25B6
 
 # ── HOST CAPABILITIES ───────────────────────────────────────────────────────────
 # PowerShell ISE has no real console: RawUI.ReadKey / KeyAvailable throw or
@@ -89,25 +94,34 @@ $script:Vt = ($host.UI.SupportsVirtualTerminal -and $script:CanRawKey)
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
-# Pad/truncate to exactly $n columns. When text is cut off, end it with the
-# Unicode ellipsis (…) so the truncation is visible.
+# Pad/truncate to exactly $n columns. When text is cut off, end it with ▶ so the
+# truncation is visible. ($script:Cut is the marker, defined once below.)
 function Clip([string]$s, [int]$n) {
-    if ($s.Length -gt $n) { return $s.Substring(0, $n - 1) + [char]0x2026 }
+    if ($s.Length -gt $n) { return $s.Substring(0, $n - 1) + $script:Cut }
     return $s.PadRight($n)
 }
 
 function ClipR([string]$s, [int]$n) {
-    if ($s.Length -gt $n) { return $s.Substring(0, $n - 1) + [char]0x2026 }
+    if ($s.Length -gt $n) { return $s.Substring(0, $n - 1) + $script:Cut }
     return $s.PadLeft($n)
 }
 
-# Truncate without padding (for free-form values), with the … marker.
+# Truncate without padding (for free-form values), with the ▶ marker.
 function Trunc([string]$s, [int]$n) {
-    if ($s.Length -gt $n) { return $s.Substring(0, [Math]::Max(1, $n - 1)) + [char]0x2026 }
+    if ($s.Length -gt $n) { return $s.Substring(0, [Math]::Max(1, $n - 1)) + $script:Cut }
     return $s
 }
 
 function HR([int]$w) { [string][char]0x2500 * $w }
+
+# A horizontal rule of $w dashes carrying a junction glyph at column $col, so a
+# vertical pane divider sitting at that column joins it cleanly (┬ above, ┴ below)
+# instead of leaving a gap. Falls back to a plain rule if $col is out of range.
+function HR-Join([int]$w, [int]$col, [char]$junction) {
+    if ($col -lt 0 -or $col -ge $w) { return (HR $w) }
+    $hz = [char]0x2500
+    return ([string]$hz * $col) + $junction + ([string]$hz * ($w - $col - 1))
+}
 
 # WindowSize is $null in ISE; fall back to the buffer width, then a sane default.
 function Get-Width {
@@ -255,17 +269,6 @@ function Fit-Vis([string]$s, [int]$n) {
     return $sb.ToString()
 }
 
-# A horizontal rule of $w dashes with a junction glyph at column $col (for joining
-# a vertical divider to the rules above/below it).
-function Make-Rule([int]$w, [int]$col, [char]$junction) {
-    $dash = [char]0x2500
-    $sb = [Text.StringBuilder]::new()
-    for ($i = 0; $i -lt $w; $i++) {
-        if ($i -eq $col) { [void]$sb.Append($junction) } else { [void]$sb.Append($dash) }
-    }
-    return $sb.ToString()
-}
-
 # Low-level frame writer (does NOT remember the frame). On a VT console it's
 # flicker-free: hide cursor, home, overwrite each line (erase-to-EOL clears
 # leftovers) and erase below — one write, so unchanged cells repaint in place.
@@ -365,7 +368,10 @@ function Show-Popup([string[]]$Body) {
     $boxH   = $Body.Count + 2
     $top    = [Math]::Max(0, [int](($screenH - $boxH) / 2))
 
-    $tl=[char]0x256D; $tr=[char]0x256E; $bl=[char]0x2570; $br=[char]0x256F; $hz=[char]0x2500; $vt=[char]0x2502
+    # Sharp corners (┌┐└┘) over rounded ones (╭╮╰╯): the rounded glyphs have no
+    # mapping in the legacy console code pages (CP437/850), so they get emitted as
+    # '?'. The sharp corners exist there and in every console font.
+    $tl=[char]0x250C; $tr=[char]0x2510; $bl=[char]0x2514; $br=[char]0x2518; $hz=[char]0x2500; $vt=[char]0x2502
     $box = [Collections.Generic.List[string]]::new()
     $box.Add("${MG}$tl$([string]$hz * ($boxW - 2))$tr${R}")
     foreach ($l in $Body) {
@@ -410,6 +416,13 @@ $script:Visited      = New-Object 'System.Collections.Generic.HashSet[string]'
 $script:MemFiles     = @{}                                              # url -> [byte[]]
 $script:PreviewOK    = New-Object 'System.Collections.Generic.HashSet[string]'  # large files user opted to preview
 $script:PreviewLimit = 512000                                           # 0.5 MB preview cap
+$script:ArcTreeCache = @{}                                              # item uri -> archive tree result (preview pane)
+
+# Sentinel emitted by Get-PreviewLines in place of the preview's horizontal rule.
+# Two-pane compositors recognise it and draw a rule that joins the vertical pane
+# separator with a T-junction (instead of a bare dash row floating beside it).
+# NUL-wrapped so it can never collide with real content.
+$script:PaneRuleTag = "$([char]0)PANE_RULE$([char]0)"
 
 function Mark-Visited([string]$key) { if ($key) { [void]$script:Visited.Add($key) } }
 function Test-Visited([string]$key) { return ($key -and $script:Visited.Contains($key)) }
@@ -521,12 +534,35 @@ function Wrap-Text([string]$s, [int]$width) {
     return $out.ToArray()
 }
 
+# Render a right-pane horizontal divider that joins the vertical pane separator
+# with a T-junction (├), so it reads as one connected rule rather than a dash row
+# floating a column to the right of the separator. $leftW is the left pane width
+# (where the separator sits); $rightW is the right pane the rule spans.
+function Format-PaneRule([string]$leftCell, [int]$leftW, [int]$rightW) {
+    $tee = [char]0x251C; $hz = [char]0x2500
+    return "$(Fit-Vis $leftCell $leftW) ${DM}$tee$([string]$hz * ([Math]::Max(1, $rightW + 1)))${R}"
+}
+
+# Preview-pane block showing a single explanatory message in place of contents
+# (e.g. a nested sub-archive that can't be browsed). Same shape as Get-PreviewLines
+# — a $PaneRuleTag divider, the "Preview" header, then the wrapped message — so the
+# two-pane compositor connects the divider to the pane separator.
+function Get-PreviewMessageLines([string]$msg, [int]$paneW) {
+    $L = [Collections.Generic.List[string]]::new()
+    $L.Add($script:PaneRuleTag)
+    $L.Add("${BD}${YL}Preview${R}")
+    foreach ($wl in (Wrap-Text $msg $paneW)) { $L.Add("${DM}$wl${R}") }
+    return $L.ToArray()
+}
+
 # Build the preview-section lines for a file: a "Preview" header then either the
 # wrapped contents, or a message (not previewable / large / failed). $sizeBytes is
 # -1 when unknown. Honours the size cap unless the url is in $PreviewOK.
+# The leading divider is emitted as $PaneRuleTag so the two-pane compositor can
+# connect it to the pane separator (see Format-PaneRule).
 function Get-PreviewLines([string]$name, [string]$url, [long]$sizeBytes, [int]$paneW, [int]$maxLines) {
     $L = [Collections.Generic.List[string]]::new()
-    $L.Add("${DM}$([string][char]0x2500 * $paneW)${R}")
+    $L.Add($script:PaneRuleTag)
     $L.Add("${BD}${YL}Preview${R}")
     if (-not (Get-IsPreviewable $name)) {
         $L.Add("${DM}This file format can't be previewed.${R}")
@@ -545,7 +581,62 @@ function Get-PreviewLines([string]$name, [string]$url, [long]$sizeBytes, [int]$p
     $wrapped = Wrap-Text $text $paneW
     $shown = [Math]::Min($wrapped.Count, [Math]::Max(1, $maxLines))
     for ($i = 0; $i -lt $shown; $i++) { $L.Add($wrapped[$i]) }
-    if ($wrapped.Count -gt $shown) { $L.Add("${DM}... ($($wrapped.Count - $shown) more lines)${R}") }
+    if ($wrapped.Count -gt $shown) { $L.Add("${DM}$script:Cut ($($wrapped.Count - $shown) more lines)${R}") }
+    return $L.ToArray()
+}
+
+# Recursively render an archive's nodes as an indented tree listing, appending
+# display lines to $acc. Folders are expanded only down to $maxDepth levels (the
+# preview is a glimpse, not the full browser — use the tree view for deeper
+# navigation); deeper folders are still listed, just not descended into. Folder
+# names are magenta, files cyan; each line is truncated to $paneW. Stops once $acc
+# reaches $cap rows so a huge archive doesn't build thousands of lines just to be
+# trimmed. (Uses the archive-node accessors defined further down; resolved at call
+# time.) $depth is the 1-based level of $nodes.
+function Add-ArcListingLines($nodes, [string]$prefix, $acc, [int]$paneW, [int]$cap, [int]$depth = 1, [int]$maxDepth = 2) {
+    $sorted = @(Sort-Nodes $nodes)
+    for ($i = 0; $i -lt $sorted.Count; $i++) {
+        if ($acc.Count -ge $cap) { return }
+        $n        = $sorted[$i]
+        $isLast   = ($i -eq $sorted.Count - 1)
+        $isFolder = Get-NodeIsFolder $n
+        $branch   = if ($isLast) { "$([char]0x2514)$([char]0x2500)$([char]0x2500) " }
+                    else         { "$([char]0x251C)$([char]0x2500)$([char]0x2500) " }
+        $name = Get-NodeName $n
+        $disp = if ($isFolder) { "$name/" } else { $name }
+        $disp = Trunc $disp ([Math]::Max(1, $paneW - $prefix.Length - $branch.Length))
+        $col  = if ($isFolder) { $MG } else { $CY }
+        $acc.Add("${DM}$prefix$branch${R}${col}$disp${R}")
+        if ($isFolder -and $depth -lt $maxDepth) {
+            $childPrefix = $prefix + $(if ($isLast) { '    ' } else { "$([char]0x2502)   " })
+            Add-ArcListingLines (Get-NodeChildren $n) $childPrefix $acc $paneW $cap ($depth + 1) $maxDepth
+        }
+    }
+}
+
+# Preview-pane lines for a listable archive: an "Archive preview" header then a
+# shallow tree listing of its entries (fetched once and cached by item uri).
+# Mirrors the shape of Get-PreviewLines (leading $PaneRuleTag so the divider
+# connects).
+function Get-ArchivePreviewLines($item, [int]$paneW, [int]$maxLines) {
+    $L = [Collections.Generic.List[string]]::new()
+    $L.Add($script:PaneRuleTag)
+    $L.Add("${BD}${YL}Archive preview${R}")
+    $key = [string]$item.Uri
+    if (-not $script:ArcTreeCache.ContainsKey($key)) { $script:ArcTreeCache[$key] = Get-ArchiveTree $item }
+    $tree = $script:ArcTreeCache[$key]
+    if (-not $tree.Ok) {
+        $L.Add("${RD}Could not read archive.${R}")
+        if ($tree.Error) { foreach ($wl in (Wrap-Text ([string]$tree.Error) $paneW)) { $L.Add("${DM}$wl${R}") } }
+        return $L.ToArray()
+    }
+    $cap  = [Math]::Max(1, $maxLines)
+    $rows = [Collections.Generic.List[string]]::new()
+    Add-ArcListingLines @($tree.Nodes) '' $rows $paneW ($cap + 1)
+    if ($rows.Count -eq 0) { $L.Add("${DM}(empty archive)${R}"); return $L.ToArray() }
+    $shown = [Math]::Min($rows.Count, $cap)
+    for ($i = 0; $i -lt $shown; $i++) { $L.Add($rows[$i]) }
+    if ($rows.Count -gt $shown) { $L.Add("${DM}$script:Cut ($($rows.Count - $shown) more)${R}") }
     return $L.ToArray()
 }
 
@@ -929,53 +1020,86 @@ function Search-Artifacts([string]$Query) {
 
 # ── DISPLAY ───────────────────────────────────────────────────────────────────
 
+# Build a fixed-width ($nameW) name cell, left-aligned and padded to the column
+# edge, with an optional one-char badge placed immediately after the name text:
+# '+' for a browsable archive, '·' for a previewable file. Space for the badge is
+# reserved before truncating, so even an ellipsised long name still shows it.
+function Format-NameCell([string]$name, [int]$nameW, [bool]$vis) {
+    $col  = if ($vis) { $DM } else { $CY }
+    $gcol = if ($vis) { $DM } else { $YL }       # badge dims with the row when visited
+    if     (Get-IsArchive $name)     { $glyph = $script:ArcGlyph }
+    elseif (Get-IsPreviewable $name) { $glyph = $script:PreviewGlyph }
+    else   { return "${col}$(Clip $name $nameW)${R}" }
+
+    $avail = [Math]::Max(1, $nameW - 2)          # reserve " <glyph>"
+    $txt   = Trunc $name $avail                  # ellipsis if too long, no padding
+    $pad   = [Math]::Max(0, $nameW - $txt.Length - 2)
+    return "${col}${txt}${R}${gcol} ${glyph}${R}$(' ' * $pad)"
+}
+
 # Build one detailed-mode data row (no gutter), sized to fit $colW. Columns are
 # packed with single-space gaps to minimise wasted space. Visited rows render
 # washed-out (dim).
-function Format-DetailedRow($item, [int]$Number, [int]$colW, [bool]$vis) {
+# In preview mode only #, Name, Type, Size, Modified are shown (the right pane
+# carries repo/path/etc.); Name takes all the freed width.
+function Format-DetailedRow($item, [int]$Number, [int]$colW, [bool]$vis, [bool]$preview = $false) {
     $numW = 4; $typeW = 5; $sizeW = 9; $modW = 10; $rtypeW = 6; $ptypeW = 8
     $repoW = [Math]::Min(16, [Math]::Max(8, [int]($colW * 0.14)))
-    $fixed = $numW + $typeW + $sizeW + $modW + $repoW + $rtypeW + $ptypeW + 12  # 8 gaps + 2 gutter + 2 margin
-    $rest  = [Math]::Max(12, $colW - $fixed)
-    $nameW = [Math]::Max(10, [int]($rest * 0.55))
-    $pathW = [Math]::Max(0, $rest - $nameW)
+    if ($preview) {
+        $nameW = [Math]::Max(10, $colW - ($numW + $typeW + $sizeW + $modW + 8))  # 4 gaps + 2 gutter + 2 margin
+        $pathW = 0
+    } else {
+        $fixed = $numW + $typeW + $sizeW + $modW + $repoW + $rtypeW + $ptypeW + 12  # 8 gaps + 2 gutter + 2 margin
+        $rest  = [Math]::Max(12, $colW - $fixed)
+        $nameW = [Math]::Max(10, [int]($rest * 0.55))
+        $pathW = [Math]::Max(0, $rest - $nameW)
+    }
 
     $name = if ($item.Name) { $item.Name } else { '?' }
-    $repo = if ($item.Repo) { $item.Repo } else { '?' }
     $type = [string]$item.FileType
     $size = if ("$($item.Size)" -ne '') { Format-Size $item.Size } else { '?' }
     $modified = if ($item.Modified) { $item.Modified.Substring(0, [Math]::Min(10, $item.Modified.Length)) } else { '?' }
-    $rmeta = Resolve-Repo $repo
-    $arc   = Get-IsArchive $name
-    $cName = if ($vis) { $DM } else { $CY }
+
+    # Visited rows wash the whole line out: every field (and the badge) goes dim.
+    $cType = if ($vis) { $DM } else { $YL }
+    $cDim  = if ($vis) { $DM } else { '' }      # size/rtype: normally default color
     $cRepo = if ($vis) { $DM } else { $MG }
 
-    $nameCell = if ($arc) { "${cName}$(Clip $name ([Math]::Max(1, $nameW - 2)))${R}${YL} $script:ArcGlyph${R}" }
-                else      { "${cName}$(Clip $name $nameW)${R}" }
+    $nameCell = Format-NameCell $name $nameW $vis
     $cells = @(
         "${DM}$(ClipR ([string]$Number) $numW)${R}",
         $nameCell,
-        "${YL}$(Clip $type $typeW)${R}",
-        "$(ClipR $size $sizeW)",
-        "${DM}$(Clip $modified $modW)${R}",
-        "${cRepo}$(Clip $repo $repoW)${R}",
-        "$(Clip ([string]$rmeta.Type) $rtypeW)",
-        "${cRepo}$(Clip ([string]$rmeta.PackageType) $ptypeW)${R}"
+        "${cType}$(Clip $type $typeW)${R}",
+        "${cDim}$(ClipR $size $sizeW)${R}",
+        "${DM}$(Clip $modified $modW)${R}"
     )
-    if ($pathW -gt 0) { $cells += "${DM}$(Clip ([string]$item.Path) $pathW)${R}" }
+    if (-not $preview) {
+        $repo  = if ($item.Repo) { $item.Repo } else { '?' }
+        $rmeta = Resolve-Repo $repo
+        $cells += "${cRepo}$(Clip $repo $repoW)${R}"
+        $cells += "${cDim}$(Clip ([string]$rmeta.Type) $rtypeW)${R}"
+        $cells += "${cRepo}$(Clip ([string]$rmeta.PackageType) $ptypeW)${R}"
+        if ($pathW -gt 0) { $cells += "${DM}$(Clip ([string]$item.Path) $pathW)${R}" }
+    }
     return ($cells -join ' ')
 }
 
-function Format-DetailedHeader([int]$colW) {
+function Format-DetailedHeader([int]$colW, [bool]$preview = $false) {
     $numW = 4; $typeW = 5; $sizeW = 9; $modW = 10; $rtypeW = 6; $ptypeW = 8
     $repoW = [Math]::Min(16, [Math]::Max(8, [int]($colW * 0.14)))
-    $fixed = $numW + $typeW + $sizeW + $modW + $repoW + $rtypeW + $ptypeW + 18  # match Format-DetailedRow
-    $rest  = [Math]::Max(12, $colW - $fixed)
-    $nameW = [Math]::Max(10, [int]($rest * 0.55))
-    $pathW = [Math]::Max(0, $rest - $nameW)
-    $hdr = @((ClipR '#' $numW), (Clip 'Name' $nameW), (Clip 'Type' $typeW), (ClipR 'Size' $sizeW),
-             (Clip 'Modified' $modW), (Clip 'Repo' $repoW), (Clip 'RType' $rtypeW), (Clip 'PType' $ptypeW))
-    if ($pathW -gt 0) { $hdr += (Clip 'Path' $pathW) }
+    if ($preview) {
+        $nameW = [Math]::Max(10, $colW - ($numW + $typeW + $sizeW + $modW + 8))  # match Format-DetailedRow
+        $hdr = @((ClipR '#' $numW), (Clip 'Name' $nameW), (Clip 'Type' $typeW), (ClipR 'Size' $sizeW),
+                 (Clip 'Modified' $modW))
+    } else {
+        $fixed = $numW + $typeW + $sizeW + $modW + $repoW + $rtypeW + $ptypeW + 18
+        $rest  = [Math]::Max(12, $colW - $fixed)
+        $nameW = [Math]::Max(10, [int]($rest * 0.55))
+        $pathW = [Math]::Max(0, $rest - $nameW)
+        $hdr = @((ClipR '#' $numW), (Clip 'Name' $nameW), (Clip 'Type' $typeW), (ClipR 'Size' $sizeW),
+                 (Clip 'Modified' $modW), (Clip 'Repo' $repoW), (Clip 'RType' $rtypeW), (Clip 'PType' $ptypeW))
+        if ($pathW -gt 0) { $hdr += (Clip 'Path' $pathW) }
+    }
     return "${BD}${YL}$($hdr -join ' ')${R}"
 }
 
@@ -1013,10 +1137,9 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
     # Column area width — narrower in preview mode to make room for the pane.
     $rightW = if ($preview) { [Math]::Max(28, [int]($w * 0.40)) } else { 0 }
     $colW   = if ($preview) { $w - $rightW - 3 } else { $w }
-    $dcol   = $colW + 1
 
     # Build the column header + data rows (each row already includes its gutter).
-    if ($detailed) { $hdrLine = Format-DetailedHeader $colW }
+    if ($detailed) { $hdrLine = Format-DetailedHeader $colW $preview }
     else {
         # Budget: gutter(2) + num + 3 single-space gaps = 5 overhead columns.
         $numW = 4; $repoW = 22
@@ -1034,15 +1157,14 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
         $vis  = Test-Visited ([string]$item.Uri)
         $sel  = ($ri -eq $SelRow)
         if ($detailed) {
-            $rowBody = Format-DetailedRow $item ($Offset + $ri + 1) $colW $vis
+            $rowBody = Format-DetailedRow $item ($Offset + $ri + 1) $colW $vis $preview
         } else {
+            # Simple view shows no archive/preview badges (detailed/preview only).
             $name = if ($item.Name) { $item.Name } else { '?' }
             $repo = if ($item.Repo) { $item.Repo } else { '?' }
-            $arc  = Get-IsArchive $name
             $cName = if ($vis) { $DM } else { $CY }
             $cRepo = if ($vis) { $DM } else { $MG }
-            $nameCell = if ($arc) { "${cName}$(Clip $name ([Math]::Max(1, $nameW - 2)))${R}${YL} $script:ArcGlyph${R}" }
-                        else      { "${cName}$(Clip $name $nameW)${R}" }
+            $nameCell = "${cName}$(Clip $name $nameW)${R}"
             $rowBody = "${DM}$(ClipR ([string]($Offset + $ri + 1)) $numW)${R} $nameCell ${cRepo}$(Clip $repo $repoW)${R} ${DM}$(Clip ([string]$item.Path) $pathW)${R}"
         }
         $g = if ($sel) { "${BD}${YL}>${R} " } else { '  ' }
@@ -1058,8 +1180,9 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
         if ($Items.Count -eq 0) { $L.Add(''); $L.Add("  ${DM}No results.${R}") }
         else { foreach ($rs in $rowStrs) { $L.Add($rs) } }   # $rs already carries its 2-col gutter
     } else {
-        # Two-pane: column table on the left, file preview on the right.
-        $L.Add("${DM}$(Make-Rule $w $dcol ([char]0x252C))${R}")
+        # Two-pane: column table on the left, file preview on the right. The rule
+        # carries a ┬ at the divider column (colW+1) so it joins the vertical bar.
+        $L.Add("$DM$(HR-Join $w ($colW + 1) ([char]0x252C))$R")
         $bodyH = [Math]::Max(4, (Get-Height) - $L.Count - 3)
 
         # Window the rows around the cursor (1 line reserved for the column header).
@@ -1088,20 +1211,37 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
             $sUrl  = Get-ItemUrl $sItem
             $sBytes = if ("$($sItem.Size)" -ne '' -and "$($sItem.Size)" -ne '?') { [long]$sItem.Size } else { -1 }
             $szTxt = if ($sBytes -ge 0) { Format-Size $sBytes } else { '?' }
+            $repo   = if ($sItem.Repo) { $sItem.Repo } else { '?' }
+            $rmeta  = Resolve-Repo $repo
+            $labelW = 11
+            $valMax = [Math]::Max(6, $rightW - $labelW - 1)
             $rl = [Collections.Generic.List[string]]::new()
             $rl.Add("${BD}${CY}$(Trunc ([string]$sItem.Name) $rightW)${R}")
-            $rl.Add("${DM}$(Trunc ([string]$sItem.Path) $rightW)${R}")
-            $rl.Add("${DM}Size ${R}$szTxt")
-            foreach ($pl in (Get-PreviewLines ([string]$sItem.Name) $sUrl $sBytes $rightW ($bodyH - 4))) { $rl.Add($pl) }
+            $rl.Add('')
+            $rl.Add("${DM}$('Repository'.PadRight($labelW))${R}${MG}$(Trunc $repo $valMax)${R}")
+            $rl.Add("${DM}$('Path'.PadRight($labelW))${R}$(Trunc ([string]$sItem.Path) $valMax)")
+            $rl.Add("${DM}$('Type'.PadRight($labelW))${R}${YL}$(Trunc ([string]$sItem.FileType) $valMax)${R}")
+            $rl.Add("${DM}$('Size'.PadRight($labelW))${R}$szTxt")
+            if ($sItem.Modified) { $rl.Add("${DM}$('Modified'.PadRight($labelW))${R}$(Trunc ([string]$sItem.Modified) $valMax)") }
+            $rl.Add("${DM}$('Repo type'.PadRight($labelW))${R}$($rmeta.Type)")
+            $rl.Add("${DM}$('Pkg type'.PadRight($labelW))${R}${MG}$($rmeta.PackageType)${R}")
+            $pvMax  = [Math]::Max(1, $bodyH - $rl.Count - 2)
+            $pvLines = if (Get-IsArchive ([string]$sItem.Name)) {
+                Get-ArchivePreviewLines $sItem $rightW $pvMax
+            } else {
+                Get-PreviewLines ([string]$sItem.Name) $sUrl $sBytes $rightW $pvMax
+            }
+            foreach ($pl in $pvLines) { $rl.Add($pl) }
             $rightLines = $rl.ToArray()
         }
 
         for ($i = 0; $i -lt $bodyH; $i++) {
             $lc = if ($i -lt $leftLines.Count)  { $leftLines[$i] }  else { '' }
             $rc = if ($i -lt $rightLines.Count) { $rightLines[$i] } else { '' }
-            $L.Add("$(Fit-Vis $lc $colW) ${DM}$([char]0x2502)${R} $rc")
+            if ($rc -eq $script:PaneRuleTag) { $L.Add((Format-PaneRule $lc $colW $rightW)) }
+            else { $L.Add("$(Fit-Vis $lc $colW) ${DM}$([char]0x2502)${R} $rc") }
         }
-        $L.Add("${DM}$(Make-Rule $w $dcol ([char]0x2534))${R}")
+        $L.Add("$DM$(HR-Join $w ($colW + 1) ([char]0x2534))$R")
     }
 
     # Footer
@@ -1218,12 +1358,14 @@ function Get-UiHeaders {
 # display name lives under text (or name); a folder is flagged by folder/isFolder
 # or implied by type; children holds the nested entries for a folder.
 function Get-NodeName($n) {
+    if ($null -eq $n) { return '' }
     if ($n.PSObject.Properties['text'] -and "$($n.text)") { return "$($n.text)" }
     if ($n.PSObject.Properties['name'] -and "$($n.name)") { return "$($n.name)" }
     return ''
 }
 
 function Get-NodeIsFolder($n) {
+    if ($null -eq $n) { return $false }
     if ($n.PSObject.Properties['folder'])   { return [bool]$n.folder }
     if ($n.PSObject.Properties['isFolder']) { return [bool]$n.isFolder }
     if ($n.PSObject.Properties['type']) {
@@ -1234,24 +1376,31 @@ function Get-NodeIsFolder($n) {
 
 # A folder's children come as an array of node objects. Guard against a missing
 # property or a non-array placeholder (treated as an unexpanded / empty folder).
+# Null entries are stripped: a malformed/empty subtree (e.g. an unbrowsable nested
+# archive) can yield array slots that are $null, and every node accessor would
+# throw on them under StrictMode.
 function Get-NodeChildren($n) {
+    if ($null -eq $n) { return @() }
     if ($n.PSObject.Properties['children']) {
         $c = $n.children
-        if ($c -is [Array]) { return @($c) }
+        if ($c -is [Array]) { return @($c | Where-Object { $null -ne $_ }) }
     }
     return @()
 }
 
-# Order a level for display: folders first, then files, each alphabetical.
+# Order a level for display: folders first, then files, each alphabetical. Null
+# entries are dropped up front so the accessors never see them.
 function Sort-Nodes($nodes) {
-    $folders = @($nodes | Where-Object {      (Get-NodeIsFolder $_) } | Sort-Object { (Get-NodeName $_).ToLower() })
-    $files   = @($nodes | Where-Object { -not (Get-NodeIsFolder $_) } | Sort-Object { (Get-NodeName $_).ToLower() })
+    $clean   = @(@($nodes) | Where-Object { $null -ne $_ })
+    $folders = @($clean | Where-Object {      (Get-NodeIsFolder $_) } | Sort-Object { (Get-NodeName $_).ToLower() })
+    $files   = @($clean | Where-Object { -not (Get-NodeIsFolder $_) } | Sort-Object { (Get-NodeName $_).ToLower() })
     return @($folders + $files)
 }
 
 # A stable per-node key for tracking which folders are expanded. The node's
 # archive path is unique; fall back to the name if absent.
 function Get-NodeKey($n) {
+    if ($null -eq $n) { return '' }
     if ($n.PSObject.Properties['path'] -and "$($n.path)") { return "$($n.path)" }
     return (Get-NodeName $n)
 }
@@ -1260,10 +1409,11 @@ function Get-NodeKey($n) {
 # *files* are expandable too, but their sub-tree is fetched lazily and stored in
 # $subCache keyed by node key (empty array until loaded).
 function Get-NodeKidsResolved($n, $subCache) {
+    if ($null -eq $n) { return @() }
     if (Get-NodeIsFolder $n) { return @(Get-NodeChildren $n) }
     if (Get-NodeIsArchive $n) {
         $k = Get-NodeKey $n
-        if ($subCache -and $subCache.ContainsKey($k)) { return @($subCache[$k]) }
+        if ($subCache -and $subCache.ContainsKey($k)) { return @(@($subCache[$k]) | Where-Object { $null -ne $_ }) }
         return @()
     }
     return @()
@@ -1281,13 +1431,13 @@ function Add-TreeRows($nodes, $ancestorLast, $expanded, $subCache, $parent, $row
         $isLast     = ($i -eq $sorted.Count - 1)
         $isFolder   = Get-NodeIsFolder $n
         $isArchive  = Get-NodeIsArchive $n
-        $expandable = $isFolder -or $isArchive
+        # Only folders are expandable. Nested sub-archives aren't browsable through
+        # the tree-browser endpoint, so they're treated as plain files (selecting
+        # one downloads it) rather than offered for an expansion that always fails.
+        $expandable = $isFolder
         $key        = Get-NodeKey $n
-        $loaded     = $isFolder -or ($subCache -and $subCache.ContainsKey($key))
-        $kids       = @(Get-NodeKidsResolved $n $subCache)
-        # Unloaded archives are optimistically treated as having children so they
-        # can be opened; once loaded, the real count decides.
-        $hasKids    = if ($loaded) { $kids.Count -gt 0 } else { $isArchive }
+        $kids       = @(Get-NodeChildren $n)
+        $hasKids    = $kids.Count -gt 0
         $isOpen     = $expandable -and $expanded.Contains($key)
         $rows.Add([PSCustomObject]@{
             Node         = $n
@@ -1309,12 +1459,13 @@ function Add-TreeRows($nodes, $ancestorLast, $expanded, $subCache, $parent, $row
     }
 }
 
-# Recursively add every (already-loaded) folder/archive key to $set (expand all).
+# Recursively add every folder key to $set (expand all). Sub-archives aren't
+# expandable, so they're skipped.
 function Add-AllFolderKeys($nodes, $expanded, $subCache) {
     foreach ($n in @($nodes)) {
-        if ((Get-NodeIsFolder $n) -or (Get-NodeIsArchive $n)) {
+        if (Get-NodeIsFolder $n) {
             [void]$expanded.Add((Get-NodeKey $n))
-            Add-AllFolderKeys (Get-NodeKidsResolved $n $subCache) $expanded $subCache
+            Add-AllFolderKeys (Get-NodeChildren $n) $expanded $subCache
         }
     }
 }
@@ -1378,7 +1529,7 @@ function Invoke-TreeBrowse([string]$repoKey, [string]$repoType, [string]$repoPkg
         $resp = Invoke-RestMethod -Uri $uri -Method Post -Body $body `
                     -ContentType 'application/json' -Headers (Get-UiHeaders) `
                     -UserAgent $ua -ErrorAction Stop
-        $data = if ($resp.PSObject.Properties['data'] -and $resp.data) { @($resp.data) } else { @() }
+        $data = if ($resp.PSObject.Properties['data'] -and $resp.data) { @(@($resp.data) | Where-Object { $null -ne $_ }) } else { @() }
         return [PSCustomObject]@{ Ok = $true; Nodes = $data; Error = '' }
     } catch {
         return [PSCustomObject]@{ Ok = $false; Nodes = @(); Error = (Get-HttpErrorDetail $_) }
@@ -1405,6 +1556,7 @@ function Get-ArchiveSubtree([string]$repoKey, [string]$path, [string]$text) {
 # An archive *file* node (not a folder) whose name has an archive extension — i.e.
 # something we can expand inline by fetching its sub-tree.
 function Get-NodeIsArchive($n) {
+    if ($null -eq $n) { return $false }
     if (Get-NodeIsFolder $n) { return $false }
     return Get-IsArchive (Get-NodeName $n)
 }
@@ -1412,6 +1564,7 @@ function Get-NodeIsArchive($n) {
 # The General-tab info object carried by a node (size/compressed/modificationTime
 # /crc), or $null. Sometimes it arrives stringified; we only use real objects.
 function Get-NodeInfo($n) {
+    if ($null -eq $n) { return $null }
     if ($n.PSObject.Properties['tabs']) {
         foreach ($t in @($n.tabs)) {
             if ($t -and $t.PSObject.Properties['info'] -and $t.info -and ($t.info -isnot [string])) {
@@ -1425,6 +1578,7 @@ function Get-NodeInfo($n) {
 # Repo-relative download path for an internal entry (the repoKey/...zip!/entry
 # form Artifactory serves single archive entries from), or '' for folders.
 function Get-NodeDownloadPath($n) {
+    if ($null -eq $n) { return '' }
     if ($n.PSObject.Properties['downloadPath'] -and "$($n.downloadPath)") { return "$($n.downloadPath)" }
     return ''
 }
@@ -1438,6 +1592,7 @@ function Format-Epoch($ms) {
 # Full download URL for an internal archive entry (repoKey + downloadPath, the
 # repo/...zip!/entry form Artifactory serves single entries from).
 function Get-EntryUrl($n) {
+    if ($null -eq $n) { return '' }
     $dp = Get-NodeDownloadPath $n
     if (-not $dp) { return '' }
     $repo = if ($n.PSObject.Properties['repoKey']) { "$($n.repoKey)" } else { '' }
@@ -1446,6 +1601,7 @@ function Get-EntryUrl($n) {
 
 # Internal (within-archive) path of a node, with the archive prefix stripped.
 function Get-NodeInternalPath($n) {
+    if ($null -eq $n) { return '' }
     $np = if ($n.PSObject.Properties['path'])        { "$($n.path)" }        else { '' }
     $ap = if ($n.PSObject.Properties['archivePath']) { "$($n.archivePath)" } else { '' }
     if ($ap -and $np.StartsWith($ap)) { return $np.Substring($ap.Length).TrimStart('/') }
@@ -1766,6 +1922,10 @@ function Show-ArchiveTree([object]$item) {
     $expanded = New-Object 'System.Collections.Generic.HashSet[string]'
     [void]$expanded.Add($rootKey)
     foreach ($n in @($tree.Nodes)) { if (Get-NodeIsFolder $n) { [void]$expanded.Add((Get-NodeKey $n)) } }
+    # Folders/archives the user has expanded at least once this session. Unlike
+    # $expanded (which shrinks on collapse), $seen only grows, so the "?" badge
+    # marks folders never looked in and never reappears once a folder is opened.
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
 
     $rows = [Collections.Generic.List[object]]::new()
     Add-TreeRows @($rootNode) @() $expanded $subCache $null $rows
@@ -1798,6 +1958,11 @@ function Show-ArchiveTree([object]$item) {
             $rebuild = $false
         }
 
+        # Record everything currently expanded as "seen" (open implies seen), so a
+        # folder opened even once never shows the "?" badge again, regardless of
+        # how it was expanded (enter, e/E, arrow). $seen never shrinks.
+        foreach ($k in $expanded) { [void]$seen.Add($k) }
+
         $w   = ((Get-Width) - 1)
         $cur = if ($rows.Count -gt 0 -and $cursor -lt $rows.Count) { $rows[$cursor] } else { $null }
 
@@ -1822,8 +1987,8 @@ function Show-ArchiveTree([object]$item) {
             $curPath = if ($cur) { Get-NodeInternalPath $cur.Node } else { '' }
             $L.Add("  ${DM}$(Trunc ('/' + $curPath) ($w - 4))${R}")
         }
-        $dcol = $leftW + 1   # column of the pane divider, shared by rules + body
-        $L.Add("${DM}$(Make-Rule $w $dcol ([char]0x252C))${R}")
+        # Top border of the tree/detail panes: ┬ at the divider column (leftW+1).
+        $L.Add("$DM$(HR-Join $w ($leftW + 1) ([char]0x252C))$R")
 
         $bodyH = [Math]::Max(3, (Get-Height) - 9)
 
@@ -1853,25 +2018,34 @@ function Show-ArchiveTree([object]$item) {
                     $pfx += if ($row.IsLast) { $ell } else { $tee }
                 }
 
-                # Unexpanded (collapsed) folders/archives get a "[?]" marker; once
-                # expanded it vanishes and the name slides left to fill the gap.
-                $markPlain = if ($row.Expandable -and $row.HasKids -and -not $row.IsOpen) { '[?] ' } else { '' }
-                $mark = if ($markPlain) { "${YL}$markPlain${R}" } else { '' }
-                $disp = if ($row.IsFolder) { "$($row.Name)/" } else { $row.Name }
-                $nameW = [Math]::Max(1, $leftW - 2 - $pfx.Length - $markPlain.Length)
-                $disp  = Trunc $disp $nameW
+                # Trailing badges (reserve 2 cols so they survive name truncation):
+                #  '+'  a never-opened folder — it has contents not yet looked in.
+                #  '·'  a previewable plain file.
+                # Once a folder is opened the '+' is gone for good (even after a
+                # collapse) since $seen, unlike IsOpen, never resets. Sub-archives
+                # get neither badge — they're treated as plain, non-expandable files.
+                $unseen = $row.IsFolder -and $row.HasKids -and -not $seen.Contains($row.Key)
+                $pv     = (-not $row.IsFolder) -and (-not $row.IsArchive) -and (Get-IsPreviewable $row.Name)
 
                 # Downloaded files render washed-out (dim).
                 $dlVisited = (-not $row.IsFolder) -and (Test-Visited (Get-EntryUrl $row.Node))
-                $fileCol   = if ($dlVisited) { $DM } else { $CY }
+
+                $disp  = if ($row.IsFolder) { "$($row.Name)/" } else { $row.Name }
+                $nameW = [Math]::Max(1, $leftW - 2 - $pfx.Length)
+                if ($unseen -or $pv) { $nameW = [Math]::Max(1, $nameW - 2) }
+                $disp  = Trunc $disp $nameW
+                $badge = if ($unseen) { "${YL} +${R}" }
+                         elseif ($pv) { $bc = if ($dlVisited) { $DM } else { $YL }; "${bc} $script:PreviewGlyph${R}" }
+                         else { '' }
+
+                # Sub-archives share the plain-file styling (same colour); their only
+                # distinction shows in the preview pane.
                 $gutter = if ($sel) { "${BD}${YL}>${R} " } else { '  ' }
                 $body = if ($row.IsFolder) {
-                    if ($sel) { "$mark${BD}${MG}$disp${R}" } else { "$mark${MG}$disp${R}" }
-                } elseif ($row.IsArchive) {
-                    if ($sel) { "$mark${BD}${fileCol}$disp${R}" } else { "$mark${fileCol}$disp${R}" }
+                    if ($sel) { "${BD}${MG}$disp${R}$badge" } else { "${MG}$disp${R}$badge" }
                 } else {
-                    if ($dlVisited) { if ($sel) { "${BD}${DM}$disp${R}" } else { "${DM}$disp${R}" } }
-                    elseif ($sel)   { "${BD}${CY}$disp${R}" } else { "$disp" }
+                    if ($dlVisited) { if ($sel) { "${BD}${DM}$disp${R}$badge" } else { "${DM}$disp${R}$badge" } }
+                    elseif ($sel)   { "${BD}${CY}$disp${R}$badge" } else { "$disp$badge" }
                 }
                 $leftLines.Add("$gutter${DM}$pfx${R}$body")
             }
@@ -1886,9 +2060,13 @@ function Show-ArchiveTree([object]$item) {
             else {
                 $detail = @(Get-NodeDetailLines $cur.Node $rightW)
                 if ($previewMode -and -not $cur.IsFolder) {
-                    $info = Get-NodeInfo $cur.Node
-                    $sz   = if ($info -and $info.PSObject.Properties['size']) { [long]$info.size } else { -1 }
-                    $detail += @(Get-PreviewLines (Get-NodeName $cur.Node) (Get-EntryUrl $cur.Node) $sz $rightW ($bodyH - $detail.Count - 2))
+                    if ($cur.IsArchive) {
+                        $detail += @(Get-PreviewMessageLines "Nested archive contents can't be browsed or previewed." $rightW)
+                    } else {
+                        $info = Get-NodeInfo $cur.Node
+                        $sz   = if ($info -and $info.PSObject.Properties['size']) { [long]$info.size } else { -1 }
+                        $detail += @(Get-PreviewLines (Get-NodeName $cur.Node) (Get-EntryUrl $cur.Node) $sz $rightW ($bodyH - $detail.Count - 2))
+                    }
                 }
             }
         }
@@ -1898,33 +2076,44 @@ function Show-ArchiveTree([object]$item) {
         for ($i = 0; $i -lt $bodyH; $i++) {
             $lc = if ($i -lt $leftLines.Count) { $leftLines[$i] } else { '' }
             $rc = if ($i -lt $detail.Count)    { $detail[$i] }    else { '' }
-            $L.Add("$(Fit-Vis $lc $leftW) ${DM}$vbar${R} $rc")
+            if ($rc -eq $script:PaneRuleTag) { $L.Add((Format-PaneRule $lc $leftW $rightW)) }
+            else { $L.Add("$(Fit-Vis $lc $leftW) ${DM}$vbar${R} $rc") }
         }
 
-        # Footer (two hint lines), justified across the full width.
-        $L.Add("${DM}$(Make-Rule $w $dcol ([char]0x2534))${R}")
-        $actVerb = if ($cur -and $cur.Expandable) { if ($cur.IsOpen) { 'collapse' } else { 'expand' } }
-                   elseif ($cur) { 'download' } else { '' }
+        # Footer (two hint lines), justified across the full width. The hints adapt
+        # to the highlighted row: only actions actually possible for that selection
+        # are shown — no expand/collapse on a plain file, no download on a folder.
+        # Bottom border closes the panes: ┴ at the divider column (leftW+1).
+        $L.Add("$DM$(HR-Join $w ($leftW + 1) ([char]0x2534))$R")
+        $canExpand   = [bool]($cur -and $cur.Expandable)
+        $canDownload = [bool]($cur -and -not $cur.IsFolder)
+        # 'c' collapses the current node if open, else its (non-root) parent.
+        $canCollapse = [bool]($cur -and ($cur.IsOpen -or
+                       ($cur.Parent -and -not $cur.Node.PSObject.Properties['__root'])))
+        $actVerb = if ($canExpand)        { if ($cur.IsOpen) { 'collapse' } else { 'expand' } }
+                   elseif ($canDownload)  { 'download' } else { '' }
         $pvLabel = if ($previewMode) { 'preview off' } else { 'preview on' }
-        $r1 = @(
-            "${BD}${LB}$([char]0x2191)$([char]0x2193)${RB}${R}${DM} move${R}",
-            "${BD}${LB}$([char]0x21B5)${RB}${R}${DM} $actVerb${R}",
-            "${BD}${LB}e${RB}${R}${DM} expand level${R}",
-            "${BD}${LB}E${RB}${R}${DM} expand all${R}",
-            "${BD}${LB}c${RB}${R}${DM} collapse${R}",
-            "${BD}${LB}C${RB}${R}${DM} collapse all${R}",
-            "${BD}${LB}v${RB}${R}${DM} $pvLabel${R}"
-        )
-        $r2 = @(
-            "${BD}${LB}g/G${RB}${R}${DM} top/bottom${R}",
-            "${BD}${LB}n/p${RB}${R}${DM} next/prev folder${R}",
-            "${BD}${LB}/${RB}${R}${DM} search${R}",
-            "${BD}${LB}d${RB}${R}${DM} download${R}",
-            "${BD}${LB}q${RB}${R}${DM} back${R}"
-        )
-        if ($previewMode) { $r2 += "${BD}${LB}y${RB}${R}${DM} preview big${R}" }
-        $L.Add((Join-Justified $r1 $w))
-        $L.Add((Join-Justified $r2 $w))
+
+        $r1 = [Collections.Generic.List[string]]::new()
+        $r1.Add("${BD}${LB}$([char]0x2191)$([char]0x2193)${RB}${R}${DM} move${R}")
+        if ($actVerb)   { $r1.Add("${BD}${LB}$([char]0x21B5)${RB}${R}${DM} $actVerb${R}") }
+        if ($canExpand) {
+            $r1.Add("${BD}${LB}e${RB}${R}${DM} expand level${R}")
+            $r1.Add("${BD}${LB}E${RB}${R}${DM} expand all${R}")
+        }
+        if ($canCollapse) { $r1.Add("${BD}${LB}c${RB}${R}${DM} collapse${R}") }
+        $r1.Add("${BD}${LB}C${RB}${R}${DM} collapse all${R}")
+        $r1.Add("${BD}${LB}v${RB}${R}${DM} $pvLabel${R}")
+
+        $r2 = [Collections.Generic.List[string]]::new()
+        $r2.Add("${BD}${LB}g/G${RB}${R}${DM} top/bottom${R}")
+        $r2.Add("${BD}${LB}n/p${RB}${R}${DM} next/prev folder${R}")
+        $r2.Add("${BD}${LB}/${RB}${R}${DM} search${R}")
+        if ($canDownload)                  { $r2.Add("${BD}${LB}d${RB}${R}${DM} download${R}") }
+        if ($previewMode -and $canDownload) { $r2.Add("${BD}${LB}y${RB}${R}${DM} preview big${R}") }
+        $r2.Add("${BD}${LB}q${RB}${R}${DM} back${R}")
+        $L.Add((Join-Justified $r1.ToArray() $w))
+        $L.Add((Join-Justified $r2.ToArray() $w))
 
         Show-Frame $L.ToArray()
 
@@ -1964,14 +2153,13 @@ function Show-ArchiveTree([object]$item) {
             }
 
             '^e$' {
-                # Expand all expandable siblings at the current level.
-                if ($cur) {
+                # Expand all sibling folders at the current level. Only meaningful
+                # when the selection itself is expandable (a folder); a no-op on a
+                # file or sub-archive, matching the context menu.
+                if ($cur -and $cur.Expandable) {
                     $parentNode = if ($cur.Parent) { $cur.Parent } else { $cur.Node }
-                    foreach ($s in @(Get-NodeKidsResolved $parentNode $subCache)) {
-                        if ((Get-NodeIsFolder $s) -or (Get-NodeIsArchive $s)) {
-                            if (Get-NodeIsArchive $s) { Load-SubArchive $s $item $subCache }
-                            [void]$expanded.Add((Get-NodeKey $s))
-                        }
+                    foreach ($s in @(Get-NodeChildren $parentNode)) {
+                        if (Get-NodeIsFolder $s) { [void]$expanded.Add((Get-NodeKey $s)) }
                     }
                     $rebuild = $true
                 }
@@ -2022,19 +2210,11 @@ function Show-ArchiveTree([object]$item) {
     }
 }
 
-# Expand a node, lazily loading a sub-archive's contents first if needed. Returns
-# a notice string on failure (e.g. a nested archive the server won't browse), or
-# '' on success.
+# Mark a folder node expanded. Only folders are expandable (sub-archives are
+# treated as plain files), so this is a simple set insert; the $item/$subCache
+# parameters are kept for call-site symmetry. Returns '' (no failure path).
 function Expand-TreeNodeInline($cur, $item, $subCache, $expanded) {
     if (-not $cur.Expandable) { return '' }
-    if ($cur.IsArchive) {
-        Show-Popup @("Reading sub-archive", $cur.Name)
-        Load-SubArchive $cur.Node $item $subCache
-        if (@(Get-NodeKidsResolved $cur.Node $subCache).Count -eq 0) {
-            # Artifactory can't browse archives nested inside another archive.
-            return "${RD}Can't open ${CY}$($cur.Name)${R}${RD} - nested archives aren't browsable.${R}"
-        }
-    }
     [void]$expanded.Add($cur.Key)
     return ''
 }
@@ -2129,6 +2309,27 @@ function View-Item([object]$item, [int]$Number) {
             '^q$' { return 'quit' }
         }
     }
+}
+
+# Act on a chosen result row, per the current view:
+#   simple              -> open the detail page (archives get a browse/explore
+#                          option inside View-Item, shown like any other file).
+#   detailed / preview  -> archives open the tree browser; plain files download
+#                          straight away and flash the result on the results page.
+# Returns 'quit' to exit the app, otherwise ''.
+function Invoke-ItemAction([object]$chosen, [int]$Number, [string]$Mode) {
+    Mark-Visited ([string]$chosen.Uri)
+    if ($Mode -eq 'simple') {
+        return (View-Item $chosen $Number)            # 'back' or 'quit'
+    }
+    if (Get-IsArchive ([string]$chosen.Name)) {
+        Show-ArchiveTree $chosen
+        return ''
+    }
+    Show-Popup @("Downloading", $chosen.Name)
+    $script:Flash.Message = Save-Item $chosen (Get-ItemUrl $chosen)
+    $script:Flash.At      = [DateTime]::UtcNow
+    return ''
 }
 
 # ── INPUT ─────────────────────────────────────────────────────────────────────
@@ -2355,13 +2556,7 @@ $selRow     = 0        # highlighted row within the current page (cursor)
             '^(enter|o)$' {
                 $absIdx = $offset + $selRow
                 if ($pageItems.Count -gt 0 -and $absIdx -ge 0 -and $absIdx -lt $totalItems) {
-                    $chosen = $allItems[$absIdx]
-                    Mark-Visited ([string]$chosen.Uri)
-                    if (Get-IsArchive ([string]$chosen.Name)) {
-                        Show-ArchiveTree $chosen
-                    } elseif ((View-Item $chosen ($absIdx + 1)) -eq 'quit') {
-                        break main
-                    }
+                    if ((Invoke-ItemAction $allItems[$absIdx] ($absIdx + 1) $mode) -eq 'quit') { break main }
                 }
                 break nav
             }
@@ -2389,14 +2584,7 @@ $selRow     = 0        # highlighted row within the current page (cursor)
                     $n = 0; if ([int]::TryParse($key, [ref]$n)) { $n } else { $null }
                 }
                 if ($null -ne $sel -and $sel -ge 1 -and $sel -le $totalItems) {
-                    $chosen = $allItems[$sel - 1]
-                    Mark-Visited ([string]$chosen.Uri)
-                    # Archives skip the detail page and open the tree browser directly.
-                    if (Get-IsArchive ([string]$chosen.Name)) {
-                        Show-ArchiveTree $chosen
-                    } elseif ((View-Item $chosen $sel) -eq 'quit') {
-                        break main
-                    }
+                    if ((Invoke-ItemAction $allItems[$sel - 1] $sel $mode) -eq 'quit') { break main }
                 }
                 break nav   # redraw the results page
             }
