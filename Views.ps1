@@ -254,7 +254,11 @@ function Get-PreviewLines([string]$name, [string]$url, [long]$sizeBytes, [int]$p
         $L.Add("${DM}Loading preview...${R}"); return $L.ToArray()
     }
     $res = $script:PreviewCache[$key]
-    if (-not $res.Ok) { $L.Add("${RD}$($res.Error)${R}"); return $L.ToArray() }
+    if (-not $res.Ok) {
+        $L.Add("${RD}Could not load file for preview.${R}")
+        if ($res.Error) { foreach ($wl in (Wrap-Text ([string]$res.Error) $paneW)) { $L.Add("${DM}$wl${R}") } }
+        return $L.ToArray()
+    }
     $bytes = $res.Bytes
     if ($null -eq $bytes) { $L.Add("${RD}Could not load file for preview.${R}"); return $L.ToArray() }
     # Seed the byte cache so a later download of this file reuses the fetch.
