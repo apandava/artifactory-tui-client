@@ -1,0 +1,26 @@
+# Claude Code local files
+CLAUDE.md
+.claude/
+
+# Downloads created at runtime (default -OutDir)
+artca-downloads/
+
+# Secrets / local config — never commit tokens or API keys
+*.secret
+*.token
+.env
+*.local.ps1
+secrets.ps1
+
+# PowerShell transcripts / logs
+*.log
+PowerShell_transcript.*
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+Desktop.ini
+.DS_Store
