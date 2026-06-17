@@ -56,8 +56,16 @@ function Get-Height {
 function ConvertTo-KeyToken($k) {
     $ch = $k.Character
     if ($ch -and [int][char]$ch -ge 32) { return ([string]$ch).ToLower() }
+    # Shift+Up / Shift+Down get distinct tokens (used to scroll the preview pane);
+    # the shift state rides on ControlKeyState. Guarded since some hosts omit it —
+    # there it just degrades to a plain arrow.
+    $shift = $false
+    try { $shift = ($k.ControlKeyState -band [System.Management.Automation.Host.ControlKeyStates]::ShiftPressed) -ne 0 } catch { }
     switch ([int]$k.VirtualKeyCode) {
-        37 { 'left' }    38 { 'up' }      39 { 'right' }  40 { 'down' }
+        37 { 'left' }
+        38 { if ($shift) { 'shift+up' }   else { 'up' } }
+        39 { 'right' }
+        40 { if ($shift) { 'shift+down' } else { 'down' } }
         33 { 'pageup' }  34 { 'pagedown' } 36 { 'home' }  35 { 'end' }
         13 { 'enter' }
         8  { 'backspace' }
@@ -212,6 +220,30 @@ function Invoke-TreeRowBurst([ref]$Cursor, [int]$RowCount, [ref]$Pending, [int]$
     if ($c -lt 0)                 { $c = 0 }
     if ($c -gt ($RowCount - 1))   { $c = $RowCount - 1 }
     $Cursor.Value = $c
+}
+
+# Coalesce a held preview-scroll burst (Shift+Down / Shift+Up) into one net offset
+# change, the same way Invoke-RowBurst coalesces selection moves, so holding a scroll
+# key doesn't backlog renders. $InitialDelta is the move from the triggering keypress
+# (already counted). The result is clamped to [0, $MaxScroll]; the first non-scroll
+# key encountered is handed back via $Pending. Uses the case-preserving poll so a
+# drained Shift-letter (e.g. E in the tree view) keeps its case for the caller.
+function Invoke-ScrollBurst([ref]$Scroll, [int]$MaxScroll, [ref]$Pending, [int]$InitialDelta) {
+    $delta = $InitialDelta
+    $stop  = $false
+    while (-not $stop) {
+        $k = Read-KeyNowCased       # non-blocking; drains key-up events
+        if ($null -eq $k) { break }
+        switch -regex ($k) {
+            '^shift\+down$' { $delta++ }
+            '^shift\+up$'   { $delta-- }
+            default         { $Pending.Value = $k; $stop = $true }
+        }
+    }
+    $s = $Scroll.Value + $delta
+    if ($s -lt 0)          { $s = 0 }
+    if ($s -gt $MaxScroll) { $s = $MaxScroll }
+    $Scroll.Value = $s
 }
 
 function Clear-Screen { Clear-Host }
