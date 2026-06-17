@@ -424,6 +424,11 @@ $script:ArcTreeCache = @{}                                              # item u
 # NUL-wrapped so it can never collide with real content.
 $script:PaneRuleTag = "$([char]0)PANE_RULE$([char]0)"
 
+# Sentinel placed in the LEFT pane (after the column header) to request a header
+# divider that joins the vertical pane separator from the left with a ┤. Mirror of
+# $PaneRuleTag for the opposite pane; NUL-wrapped for the same reason.
+$script:HeaderRuleTag = "$([char]0)HDR_RULE$([char]0)"
+
 function Mark-Visited([string]$key) { if ($key) { [void]$script:Visited.Add($key) } }
 function Test-Visited([string]$key) { return ($key -and $script:Visited.Contains($key)) }
 
@@ -541,6 +546,16 @@ function Wrap-Text([string]$s, [int]$width) {
 function Format-PaneRule([string]$leftCell, [int]$leftW, [int]$rightW) {
     $tee = [char]0x251C; $hz = [char]0x2500
     return "$(Fit-Vis $leftCell $leftW) ${DM}$tee$([string]$hz * ([Math]::Max(1, $rightW + 1)))${R}"
+}
+
+# Render a left-pane horizontal divider (between the column header and the rows)
+# that joins the vertical pane separator from the left with a ┤, so it reads as one
+# connected rule. Spans the left pane; $rightCell is whatever the right pane shows
+# on this row (drawn unchanged to the right of the junction). $leftW is the left
+# pane width (the separator sits at $leftW + 1).
+function Format-HeaderRule([string]$rightCell, [int]$leftW) {
+    $tee = [char]0x2524; $hz = [char]0x2500
+    return "${DM}$([string]$hz * ($leftW + 1))$tee${R} $rightCell"
 }
 
 # Preview-pane block showing a single explanatory message in place of contents
@@ -1185,8 +1200,9 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
         $L.Add("$DM$(HR-Join $w ($colW + 1) ([char]0x252C))$R")
         $bodyH = [Math]::Max(4, (Get-Height) - $L.Count - 3)
 
-        # Window the rows around the cursor (1 line reserved for the column header).
-        $rowsH = [Math]::Max(1, $bodyH - 1)
+        # Window the rows around the cursor (2 lines reserved: column header + the
+        # header divider beneath it).
+        $rowsH = [Math]::Max(1, $bodyH - 2)
         $sIdx = 0; $eIdx = $rowStrs.Count - 1; $indTop = $false; $indBot = $false
         if ($rowStrs.Count -gt $rowsH) {
             $winH = [Math]::Max(1, $rowsH - 2)
@@ -1197,6 +1213,7 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
         }
         $leftLines = [Collections.Generic.List[string]]::new()
         $leftLines.Add("  $hdrLine")
+        $leftLines.Add($script:HeaderRuleTag)   # divider between header and rows
         if ($Items.Count -eq 0) { $leftLines.Add("  ${DM}No results.${R}") }
         else {
             if ($indTop) { $leftLines.Add("  ${DM}$([char]0x2191) $sIdx more${R}") }
@@ -1238,7 +1255,8 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
         for ($i = 0; $i -lt $bodyH; $i++) {
             $lc = if ($i -lt $leftLines.Count)  { $leftLines[$i] }  else { '' }
             $rc = if ($i -lt $rightLines.Count) { $rightLines[$i] } else { '' }
-            if ($rc -eq $script:PaneRuleTag) { $L.Add((Format-PaneRule $lc $colW $rightW)) }
+            if ($rc -eq $script:PaneRuleTag)        { $L.Add((Format-PaneRule $lc $colW $rightW)) }
+            elseif ($lc -eq $script:HeaderRuleTag)  { $L.Add((Format-HeaderRule $rc $colW)) }
             else { $L.Add("$(Fit-Vis $lc $colW) ${DM}$([char]0x2502)${R} $rc") }
         }
         $L.Add("$DM$(HR-Join $w ($colW + 1) ([char]0x2534))$R")
