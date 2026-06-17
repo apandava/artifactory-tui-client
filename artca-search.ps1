@@ -21,7 +21,9 @@
 .PARAMETER Repos
     Optional comma-separated list of repositories to restrict the search to.
 .PARAMETER PageSize
-    Rows per page (default 25). Paging is client-side over the result set.
+    Rows per page. Paging is client-side over the result set. Defaults to 0,
+    meaning auto-size to fill the current window (and re-fit when it's resized);
+    pass a positive number to pin a fixed page size instead.
 .PARAMETER Prefetch
     How many pages ahead to eagerly warm in the background (default 5). The page
     you're on plus this many ahead are fetched at full concurrency; pages beyond
@@ -36,7 +38,7 @@ param(
     [string] $Token    = '',
     [string] $Basic    = '',
     [string] $Repos    = '',
-    [int]    $PageSize = 25,
+    [int]    $PageSize = 0,
     [int]    $Prefetch = 5,
     [string] $OutDir   = (Join-Path (Get-Location).Path 'artca-downloads')
 )
@@ -49,6 +51,13 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::DefaultConnectionLimit = 64
 [Net.ServicePointManager]::SecurityProtocol =
     [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+# Windows PowerShell 5.1 leaves the console on the OEM code page (CP437/850),
+# which can't encode glyphs outside its set — anything beyond it (e.g. …, the
+# truncation marker) is transliterated to '?'. Box-drawing chars survive only
+# because they happen to live in CP437. Switch console output to UTF-8 so every
+# Unicode glyph renders. Guarded: ISE / redirected output can't set this and throw.
+try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new() } catch { }
 
 # ── ANSI ──────────────────────────────────────────────────────────────────────
 # $host.UI.SupportsVirtualTerminal is set by the host process (Windows Terminal,
@@ -74,8 +83,8 @@ $LB = '['; $RB = ']'
 $script:ArcGlyph     = '+'
 $script:PreviewGlyph = [char]0x00B7
 
-# Marker appended wherever text is truncated to fit a column (▶).
-$script:Cut = [char]0x25B6
+# Marker appended wherever text is truncated to fit a column (…).
+$script:Cut = [char]0x2026
 
 # ── HOST CAPABILITIES ───────────────────────────────────────────────────────────
 # PowerShell ISE has no real console: RawUI.ReadKey / KeyAvailable throw or
@@ -94,7 +103,7 @@ $script:Vt = ($host.UI.SupportsVirtualTerminal -and $script:CanRawKey)
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
-# Pad/truncate to exactly $n columns. When text is cut off, end it with ▶ so the
+# Pad/truncate to exactly $n columns. When text is cut off, end it with … so the
 # truncation is visible. ($script:Cut is the marker, defined once below.)
 function Clip([string]$s, [int]$n) {
     if ($s.Length -gt $n) { return $s.Substring(0, $n - 1) + $script:Cut }
@@ -106,7 +115,7 @@ function ClipR([string]$s, [int]$n) {
     return $s.PadLeft($n)
 }
 
-# Truncate without padding (for free-form values), with the ▶ marker.
+# Truncate without padding (for free-form values), with the … marker.
 function Trunc([string]$s, [int]$n) {
     if ($s.Length -gt $n) { return $s.Substring(0, [Math]::Max(1, $n - 1)) + $script:Cut }
     return $s
@@ -198,6 +207,28 @@ function Read-KeyTimeout([int]$TimeoutMs) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
     do {
         $t = Read-KeyNow
+        if ($null -ne $t) { return $t }
+        Start-Sleep -Milliseconds 25
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $null
+}
+
+# Case-preserving variants of the non-blocking poll, for the archive tree (which
+# distinguishes e/E, c/C, g/G). Same key-up draining as Read-KeyNow.
+function Read-KeyNowCased {
+    if (-not $script:CanRawKey) { return $null }
+    while ($host.UI.RawUI.KeyAvailable) {
+        $k = $host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown,IncludeKeyUp')
+        if (-not $k.KeyDown) { continue }
+        $t = ConvertTo-KeyTokenCased $k
+        if ($t -ne '') { return $t }
+    }
+    return $null
+}
+function Read-KeyTimeoutCased([int]$TimeoutMs) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    do {
+        $t = Read-KeyNowCased
         if ($null -ne $t) { return $t }
         Start-Sleep -Milliseconds 25
     } while ([DateTime]::UtcNow -lt $deadline)
@@ -416,7 +447,6 @@ $script:Visited      = New-Object 'System.Collections.Generic.HashSet[string]'
 $script:MemFiles     = @{}                                              # url -> [byte[]]
 $script:PreviewOK    = New-Object 'System.Collections.Generic.HashSet[string]'  # large files user opted to preview
 $script:PreviewLimit = 512000                                           # 0.5 MB preview cap
-$script:ArcTreeCache = @{}                                              # item uri -> archive tree result (preview pane)
 
 # Sentinel emitted by Get-PreviewLines in place of the preview's horizontal rule.
 # Two-pane compositors recognise it and draw a rule that joins the vertical pane
@@ -497,13 +527,6 @@ function Get-FileBytes([string]$url) {
     finally { $ProgressPreference = $old }
 }
 
-# Fetch bytes, caching them in memory by url so a later download/preview reuses them.
-function Get-CachedBytes([string]$url) {
-    if ($script:MemFiles.ContainsKey($url)) { return $script:MemFiles[$url] }
-    $b = Get-FileBytes $url
-    if ($null -ne $b) { $script:MemFiles[$url] = $b }
-    return $b
-}
 
 # Decode bytes to text (UTF-8, BOM-aware).
 function Convert-BytesToText([byte[]]$bytes) {
@@ -590,8 +613,18 @@ function Get-PreviewLines([string]$name, [string]$url, [long]$sizeBytes, [int]$p
         $L.Add("${DM}Press [y] to preview it anyway.${R}")
         return $L.ToArray()
     }
-    $bytes = Get-CachedBytes $url
+    # Contents come from the background preview cache (warmed by the nav loop); the
+    # pane shows a loading line until the fetch lands, never blocking input.
+    $key = Get-FilePreviewKey $url
+    if (-not $script:PreviewCache.ContainsKey($key)) {
+        $L.Add("${DM}Loading preview...${R}"); return $L.ToArray()
+    }
+    $res = $script:PreviewCache[$key]
+    if (-not $res.Ok) { $L.Add("${RD}$($res.Error)${R}"); return $L.ToArray() }
+    $bytes = $res.Bytes
     if ($null -eq $bytes) { $L.Add("${RD}Could not load file for preview.${R}"); return $L.ToArray() }
+    # Seed the byte cache so a later download of this file reuses the fetch.
+    if (-not $script:MemFiles.ContainsKey($url)) { $script:MemFiles[$url] = $bytes }
     $text  = Convert-BytesToText $bytes
     $wrapped = Wrap-Text $text $paneW
     $shown = [Math]::Min($wrapped.Count, [Math]::Max(1, $maxLines))
@@ -637,9 +670,12 @@ function Get-ArchivePreviewLines($item, [int]$paneW, [int]$maxLines) {
     $L = [Collections.Generic.List[string]]::new()
     $L.Add($script:PaneRuleTag)
     $L.Add("${BD}${YL}Archive preview${R}")
-    $key = [string]$item.Uri
-    if (-not $script:ArcTreeCache.ContainsKey($key)) { $script:ArcTreeCache[$key] = Get-ArchiveTree $item }
-    $tree = $script:ArcTreeCache[$key]
+    # Entry listing comes from the background preview cache (warmed by the nav loop).
+    $key = Get-ArcPreviewKey ([string]$item.Uri)
+    if (-not $script:PreviewCache.ContainsKey($key)) {
+        $L.Add("${DM}Loading preview...${R}"); return $L.ToArray()
+    }
+    $tree = $script:PreviewCache[$key]
     if (-not $tree.Ok) {
         $L.Add("${RD}Could not read archive.${R}")
         if ($tree.Error) { foreach ($wl in (Wrap-Text ([string]$tree.Error) $paneW)) { $L.Add("${DM}$wl${R}") } }
@@ -975,6 +1011,329 @@ function Start-Lookahead([object[]]$Items) {
     $script:LaHandle = $ps.BeginInvoke()
 }
 
+# ── BACKGROUND PREVIEW PREFETCH ───────────────────────────────────────────────
+# Previews (a file's text, or an archive's entry listing) used to be fetched
+# synchronously the moment a row was highlighted, so every cursor move blocked on
+# the network. Instead we warm them on a small runspace pool that writes into a
+# synchronized cache; the preview pane shows "Loading..." until the entry lands,
+# and the main loop keeps taking keystrokes the whole time. Mirrors the metadata
+# prefetch system above. Cache keys are kind-prefixed ("F|<url>" for a file,
+# "A|<uri>" for an archive) so the one cache serves both render paths.
+$script:PreviewCache = [hashtable]::Synchronized(@{})   # key -> result (bg-written)
+$script:PvPool   = $null
+$script:PvJobs   = [Collections.Generic.List[object]]::new()
+$script:PvQueued = @{}   # keys in flight (main-thread only)
+
+function Get-FilePreviewKey([string]$url) { "F|$url" }
+function Get-ArcPreviewKey([string]$uri)  { "A|$uri" }
+
+# Shared error-extraction, injected into every background worker (runspaces can't
+# see our functions). Pulls a useful message off a failed web request: the HTTP
+# status plus the server's own error body — so a blacked-out-repo 404 surfaces as
+# "HTTP 404 - The repository '...' is blacked out..." rather than a generic line.
+$script:PvErrFn = @'
+function Get-WkError($e) {
+    $code = 0
+    try { if ($e.Exception.Response) { $code = [int]$e.Exception.Response.StatusCode } } catch { }
+    # The server's response body: $e.ErrorDetails.Message holds it for failed web
+    # cmdlets (reliable even after the cmdlet consumed the stream); fall back to
+    # reading the response stream directly.
+    $bd = ''
+    try { if ($e.ErrorDetails -and $e.ErrorDetails.Message) { $bd = "$($e.ErrorDetails.Message)" } } catch { }
+    if (-not $bd) {
+        try { if ($e.Exception.Response) { $bd = [System.IO.StreamReader]::new($e.Exception.Response.GetResponseStream()).ReadToEnd() } } catch { }
+    }
+    $detail = ''
+    if ($bd) {
+        try {
+            $j = $bd | ConvertFrom-Json
+            if ($j.PSObject.Properties['errors'] -and $j.errors) { $detail = (@($j.errors | ForEach-Object { "$($_.message)" }) -join '; ') }
+            elseif ($j.PSObject.Properties['message']) { $detail = "$($j.message)" }
+        } catch { $detail = $bd.Trim() }
+    }
+    $msg = if ($detail -and $code -gt 0) { "HTTP $code - $detail" }
+           elseif ($detail)             { $detail }
+           elseif ($code -gt 0)         { "HTTP $code" }
+           else                         { '' }
+    return [PSCustomObject]@{ Code = $code; Message = $msg }
+}
+
+'@
+
+# File preview worker: fetch raw bytes; decoding/wrapping stays on the main thread.
+# Get-WkError is injected ahead of this body by Start-PreviewPrefetch (a separate
+# AddScript) so $PvErrFn isn't duplicated and param() can stay first here.
+$script:PvFileScript = {
+    param($key, $url, $headers, $cache, $alert)
+    $old = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+    try {
+        $resp = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -ErrorAction Stop
+        $bytes = if ($resp.RawContentStream) { $resp.RawContentStream.ToArray() }
+                 elseif ($resp.Content -is [byte[]]) { [byte[]]$resp.Content }
+                 else { [Text.Encoding]::UTF8.GetBytes([string]$resp.Content) }
+        $cache[$key] = [PSCustomObject]@{ Ok = $true; Bytes = $bytes; Nodes = $null; Error = '' }
+    } catch {
+        $we = Get-WkError $_
+        if ($we.Code -eq 429 -or $we.Code -eq 503) { $alert.Message = "Server rate-limited a preview request (HTTP $($we.Code))."; $alert.At = [DateTime]::UtcNow }
+        $err = if ($we.Message) { $we.Message } else { "Could not load file for preview." }
+        $cache[$key] = [PSCustomObject]@{ Ok = $false; Bytes = $null; Nodes = $null; Error = $err }
+    } finally { $ProgressPreference = $old }
+}
+
+# Archive preview worker: POST the tree-browser request, store the top-level nodes.
+$script:PvArcScript = {
+    param($key, $uri, $body, $headers, $ua, $cache, $alert)
+    try {
+        $resp = Invoke-RestMethod -Uri $uri -Method Post -Body $body `
+                    -ContentType 'application/json' -Headers $headers -UserAgent $ua -ErrorAction Stop
+        $data = if ($resp.PSObject.Properties['data'] -and $resp.data) { @(@($resp.data) | Where-Object { $null -ne $_ }) } else { @() }
+        $cache[$key] = [PSCustomObject]@{ Ok = $true; Bytes = $null; Nodes = $data; Error = '' }
+    } catch {
+        $we = Get-WkError $_
+        if ($we.Code -eq 429 -or $we.Code -eq 503) { $alert.Message = "Server rate-limited a preview request (HTTP $($we.Code))."; $alert.At = [DateTime]::UtcNow }
+        $err = if ($we.Message) { $we.Message } else { "Could not read archive." }
+        $cache[$key] = [PSCustomObject]@{ Ok = $false; Bytes = $null; Nodes = $null; Error = $err }
+    }
+}
+
+# Reap finished preview jobs, freeing their in-flight slots (completed handles only).
+function Receive-PreviewPrefetch {
+    if ($script:PvJobs.Count -eq 0) { return }
+    $still = [Collections.Generic.List[object]]::new()
+    foreach ($j in $script:PvJobs) {
+        if ($j.Handle.IsCompleted) {
+            try { [void]$j.PS.EndInvoke($j.Handle) } catch { }
+            try { $j.PS.Dispose() } catch { }
+            $script:PvQueued.Remove($j.Key)
+        } else { $still.Add($j) }
+    }
+    $script:PvJobs = $still
+}
+
+# Cancel any in-flight preview fetch whose key isn't in $Keep, so a fast skim
+# doesn't leave stale neighbour fetches starving the row the user lands on.
+function Restrict-PreviewPrefetch([hashtable]$Keep) {
+    if ($script:PvJobs.Count -eq 0) { return }
+    $still = [Collections.Generic.List[object]]::new()
+    foreach ($j in $script:PvJobs) {
+        if ($Keep.ContainsKey($j.Key)) { $still.Add($j); continue }
+        try { [void]$j.PS.Stop() } catch { }
+        try { $j.PS.Dispose() }    catch { }
+        $script:PvQueued.Remove($j.Key)
+    }
+    $script:PvJobs = $still
+}
+
+# Queue preview fetches for a list of request descriptors (see Get-ItemPreviewRequest
+# / Get-NodePreviewRequest). Already-cached or in-flight keys are skipped; $null
+# entries (nothing to preview) are ignored. Requests are queued in the order given,
+# so callers put the highlighted row first.
+function Start-PreviewPrefetch($Requests) {
+    if ($null -eq $Requests) { return }
+    Receive-PreviewPrefetch
+    foreach ($rq in $Requests) {
+        if (-not $rq) { continue }
+        $k = $rq.Key
+        if ($script:PreviewCache.ContainsKey($k) -or $script:PvQueued.ContainsKey($k)) { continue }
+        if ($null -eq $script:PvPool) {
+            $script:PvPool = [RunspaceFactory]::CreateRunspacePool(1, 6)
+            $script:PvPool.Open()
+        }
+        $ps = [PowerShell]::Create()
+        $ps.RunspacePool = $script:PvPool
+        [void]$ps.AddScript($script:PvErrFn)   # define Get-WkError in the worker scope
+        if ($rq.Kind -eq 'file') {
+            [void]$ps.AddScript($script:PvFileScript).AddArgument($k).AddArgument($rq.Url).
+                AddArgument($rq.Headers).AddArgument($script:PreviewCache).AddArgument($script:Alert)
+        } else {
+            [void]$ps.AddScript($script:PvArcScript).AddArgument($k).AddArgument($rq.Uri).AddArgument($rq.Body).
+                AddArgument($rq.Headers).AddArgument($rq.Ua).AddArgument($script:PreviewCache).AddArgument($script:Alert)
+        }
+        $script:PvJobs.Add([PSCustomObject]@{ PS = $ps; Handle = $ps.BeginInvoke(); Key = $k })
+        $script:PvQueued[$k] = $true
+    }
+}
+
+# True if $key names a preview that's loadable but not yet resolved (in flight or
+# still to be queued) — i.e. the pane should show "Loading...".
+function Test-PreviewLoading([string]$key) {
+    return ($key -and -not $script:PreviewCache.ContainsKey($key))
+}
+
+# Count of these keys still loading / still in flight, used to decide whether to
+# keep polling.
+function Get-PreviewLoadingCount([string[]]$keys) {
+    if ($null -eq $keys) { return 0 }
+    @($keys | Where-Object { $_ -and $script:PvQueued.ContainsKey($_) -and -not $script:PreviewCache.ContainsKey($_) }).Count
+}
+
+# Count of these keys already resolved (cached), used to detect fill-in progress.
+function Get-PreviewLoadedCount([string[]]$keys) {
+    if ($null -eq $keys) { return 0 }
+    @($keys | Where-Object { $_ -and $script:PreviewCache.ContainsKey($_) }).Count
+}
+
+# Count of these keys not yet resolved (loading or still to be trickled).
+function Get-PreviewPendingCount([string[]]$keys) {
+    if ($null -eq $keys) { return 0 }
+    @($keys | Where-Object { $_ -and -not $script:PreviewCache.ContainsKey($_) }).Count
+}
+
+# Block (up to $TimeoutMs) for a single key to resolve. Used on ISE / non-console
+# hosts where the live poll can't run; the caller must have queued it first.
+function Wait-Preview([string]$key, [int]$TimeoutMs) {
+    if (-not $key) { return }
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    while (-not $script:PreviewCache.ContainsKey($key) -and [DateTime]::UtcNow -lt $deadline) {
+        Receive-PreviewPrefetch
+        Start-Sleep -Milliseconds 60
+    }
+}
+
+# ── THROTTLED PREVIEW LOOKAHEAD ───────────────────────────────────────────────
+# After the fast window (the highlighted row + its nearest neighbours, warmed at
+# full concurrency by the pool), the *rest* of the page's previews are trickled in
+# one at a time at a gentle rate by a single self-pacing runspace — nearest-first,
+# until the whole page is warm. Mirrors Start-Lookahead for metadata. Superseded
+# (cancelled + relaunched) whenever the selection moves, so the trickle always
+# fans out from where the cursor actually is.
+$script:PvLaPS     = $null
+$script:PvLaHandle = $null
+$script:PvLaCancel = $null
+$script:PvLaReap   = [Collections.Generic.List[object]]::new()
+
+$script:PvLaScript = {
+    param($reqs, $cache, $cancel, $throttleMs, $alert)
+    foreach ($rq in $reqs) {
+        if ($cancel.stop) { break }
+        $k = $rq.Key
+        if ($cache.ContainsKey($k)) { continue }
+        try {
+            if ($rq.Kind -eq 'file') {
+                $old = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+                try {
+                    $resp  = Invoke-WebRequest -Uri $rq.Url -Headers $rq.Headers -UseBasicParsing -ErrorAction Stop
+                    $bytes = if ($resp.RawContentStream) { $resp.RawContentStream.ToArray() }
+                             elseif ($resp.Content -is [byte[]]) { [byte[]]$resp.Content }
+                             else { [Text.Encoding]::UTF8.GetBytes([string]$resp.Content) }
+                    $cache[$k] = [PSCustomObject]@{ Ok = $true; Bytes = $bytes; Nodes = $null; Error = '' }
+                } finally { $ProgressPreference = $old }
+            } else {
+                $resp = Invoke-RestMethod -Uri $rq.Uri -Method Post -Body $rq.Body `
+                            -ContentType 'application/json' -Headers $rq.Headers -UserAgent $rq.Ua -ErrorAction Stop
+                $data = if ($resp.PSObject.Properties['data'] -and $resp.data) { @(@($resp.data) | Where-Object { $null -ne $_ }) } else { @() }
+                $cache[$k] = [PSCustomObject]@{ Ok = $true; Bytes = $null; Nodes = $data; Error = '' }
+            }
+        } catch {
+            $we = Get-WkError $_
+            if ($we.Code -eq 429 -or $we.Code -eq 503) { $alert.Message = "Server rate-limited a preview request (HTTP $($we.Code))."; $alert.At = [DateTime]::UtcNow }
+            $err = if ($we.Message) { $we.Message } elseif ($rq.Kind -eq 'file') { "Could not load file for preview." } else { "Could not read archive." }
+            $cache[$k] = [PSCustomObject]@{ Ok = $false; Bytes = $null; Nodes = $null; Error = $err }
+        }
+        if (-not $cancel.stop) { Start-Sleep -Milliseconds $throttleMs }
+    }
+}
+
+function Receive-PreviewLookahead {
+    if ($script:PvLaReap.Count -eq 0) { return }
+    $still = [Collections.Generic.List[object]]::new()
+    foreach ($j in $script:PvLaReap) {
+        if ($j.Handle.IsCompleted) {
+            try { [void]$j.PS.EndInvoke($j.Handle) } catch { }
+            try { $j.PS.Dispose() } catch { }
+        } else { $still.Add($j) }
+    }
+    $script:PvLaReap = $still
+}
+
+function Stop-PreviewLookahead {
+    if ($script:PvLaCancel) { $script:PvLaCancel.stop = $true }   # signal; don't block
+    if ($script:PvLaPS) {
+        $script:PvLaReap.Add([PSCustomObject]@{ PS = $script:PvLaPS; Handle = $script:PvLaHandle })
+    }
+    $script:PvLaPS = $null; $script:PvLaHandle = $null; $script:PvLaCancel = $null
+    Receive-PreviewLookahead
+}
+
+# True while the trickle runspace is still running.
+function Test-PreviewLookaheadAlive {
+    return ($null -ne $script:PvLaHandle -and -not $script:PvLaHandle.IsCompleted)
+}
+
+# (Re)launch the trickle over $Requests (already-cached keys are skipped inside the
+# worker too). Supersedes any running trickle.
+function Start-PreviewLookahead($Requests) {
+    Stop-PreviewLookahead
+    if ($null -eq $Requests) { return }
+    $pending = @($Requests | Where-Object { $_ -and -not $script:PreviewCache.ContainsKey($_.Key) })
+    if ($pending.Count -eq 0) { return }
+    $cancel = [hashtable]::Synchronized(@{ stop = $false })
+    $ps     = [PowerShell]::Create()
+    [void]$ps.AddScript($script:PvErrFn)   # define Get-WkError in the worker scope
+    [void]$ps.AddScript($script:PvLaScript).
+        AddArgument($pending).AddArgument($script:PreviewCache).
+        AddArgument($cancel).AddArgument(200).AddArgument($script:Alert)
+    $script:PvLaCancel = $cancel
+    $script:PvLaPS     = $ps
+    $script:PvLaHandle = $ps.BeginInvoke()
+}
+
+# Plan the page's preview warming around the cursor. Visiting indices nearest-first
+# (the highlighted row, then fanning outward), it splits the loadable previews into:
+#   WindowReqs/WindowKeys — within $radius of the cursor: warmed fast by the pool.
+#   RestReqs              — beyond $radius, nearest-first: trickled by the lookahead.
+#   AllKeys               — every loadable preview key on the page (progress / poll).
+function Get-PreviewPlan($pageItems, [int]$selRow, [int]$radius = 4) {
+    $winReqs  = [Collections.Generic.List[object]]::new()
+    $winKeys  = [Collections.Generic.List[string]]::new()
+    $restReqs = [Collections.Generic.List[object]]::new()
+    $allKeys  = [Collections.Generic.List[string]]::new()
+    if ($null -ne $pageItems -and $pageItems.Count -gt 0) {
+        $order = [Collections.Generic.List[int]]::new()
+        $order.Add($selRow)
+        $max = [Math]::Max($selRow, $pageItems.Count - 1 - $selRow)
+        for ($d = 1; $d -le $max; $d++) {
+            if ($selRow + $d -lt $pageItems.Count) { $order.Add($selRow + $d) }
+            if ($selRow - $d -ge 0)                { $order.Add($selRow - $d) }
+        }
+        foreach ($idx in $order) {
+            $rq = Get-ItemPreviewRequest $pageItems[$idx]
+            if (-not $rq) { continue }
+            $allKeys.Add($rq.Key)
+            if ([Math]::Abs($idx - $selRow) -le $radius) { $winReqs.Add($rq); $winKeys.Add($rq.Key) }
+            else { $restReqs.Add($rq) }
+        }
+    }
+    return [PSCustomObject]@{
+        WindowReqs = @($winReqs.ToArray());  WindowKeys = @($winKeys.ToArray())
+        RestReqs   = @($restReqs.ToArray()); AllKeys    = @($allKeys.ToArray())
+    }
+}
+
+# Fast preview window (highlighted entry first, fanning outward) over archive-tree
+# rows (each carrying a .Node) rather than results items. The tree isn't paged and
+# can be huge, so entries beyond the window aren't trickled — only the window warms.
+# Returns { Reqs; Keys }.
+function Get-NodePreviewWindow($rows, [int]$cursor, [int]$radius = 4) {
+    $reqs = [Collections.Generic.List[object]]::new()
+    $keys = [Collections.Generic.List[string]]::new()
+    if ($null -eq $rows -or $rows.Count -eq 0) {
+        return [PSCustomObject]@{ Reqs = @(); Keys = @() }
+    }
+    $order = [Collections.Generic.List[int]]::new()
+    $order.Add($cursor)
+    for ($d = 1; $d -le $radius; $d++) {
+        if ($cursor + $d -lt $rows.Count) { $order.Add($cursor + $d) }
+        if ($cursor - $d -ge 0)           { $order.Add($cursor - $d) }
+    }
+    foreach ($idx in $order) {
+        if ($idx -lt 0 -or $idx -ge $rows.Count) { continue }
+        $rq = Get-NodePreviewRequest $rows[$idx].Node
+        if ($rq) { $reqs.Add($rq); $keys.Add($rq.Key) }
+    }
+    return [PSCustomObject]@{ Reqs = @($reqs.ToArray()); Keys = @($keys.ToArray()) }
+}
+
 # ── SEARCH ────────────────────────────────────────────────────────────────────
 # Parse a storage URI such as
 #   https://host/artifactory/api/storage/<repo>/<dir>/<file>
@@ -1039,12 +1398,23 @@ function Search-Artifacts([string]$Query) {
 # edge, with an optional one-char badge placed immediately after the name text:
 # '+' for a browsable archive, '·' for a previewable file. Space for the badge is
 # reserved before truncating, so even an ellipsised long name still shows it.
-function Format-NameCell([string]$name, [int]$nameW, [bool]$vis) {
-    $col  = if ($vis) { $DM } else { $CY }
-    $gcol = if ($vis) { $DM } else { $YL }       # badge dims with the row when visited
+# In preview mode the badge starts dim (grey) and turns yellow once that item's
+# preview has loaded in the background; elsewhere it's always yellow.
+function Format-NameCell([object]$item, [int]$nameW, [bool]$vis, [bool]$preview = $false) {
+    $name = [string]$item.Name
+    # A preview/fetch error (e.g. blacked-out repo) flags the whole cell red.
+    $errored = Test-ItemPreviewError $item
+    $col  = if ($errored) { $RD } elseif ($vis) { $DM } else { $CY }
     if     (Get-IsArchive $name)     { $glyph = $script:ArcGlyph }
     elseif (Get-IsPreviewable $name) { $glyph = $script:PreviewGlyph }
     else   { return "${col}$(Clip $name $nameW)${R}" }
+
+    $gcol = if ($errored) { $RD }
+            elseif ($vis) { $DM }
+            elseif ($preview) {
+                $k = Get-ItemPreviewKey $item
+                if ($k -and $script:PreviewCache.ContainsKey($k)) { $YL } else { $DM }
+            } else { $YL }
 
     $avail = [Math]::Max(1, $nameW - 2)          # reserve " <glyph>"
     $txt   = Trunc $name $avail                  # ellipsis if too long, no padding
@@ -1080,7 +1450,7 @@ function Format-DetailedRow($item, [int]$Number, [int]$colW, [bool]$vis, [bool]$
     $cDim  = if ($vis) { $DM } else { '' }      # size/rtype: normally default color
     $cRepo = if ($vis) { $DM } else { $MG }
 
-    $nameCell = Format-NameCell $name $nameW $vis
+    $nameCell = Format-NameCell $item $nameW $vis $preview
     $cells = @(
         "${DM}$(ClipR ([string]$Number) $numW)${R}",
         $nameCell,
@@ -1177,7 +1547,7 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
             # Simple view shows no archive/preview badges (detailed/preview only).
             $name = if ($item.Name) { $item.Name } else { '?' }
             $repo = if ($item.Repo) { $item.Repo } else { '?' }
-            $cName = if ($vis) { $DM } else { $CY }
+            $cName = if (Test-ItemPreviewError $item) { $RD } elseif ($vis) { $DM } else { $CY }
             $cRepo = if ($vis) { $DM } else { $MG }
             $nameCell = "${cName}$(Clip $name $nameW)${R}"
             $rowBody = "${DM}$(ClipR ([string]($Offset + $ri + 1)) $numW)${R} $nameCell ${cRepo}$(Clip $repo $repoW)${R} ${DM}$(Clip ([string]$item.Path) $pathW)${R}"
@@ -1523,10 +1893,12 @@ function Get-RepoTypeForUI([string]$repo) {
 # '!/' separator returns 404. A single POST returns the entire archive contents
 # nested under each folder's 'children' — so we make ONE call and navigate the
 # result client-side; there is no per-folder fetch.
-function Invoke-TreeBrowse([string]$repoKey, [string]$repoType, [string]$repoPkgType,
-                           [string]$path, [string]$text) {
-    $uri  = "$($BaseUrl.TrimEnd('/'))/ui/api/v1/ui/v2/treebrowser?compacted=false"
-    $ua   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/151.0'
+# Build the treebrowser POST request (uri / body / headers / user-agent) without
+# sending it. Shared by the synchronous Invoke-TreeBrowse and the background
+# preview worker (which can't call these helpers from its isolated runspace, so it
+# needs the request fully materialised on the main thread).
+function Get-TreeBrowseRequest([string]$repoKey, [string]$repoType, [string]$repoPkgType,
+                               [string]$path, [string]$text) {
     $body = [ordered]@{
         projectKey    = ''
         type          = 'paginatedJunction'
@@ -1542,11 +1914,21 @@ function Invoke-TreeBrowse([string]$repoKey, [string]$repoType, [string]$repoPkg
         isArchive     = $true
         mustInclude   = $null
     } | ConvertTo-Json -Compress
+    return [PSCustomObject]@{
+        Uri     = "$($BaseUrl.TrimEnd('/'))/ui/api/v1/ui/v2/treebrowser?compacted=false"
+        Body    = $body
+        Headers = (Get-UiHeaders)
+        Ua      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/151.0'
+    }
+}
 
+function Invoke-TreeBrowse([string]$repoKey, [string]$repoType, [string]$repoPkgType,
+                           [string]$path, [string]$text) {
+    $rq = Get-TreeBrowseRequest $repoKey $repoType $repoPkgType $path $text
     try {
-        $resp = Invoke-RestMethod -Uri $uri -Method Post -Body $body `
-                    -ContentType 'application/json' -Headers (Get-UiHeaders) `
-                    -UserAgent $ua -ErrorAction Stop
+        $resp = Invoke-RestMethod -Uri $rq.Uri -Method Post -Body $rq.Body `
+                    -ContentType 'application/json' -Headers $rq.Headers `
+                    -UserAgent $rq.Ua -ErrorAction Stop
         $data = if ($resp.PSObject.Properties['data'] -and $resp.data) { @(@($resp.data) | Where-Object { $null -ne $_ }) } else { @() }
         return [PSCustomObject]@{ Ok = $true; Nodes = $data; Error = '' }
     } catch {
@@ -1560,6 +1942,101 @@ function Get-ArchiveTree([object]$item) {
     $repoPkgType = [string](Resolve-Repo $repoKey).PackageType
     $archPath    = if ($item.Path) { "$($item.Path)/$($item.Name)" } else { [string]$item.Name }
     return Invoke-TreeBrowse $repoKey $repoType $repoPkgType $archPath ([string]$item.Name)
+}
+
+# Is this file small enough to auto-preview in the background? Unknown sizes and
+# anything over the cap are gated behind an explicit [y] (PreviewOK), matching the
+# synchronous Get-PreviewLines logic — so we never auto-stream a huge file.
+function Test-FileAutoPreviewable([string]$url, [long]$sizeBytes) {
+    if ($sizeBytes -ge 0 -and $sizeBytes -le $script:PreviewLimit) { return $true }
+    return $script:PreviewOK.Contains($url)
+}
+
+# The preview-cache key for a results item, or '' when there's nothing to load in
+# the background (not previewable, or a gated large file). Cheap; called per row
+# to decide the badge's load-state colour.
+function Get-ItemPreviewKey($item) {
+    $name = [string]$item.Name
+    if (Get-IsArchive $name) { return (Get-ArcPreviewKey ([string]$item.Uri)) }
+    if (Get-IsPreviewable $name) {
+        $url = Get-ItemUrl $item
+        $sz  = if ("$($item.Size)" -ne '' -and "$($item.Size)" -ne '?') { [long]$item.Size } else { -1 }
+        if (Test-FileAutoPreviewable $url $sz) { return (Get-FilePreviewKey $url) }
+    }
+    return ''
+}
+
+# A full background-fetch request descriptor for a results item, or $null when
+# there's nothing to load. Used by Start-PreviewPrefetch.
+function Get-ItemPreviewRequest($item) {
+    $name = [string]$item.Name
+    if (Get-IsArchive $name) {
+        $repoKey     = [string]$item.Repo
+        $repoType    = Get-RepoTypeForUI $repoKey
+        $repoPkgType = [string](Resolve-Repo $repoKey).PackageType
+        $archPath    = if ($item.Path) { "$($item.Path)/$($item.Name)" } else { $name }
+        $rq          = Get-TreeBrowseRequest $repoKey $repoType $repoPkgType $archPath $name
+        return @{ Key = (Get-ArcPreviewKey ([string]$item.Uri)); Kind = 'archive';
+                  Uri = $rq.Uri; Body = $rq.Body; Headers = $rq.Headers; Ua = $rq.Ua }
+    }
+    if (Get-IsPreviewable $name) {
+        $url = Get-ItemUrl $item
+        $sz  = if ("$($item.Size)" -ne '' -and "$($item.Size)" -ne '?') { [long]$item.Size } else { -1 }
+        if (Test-FileAutoPreviewable $url $sz) {
+            return @{ Key = (Get-FilePreviewKey $url); Kind = 'file'; Url = $url; Headers = (Get-AuthHeaders) }
+        }
+    }
+    return $null
+}
+
+# Preview-cache key for an archive-tree node, or '' when it has nothing to load in
+# the background (folder, nested sub-archive, non-previewable, or gated large file).
+function Get-NodePreviewKey($n) {
+    if ($null -eq $n -or (Get-NodeIsFolder $n) -or (Get-NodeIsArchive $n)) { return '' }
+    if (-not (Get-IsPreviewable (Get-NodeName $n))) { return '' }
+    $url = Get-EntryUrl $n
+    if (-not $url) { return '' }
+    $info = Get-NodeInfo $n
+    $sz   = if ($info -and $info.PSObject.Properties['size']) { [long]$info.size } else { -1 }
+    if (Test-FileAutoPreviewable $url $sz) { return (Get-FilePreviewKey $url) }
+    return ''
+}
+
+# Background-fetch request for an archive-tree node's preview, or $null.
+function Get-NodePreviewRequest($n) {
+    $key = Get-NodePreviewKey $n
+    if (-not $key) { return $null }
+    return @{ Key = $key; Kind = 'file'; Url = (Get-EntryUrl $n); Headers = (Get-AuthHeaders) }
+}
+
+# The natural preview key for an item/node (archive listing or file contents),
+# ignoring the size gate — used to look up whether a fetch *that was attempted*
+# came back as an error, so the row can be flagged.
+function Get-ItemNaturalPreviewKey($item) {
+    $name = [string]$item.Name
+    if (Get-IsArchive $name)     { return (Get-ArcPreviewKey ([string]$item.Uri)) }
+    if (Get-IsPreviewable $name) { return (Get-FilePreviewKey (Get-ItemUrl $item)) }
+    return ''
+}
+
+# True if a preview fetch for this item resolved to an error (e.g. the server
+# refused to serve the artifact — a blacked-out repo, 404, auth failure). The row
+# is then drawn red. A still-loading or never-fetched item is not "errored".
+function Test-ItemPreviewError($item) {
+    $key = Get-ItemNaturalPreviewKey $item
+    if (-not $key -or -not $script:PreviewCache.ContainsKey($key)) { return $false }
+    return (-not $script:PreviewCache[$key].Ok)
+}
+
+# As Test-ItemPreviewError, for an archive-tree node (a previewable file entry).
+function Test-NodePreviewError($n) {
+    if ($null -eq $n -or (Get-NodeIsFolder $n) -or (Get-NodeIsArchive $n)) { return $false }
+    if (-not (Get-IsPreviewable (Get-NodeName $n))) { return $false }
+    $url = Get-EntryUrl $n
+    if (-not $url) { return $false }
+    $key = Get-FilePreviewKey $url
+    if (-not $script:PreviewCache.ContainsKey($key)) { return $false }
+    return (-not $script:PreviewCache[$key].Ok)
 }
 
 # Fetch the contents of a sub-archive (an archive file *inside* the tree) by
@@ -1912,6 +2389,7 @@ function Read-TreeQuery {
 # itself (its detail pane shows storage metadata). Sub-archives expand inline.
 function Show-ArchiveTree([object]$item) {
     Initialize-RepoMap
+    Stop-PreviewLookahead   # halt the results-page preview trickle while browsing
 
     Show-Popup @("Reading archive", $item.Name)
     $tree = Get-ArchiveTree $item
@@ -1984,6 +2462,24 @@ function Show-ArchiveTree([object]$item) {
         $w   = ((Get-Width) - 1)
         $cur = if ($rows.Count -gt 0 -and $cursor -lt $rows.Count) { $rows[$cursor] } else { $null }
 
+        # Background-warm previews for entries around the cursor (preview mode only),
+        # so the pane shows "Loading..." then fills in without blocking keys. On ISE
+        # (no key poll) block briefly for the highlighted entry before drawing.
+        $tvKeys = @()
+        if ($previewMode -and $rows.Count -gt 0) {
+            $tw = Get-NodePreviewWindow $rows $cursor
+            $keepPv = @{}; foreach ($pk in $tw.Keys) { $keepPv[$pk] = $true }
+            Restrict-PreviewPrefetch $keepPv
+            Start-PreviewPrefetch $tw.Reqs
+            $tvKeys = $tw.Keys
+            if (-not $script:CanRawKey -and $cur) {
+                $selKey = Get-NodePreviewKey $cur.Node
+                if (Test-PreviewLoading $selKey) { Wait-Preview $selKey 5000 }
+            }
+        } else {
+            Restrict-PreviewPrefetch @{}; Receive-PreviewPrefetch
+        }
+
         # Pane geometry.
         $rightW = [Math]::Max(24, [int]($w * 0.34))
         $leftW  = $w - $rightW - 3
@@ -2045,15 +2541,25 @@ function Show-ArchiveTree([object]$item) {
                 $unseen = $row.IsFolder -and $row.HasKids -and -not $seen.Contains($row.Key)
                 $pv     = (-not $row.IsFolder) -and (-not $row.IsArchive) -and (Get-IsPreviewable $row.Name)
 
-                # Downloaded files render washed-out (dim).
+                # Downloaded files render washed-out (dim); a failed preview fetch
+                # (e.g. blacked-out repo) flags the entry red.
                 $dlVisited = (-not $row.IsFolder) -and (Test-Visited (Get-EntryUrl $row.Node))
+                $entryErr  = Test-NodePreviewError $row.Node
 
                 $disp  = if ($row.IsFolder) { "$($row.Name)/" } else { $row.Name }
                 $nameW = [Math]::Max(1, $leftW - 2 - $pfx.Length)
                 if ($unseen -or $pv) { $nameW = [Math]::Max(1, $nameW - 2) }
                 $disp  = Trunc $disp $nameW
+                # The '·' badge is red on error, else starts grey in preview mode and
+                # turns yellow once this entry's preview has loaded in the background.
+                $pvCol = if ($entryErr) { $RD }
+                         elseif ($dlVisited) { $DM }
+                         elseif ($previewMode) {
+                             $pk = Get-NodePreviewKey $row.Node
+                             if ($pk -and $script:PreviewCache.ContainsKey($pk)) { $YL } else { $DM }
+                         } else { $YL }
                 $badge = if ($unseen) { "${YL} +${R}" }
-                         elseif ($pv) { $bc = if ($dlVisited) { $DM } else { $YL }; "${bc} $script:PreviewGlyph${R}" }
+                         elseif ($pv) { "${pvCol} $script:PreviewGlyph${R}" }
                          else { '' }
 
                 # Sub-archives share the plain-file styling (same colour); their only
@@ -2061,6 +2567,8 @@ function Show-ArchiveTree([object]$item) {
                 $gutter = if ($sel) { "${BD}${YL}>${R} " } else { '  ' }
                 $body = if ($row.IsFolder) {
                     if ($sel) { "${BD}${MG}$disp${R}$badge" } else { "${MG}$disp${R}$badge" }
+                } elseif ($entryErr) {
+                    if ($sel) { "${BD}${RD}$disp${R}$badge" } else { "${RD}$disp${R}$badge" }
                 } else {
                     if ($dlVisited) { if ($sel) { "${BD}${DM}$disp${R}$badge" } else { "${DM}$disp${R}$badge" } }
                     elseif ($sel)   { "${BD}${CY}$disp${R}$badge" } else { "$disp$badge" }
@@ -2135,7 +2643,15 @@ function Show-ArchiveTree([object]$item) {
 
         Show-Frame $L.ToArray()
 
-        switch -regex -casesensitive (Read-KeyCased) {
+        # Poll (non-blocking) while a windowed preview is still loading so the pane
+        # and badges fill in live; otherwise block for the next key. A timeout just
+        # reaps and loops, redrawing with whatever has landed.
+        $kc = if ($previewMode -and $script:CanRawKey -and (Get-PreviewLoadingCount $tvKeys) -gt 0) {
+                  Read-KeyTimeoutCased 120
+              } else { Read-KeyCased }
+        if ($null -eq $kc) { Receive-PreviewPrefetch; continue }
+
+        switch -regex -casesensitive ($kc) {
             '^(up|k)$'   { if ($cursor -gt 0)               { $cursor-- } }
             '^(down|j)$' { if ($cursor -lt $rows.Count - 1) { $cursor++ } }
             '^home$'     { $cursor = 0 }
@@ -2402,8 +2918,21 @@ $fetch      = $true    # re-query the server only when the query changes
 $mode       = 'simple' # 'd' cycles simple -> detailed -> preview
 $pendingKey = ''       # a non-nav key absorbed while coalescing a paging burst
 $selRow     = 0        # highlighted row within the current page (cursor)
+$autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
 
 :main while ($true) {
+
+    # Auto page size: fill the window, leaving room for the chrome (title, rules,
+    # column header, footer rule, nav) plus any transient alert/flash lines, plus
+    # one spare row. Recomputed every iteration so a window resize re-fits on the
+    # next redraw. The non-preview views render every row of the page, so the page
+    # must not exceed what fits; preview windows its rows and tolerates more.
+    if ($autoPage) {
+        $reserve = 9
+        if ($script:Alert.Message -and ([DateTime]::UtcNow - $script:Alert.At).TotalSeconds -lt 60) { $reserve++ }
+        if ($script:Flash.Message -and ([DateTime]::UtcNow - $script:Flash.At).TotalSeconds -lt 15) { $reserve++ }
+        $PageSize = [Math]::Max(5, (Get-Height) - $reserve)
+    }
 
     if ($fetch) {
         Show-Loading $query
@@ -2438,6 +2967,7 @@ $selRow     = 0        # highlighted row within the current page (cursor)
     if ($selRow -lt 0) { $selRow = 0 }
     $hl = if ($script:CanRawKey) { $selRow } else { -1 }
     $detailed = ($mode -ne 'simple')   # detailed + preview both fetch size/modified
+    $preview  = ($mode -eq 'preview')  # two-pane mode: warm previews in background
 
     # Detailed view only: load the repo map once, then show whatever detail is
     # already cached. We never block on a "Loading details..." screen — the page
@@ -2493,6 +3023,26 @@ $selRow     = 0        # highlighted row within the current page (cursor)
         Stop-Lookahead   # back in simple view
     }
 
+    # Background-warm previews (preview mode only), tiered like the page prefetch:
+    # the highlighted row + its nearest neighbours go to the pool at full speed,
+    # the rest of the page trickles in one-by-one (nearest-first) until the whole
+    # page is warm. The pane shows "Loading..." until each lands; the poll below
+    # redraws as they arrive. $pvKeys = fast window; $pvPageKeys = the whole page.
+    $pvKeys = @(); $pvPageKeys = @()
+    if ($preview -and $pageItems.Count -gt 0) {
+        $plan = Get-PreviewPlan $pageItems $selRow
+        $keepPv = @{}; foreach ($k in $plan.WindowKeys) { $keepPv[$k] = $true }
+        Restrict-PreviewPrefetch $keepPv      # drop fast fetches for rows we left
+        Start-PreviewPrefetch $plan.WindowReqs # highlighted first, then nearest, fast
+        Start-PreviewLookahead $plan.RestReqs  # the rest, trickled nearest-first
+        $pvKeys     = $plan.WindowKeys
+        $pvPageKeys = $plan.AllKeys
+    } else {
+        Restrict-PreviewPrefetch @{}          # left preview mode: drop pending work
+        Stop-PreviewLookahead
+        Receive-PreviewPrefetch
+    }
+
     # ISE / non-console hosts can't poll the keyboard, so the live fill-in loop
     # below is disabled there. Instead block briefly for this page's details to
     # arrive (they were just queued above), then redraw once with them filled.
@@ -2501,10 +3051,20 @@ $selRow     = 0        # highlighted row within the current page (cursor)
         Show-Page -Query $query -Items $pageItems -Page $page `
                   -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl
     }
+    # Likewise block briefly for the highlighted item's preview on ISE.
+    if ($preview -and -not $script:CanRawKey -and $pageItems.Count -gt 0) {
+        $selKey = Get-ItemPreviewKey $pageItems[$selRow]
+        if (Test-PreviewLoading $selKey) {
+            Wait-Preview $selKey 5000
+            Show-Page -Query $query -Items $pageItems -Page $page `
+                      -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl
+        }
+    }
 
     # Rows already populated at the last draw; used so the fill-in poll only
     # repaints when a *new* row actually lands (no needless flicker).
     $shownCached = $pageItems.Count - (Get-MissingMeta $pageItems)
+    $pvLoaded    = Get-PreviewLoadedCount $pvPageKeys
     # Consecutive poll ticks where nothing new landed and nothing is in flight.
     # Bounds how long we chase rows that never arrive (denied / persistently
     # failing) before settling for a normal blocking read.
@@ -2515,27 +3075,55 @@ $selRow     = 0        # highlighted row within the current page (cursor)
         if ($pendingKey) {
             $key = $pendingKey; $pendingKey = ''
         }
-        # While any row on this page is still blank, poll for keys and redraw as
-        # data lands — by *any* path (burst, trickle, or retry), since we key off
-        # the cache, not the queue. This is what keeps a page that loaded only
-        # partially on arrival filling in instead of sitting half-blank.
-        elseif ($detailed -and $script:CanRawKey -and (Get-MissingMeta $pageItems) -gt 0 -and $idleTicks -lt 30) {
+        # While any row's detail is still blank, or a preview in the window is still
+        # loading, poll for keys and redraw as data lands — by *any* path, since we
+        # key off the caches, not the queues. Keeps a partially-loaded page (and the
+        # preview pane / badges) filling in instead of sitting stale, without ever
+        # blocking the keyboard.
+        elseif ($script:CanRawKey -and (
+                    ($detailed -and (Get-MissingMeta $pageItems) -gt 0 -and $idleTicks -lt 30) -or
+                    ($preview  -and ((Get-PreviewLoadingCount $pvKeys) -gt 0 -or
+                                     ((Get-PreviewPendingCount $pvPageKeys) -gt 0 -and (Test-PreviewLookaheadAlive)))))) {
             $key = Read-KeyTimeout 120
             if ($null -eq $key) {
                 Receive-Prefetch
+                Receive-PreviewPrefetch
+                $redraw = $false
+
                 $nowCached = $pageItems.Count - (Get-MissingMeta $pageItems)
                 if ($nowCached -gt $shownCached) {
                     $shownCached = $nowCached
                     $idleTicks   = 0
                     Apply-Meta $pageItems
-                    Show-Page -Query $query -Items $pageItems -Page $page `
-                              -TotalPages $totalPages -TotalItems $totalItems `
-                              -Offset $offset -Mode $mode -SelRow $hl
-                } elseif ((Get-LoadingMeta $pageItems) -eq 0) {
+                    $redraw = $true
+                } elseif ($detailed -and (Get-MissingMeta $pageItems) -gt 0 -and (Get-LoadingMeta $pageItems) -eq 0) {
                     # Nothing landed and nothing is in flight: re-queue the
                     # stragglers (covers transient failures) and count idle time.
                     $idleTicks++
                     Start-Prefetch $pageItems
+                }
+
+                if ($preview) {
+                    # Re-warm the fast window (sizes that just landed unlock new file
+                    # previews); if the trickle finished but page work remains, relaunch
+                    # it; redraw when any preview resolves or a badge flips.
+                    Receive-PreviewLookahead
+                    $plan = Get-PreviewPlan $pageItems $selRow
+                    Start-PreviewPrefetch $plan.WindowReqs
+                    if (-not (Test-PreviewLookaheadAlive)) {
+                        $restPending = @($plan.RestReqs | Where-Object { -not $script:PreviewCache.ContainsKey($_.Key) })
+                        if ($restPending.Count -gt 0) { Start-PreviewLookahead $restPending }
+                    }
+                    $pvKeys     = $plan.WindowKeys
+                    $pvPageKeys = $plan.AllKeys
+                    $pvNow      = Get-PreviewLoadedCount $pvPageKeys
+                    if ($pvNow -ne $pvLoaded) { $pvLoaded = $pvNow; $redraw = $true }
+                }
+
+                if ($redraw) {
+                    Show-Page -Query $query -Items $pageItems -Page $page `
+                              -TotalPages $totalPages -TotalItems $totalItems `
+                              -Offset $offset -Mode $mode -SelRow $hl
                 }
                 continue nav
             }
@@ -2610,6 +3198,7 @@ $selRow     = 0        # highlighted row within the current page (cursor)
     }
 }
 
-Stop-Lookahead   # signal the background trickle to stop (process exit reclaims the rest)
+Stop-Lookahead          # signal the background trickles to stop (process exit reclaims the rest)
+Stop-PreviewLookahead
 
 Clear-Screen
