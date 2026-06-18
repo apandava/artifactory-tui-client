@@ -30,7 +30,7 @@
     that are trickled in gently. Higher = smoother fast-flicking, more requests.
 .PARAMETER OutDir
     Folder downloads are saved into (created if missing). Defaults to
-    ./artca-downloads under the current directory.
+    ./art-downloads under the current directory.
 #>
 param(
     [string] $BaseUrl  = '',
@@ -40,7 +40,7 @@ param(
     [string] $Repos    = '',
     [int]    $PageSize = 0,
     [int]    $Prefetch = 5,
-    [string] $OutDir   = (Join-Path (Get-Location).Path 'artca-downloads')
+    [string] $OutDir   = (Join-Path (Get-Location).Path 'art-downloads')
 )
 
 Set-StrictMode -Version Latest
@@ -113,7 +113,17 @@ if ($PSScriptRoot -and -not (Get-Command Show-Page -ErrorAction SilentlyContinue
     foreach ($component in 'Render','Api','Prefetch','Views','Archive') {
         . (Join-Path $PSScriptRoot "$component.ps1")
     }
+    # Audit.ps1 is OPTIONAL: load it only if present beside the others. Its absence
+    # leaves the tool working exactly as before.
+    $auditPath = Join-Path $PSScriptRoot 'Audit.ps1'
+    if (Test-Path -LiteralPath $auditPath) { . $auditPath }
 }
+
+# Capability flag the base files gate every audit reference on. Always defined
+# (default $false) so StrictMode is satisfied when Audit.ps1 is absent; flipped on
+# only once the audit component's sentinel (Invoke-Audit) is present — whether
+# dot-sourced above (file mode) or pasted beforehand (paste mode).
+$script:AuditAvailable = [bool](Get-Command Invoke-Audit -ErrorAction SilentlyContinue)
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
@@ -138,6 +148,8 @@ $selRow     = 0        # highlighted row within the current page (cursor)
 $autoPage   = ($PageSize -le 0)   # 0 (default) => size each page to the window
 $pvScroll   = 0        # preview-pane scroll offset for the selected file ([ / ])
 $lastPvId   = ''       # previewed item's id last frame; changing it resets the scroll
+$excludeText = ''      # results exclude-filter terms ('f' edits, 'i' clears)
+$excludeRx   = @()     # compiled glob regexes for $excludeText (empty = no filter)
 
 :main while ($true) {
 
@@ -150,6 +162,7 @@ $lastPvId   = ''       # previewed item's id last frame; changing it resets the 
         $reserve = 9
         if ($script:Alert.Message -and ([DateTime]::UtcNow - $script:Alert.At).TotalSeconds -lt 60) { $reserve++ }
         if ($script:Flash.Message -and ([DateTime]::UtcNow - $script:Flash.At).TotalSeconds -lt 15) { $reserve++ }
+        if ($excludeRx.Count -gt 0) { $reserve++ }   # header line showing the active filter
         $PageSize = [Math]::Max(5, (Get-Height) - $reserve)
     }
 
@@ -171,6 +184,16 @@ $lastPvId   = ''       # previewed item's id last frame; changing it resets the 
     }
 
     $allItems   = @($result.Items)
+    # Exclude filter: items whose name matches a glob are dimmed and sorted to the
+    # back (included items keep their original order), mirroring the audit view.
+    if ($excludeRx.Count -gt 0 -and $allItems.Count -gt 0) {
+        $inc = [Collections.Generic.List[object]]::new()
+        $exc = [Collections.Generic.List[object]]::new()
+        foreach ($it in $allItems) {
+            if (Test-NameMatchesAny ([string]$it.Name) $excludeRx) { $exc.Add($it) } else { $inc.Add($it) }
+        }
+        $allItems = @($inc.ToArray()) + @($exc.ToArray())
+    }
     $totalItems = $allItems.Count
     $totalPages = [Math]::Max(1, [Math]::Ceiling($totalItems / $PageSize))
     if ($page -ge $totalPages) { $page = $totalPages - 1 }
@@ -205,8 +228,15 @@ $lastPvId   = ''       # previewed item's id last frame; changing it resets the 
         Apply-Meta $pageItems
     }
 
+    # Passive audit (if running): enqueue this page nearest-first and pump once so
+    # markers for any matches show on this very render. Guarded — no-op without the
+    # audit component. Content findings arrive asynchronously via the nav-loop poll.
+    if ($script:AuditAvailable -and $script:AuditState -eq 'passive') {
+        [void](Invoke-AuditPassiveTick $pageItems $selRow)
+    }
+
     Show-Page -Query $query -Items $pageItems -Page $page `
-              -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll
+              -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll -ExcludeRx $excludeRx -Filter $excludeText
 
     # Background warming (non-blocking, detailed view only). Build a prefetch
     # window in priority order — current page first, then pages fanning outward
@@ -281,7 +311,7 @@ $lastPvId   = ''       # previewed item's id last frame; changing it resets the 
     if ($detailed -and -not $script:CanRawKey -and (Get-MissingMeta $pageItems) -gt 0) {
         Wait-Meta $pageItems 5000
         Show-Page -Query $query -Items $pageItems -Page $page `
-                  -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll
+                  -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll -ExcludeRx $excludeRx -Filter $excludeText
     }
     # Likewise block briefly for the highlighted item's preview on ISE.
     if ($preview -and -not $script:CanRawKey -and $pageItems.Count -gt 0) {
@@ -289,7 +319,7 @@ $lastPvId   = ''       # previewed item's id last frame; changing it resets the 
         if (Test-PreviewLoading $selKey) {
             Wait-Preview $selKey 5000
             Show-Page -Query $query -Items $pageItems -Page $page `
-                      -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll
+                      -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll -ExcludeRx $excludeRx -Filter $excludeText
         }
     }
 
@@ -315,7 +345,9 @@ $lastPvId   = ''       # previewed item's id last frame; changing it resets the 
         elseif ($script:CanRawKey -and (
                     ($detailed -and (Get-MissingMeta $pageItems) -gt 0 -and $idleTicks -lt 30) -or
                     ($preview  -and ((Get-PreviewLoadingCount $pvKeys) -gt 0 -or
-                                     ((Get-PreviewPendingCount $pvPageKeys) -gt 0 -and (Test-PreviewLookaheadAlive)))))) {
+                                     ((Get-PreviewPendingCount $pvPageKeys) -gt 0 -and (Test-PreviewLookaheadAlive)))) -or
+                    ($script:AuditAvailable -and $script:AuditState -eq 'passive' -and
+                        ($script:AuditQueue.Count -gt 0 -or $script:AuditJobs.Count -gt 0)))) {
             $key = Read-KeyTimeout 120
             if ($null -eq $key) {
                 Receive-Prefetch
@@ -354,10 +386,15 @@ $lastPvId   = ''       # previewed item's id last frame; changing it resets the 
                     if ($pvNow -ne $pvLoaded) { $pvLoaded = $pvNow; $redraw = $true }
                 }
 
+                # Passive audit: enqueue/pump and redraw as matches land.
+                if ($script:AuditAvailable -and $script:AuditState -eq 'passive') {
+                    if (Invoke-AuditPassiveTick $pageItems $selRow) { $redraw = $true }
+                }
+
                 if ($redraw) {
                     Show-Page -Query $query -Items $pageItems -Page $page `
                               -TotalPages $totalPages -TotalItems $totalItems `
-                              -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll
+                              -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll -ExcludeRx $excludeRx -Filter $excludeText
                 }
                 continue nav
             }
@@ -419,14 +456,48 @@ $lastPvId   = ''       # previewed item's id last frame; changing it resets the 
                 break nav
             }
             '^y$' {
-                # Preview mode: opt the highlighted (large/unknown) file into preview.
+                # Preview mode: opt the highlighted file into a large (text) or force
+                # (non-text) preview, but only when it's actually gated — so the 5 MB
+                # ceiling can't be bypassed and archives are left alone.
                 if ($mode -eq 'preview' -and $pageItems.Count -gt 0) {
-                    $u = Get-ItemUrl $allItems[$offset + $selRow]
-                    [void]$script:PreviewOK.Add($u)
+                    $it = $allItems[$offset + $selRow]
+                    if (-not (Get-IsArchive ([string]$it.Name))) {
+                        $u  = Get-ItemUrl $it
+                        $sz = if ("$($it.Size)" -ne '' -and "$($it.Size)" -ne '?') { [long]$it.Size } else { -1 }
+                        $st = Get-PreviewState ([string]$it.Name) $u $sz
+                        if ($st -eq 'large-gated' -or $st -eq 'force-gated') { [void]$script:PreviewOK.Add($u) }
+                    }
                     break nav
                 }
             }
-            '^s$' { $q = Read-Query; if ($q) { $query = $q; $page = 0; $selRow = 0; $fetch = $true }; break nav }
+            '^s$' { $q = Read-Query; if ($q) { if ($script:AuditAvailable) { Reset-AuditEngine }; $query = $q; $page = 0; $selRow = 0; $fetch = $true }; break nav }
+            '^f$' {
+                # Edit the exclude filter: matching results dim and sort to the back.
+                $excludeText = Read-ExcludeFilter $excludeText
+                # @() keeps a single-term result an array (a lone regex would otherwise
+                # unwrap to a scalar and break $excludeRx.Count downstream).
+                $excludeRx   = @(Get-GlobRegexes $excludeText)
+                $page = 0; $selRow = 0
+                break nav
+            }
+            '^i$' {
+                # Clear the exclude filter (show all results in their original order).
+                if ($excludeRx.Count -gt 0) { $excludeText = ''; $excludeRx = @(); $page = 0; $selRow = 0 }
+                break nav
+            }
+            '^a$' {
+                # Open the audit menu (only when the audit component is loaded).
+                if ($script:AuditAvailable) {
+                    $ctx = @{
+                        LocationLabel = "all $totalItems result$(if ($totalItems -ne 1){'s'}) for '$query'"
+                        LocationKind  = 'items'
+                        Label         = "search: $query"
+                        Items         = $allItems
+                    }
+                    [void](Show-AuditMenu $ctx)
+                    break nav   # redraw results (markers / returning from audit view)
+                }
+            }
             '^q$' { break main }
             '^\d+$' {
                 # Console captures one digit then reads the rest; ISE's Read-Host
@@ -448,5 +519,6 @@ $lastPvId   = ''       # previewed item's id last frame; changing it resets the 
 Stop-Lookahead          # signal the background trickles to stop (process exit reclaims the rest)
 Stop-PreviewLookahead
 Close-PrefetchPools     # release the pools' worker runspaces
+if ($script:AuditAvailable) { Stop-AuditWork }   # abort any audit workers/walker (matters in paste-mode sessions)
 
 Clear-Screen

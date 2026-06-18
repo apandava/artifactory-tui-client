@@ -432,6 +432,29 @@ function Get-Ext([string]$name) {
 
 # ── INPUT ─────────────────────────────────────────────────────────────────────
 
+# Blocking line input seeded with an editable initial value, so a filter can be
+# tweaked instead of retyped from scratch. On a real console the initial text is
+# echoed and the user edits from the end (type to append, Backspace to delete);
+# Enter commits. ISE / no-raw-key hosts can't prefill, so they fall back to a plain
+# Read-Host. The caller prints the prompt prefix (and any colour) first.
+function Read-LineEdit([string]$initial) {
+    if (-not $script:CanRawKey) { return (Read-Host).Trim() }
+    $buf = [Text.StringBuilder]::new()
+    [void]$buf.Append("$initial")
+    [Console]::Write("$initial")
+    while ($true) {
+        $k  = $host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        $vk = $k.VirtualKeyCode
+        $ch = $k.Character
+        if     ($vk -eq 13) { break }                                  # Enter commits
+        elseif ($vk -eq 8)  { if ($buf.Length -gt 0) { [void]$buf.Remove($buf.Length - 1, 1); [Console]::Write("`b `b") } }  # Backspace
+        elseif ($ch -and ([int][char]$ch) -ge 32) { [void]$buf.Append([char]$ch); [Console]::Write([string]$ch) }            # printable
+        # arrows / Esc / function keys: ignored (end-of-line editing only)
+    }
+    [Console]::Write("`r`n")
+    return $buf.ToString().Trim()
+}
+
 function Read-Query {
     Clear-Screen
     Write-Host "  ${BD}${MG}ARTCA${R}  ${DM}$BaseUrl${R}`n"
@@ -440,6 +463,20 @@ function Read-Query {
     $q = Read-Host
     Write-Host -NoNewline $R
     return $q.Trim()
+}
+
+# Full-screen prompt to edit the results exclude filter; the field is prefilled with
+# the current terms so they can be tweaked. Returns the entered string (blank clears).
+function Read-ExcludeFilter([string]$current) {
+    Clear-Screen
+    Write-Host "  ${BD}${MG}ARTCA${R}  ${DM}Exclude filter${R}`n"
+    Write-Host "  ${DM}Space/comma-separated name globs to EXCLUDE (matches are dimmed${R}"
+    Write-Host "  ${DM}and sent to the back).  e.g.  *.sha1   *.pom   *sources*    (clear = no filter)${R}`n"
+    if (-not $script:CanRawKey -and $current) { Write-Host "  ${DM}Current:${R} $current`n" }
+    Write-Host -NoNewline "  Exclude: ${BD}${CY}"
+    $s = Read-LineEdit $current
+    Write-Host -NoNewline $R
+    return $s
 }
 
 # The first digit was already captured (no-echo); echo it, then read the rest.

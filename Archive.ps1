@@ -258,16 +258,16 @@ function Test-FileAutoPreviewable([string]$url, [long]$sizeBytes) {
 function Get-ItemPreviewKey($item) {
     $name = [string]$item.Name
     if (Get-IsArchive $name) { return (Get-ArcPreviewKey ([string]$item.Uri)) }
-    if (Get-IsPreviewable $name) {
-        $url = Get-ItemUrl $item
-        $sz  = if ("$($item.Size)" -ne '' -and "$($item.Size)" -ne '?') { [long]$item.Size } else { -1 }
-        if (Test-FileAutoPreviewable $url $sz) { return (Get-FilePreviewKey $url) }
-    }
+    $url = Get-ItemUrl $item
+    if (Test-Downloaded $url) { return '' }
+    $sz  = if ("$($item.Size)" -ne '' -and "$($item.Size)" -ne '?') { [long]$item.Size } else { -1 }
+    if (Test-PreviewLoadable (Get-PreviewState $name $url $sz)) { return (Get-FilePreviewKey $url) }
     return ''
 }
 
 # A full background-fetch request descriptor for a results item, or $null when
-# there's nothing to load. Used by Start-PreviewPrefetch.
+# there's nothing to load. Used by Start-PreviewPrefetch. Non-text files are fetched
+# only once force-previewed (their url opted into PreviewOK).
 function Get-ItemPreviewRequest($item) {
     $name = [string]$item.Name
     if (Get-IsArchive $name) {
@@ -279,26 +279,26 @@ function Get-ItemPreviewRequest($item) {
         return @{ Key = (Get-ArcPreviewKey ([string]$item.Uri)); Kind = 'archive';
                   Uri = $rq.Uri; Body = $rq.Body; Headers = $rq.Headers; Ua = $rq.Ua }
     }
-    if (Get-IsPreviewable $name) {
-        $url = Get-ItemUrl $item
-        $sz  = if ("$($item.Size)" -ne '' -and "$($item.Size)" -ne '?') { [long]$item.Size } else { -1 }
-        if (Test-FileAutoPreviewable $url $sz) {
-            return @{ Key = (Get-FilePreviewKey $url); Kind = 'file'; Url = $url; Headers = (Get-AuthHeaders) }
-        }
+    $url = Get-ItemUrl $item
+    if (Test-Downloaded $url) { return $null }
+    $sz  = if ("$($item.Size)" -ne '' -and "$($item.Size)" -ne '?') { [long]$item.Size } else { -1 }
+    if (Test-PreviewLoadable (Get-PreviewState $name $url $sz)) {
+        return @{ Key = (Get-FilePreviewKey $url); Kind = 'file'; Url = $url; Headers = (Get-AuthHeaders) }
     }
     return $null
 }
 
 # Preview-cache key for an archive-tree node, or '' when it has nothing to load in
-# the background (folder, nested sub-archive, non-previewable, or gated large file).
+# the background (folder, nested sub-archive, downloaded, or a gated/too-large file).
+# A non-text node loads only once force-previewed.
 function Get-NodePreviewKey($n) {
     if ($null -eq $n -or (Get-NodeIsFolder $n) -or (Get-NodeIsArchive $n)) { return '' }
-    if (-not (Get-IsPreviewable (Get-NodeName $n))) { return '' }
     $url = Get-EntryUrl $n
     if (-not $url) { return '' }
+    if (Test-Downloaded $url) { return '' }
     $info = Get-NodeInfo $n
     $sz   = if ($info -and $info.PSObject.Properties['size']) { [long]$info.size } else { -1 }
-    if (Test-FileAutoPreviewable $url $sz) { return (Get-FilePreviewKey $url) }
+    if (Test-PreviewLoadable (Get-PreviewState (Get-NodeName $n) $url $sz)) { return (Get-FilePreviewKey $url) }
     return ''
 }
 
@@ -311,11 +311,13 @@ function Get-NodePreviewRequest($n) {
 
 # The natural preview key for an item/node (archive listing or file contents),
 # ignoring the size gate — used to look up whether a fetch *that was attempted*
-# came back as an error, so the row can be flagged.
+# came back as an error, so the row can be flagged. Force-previewable files (opted
+# into PreviewOK) count as previewable here too.
 function Get-ItemNaturalPreviewKey($item) {
     $name = [string]$item.Name
-    if (Get-IsArchive $name)     { return (Get-ArcPreviewKey ([string]$item.Uri)) }
-    if (Get-IsPreviewable $name) { return (Get-FilePreviewKey (Get-ItemUrl $item)) }
+    if (Get-IsArchive $name) { return (Get-ArcPreviewKey ([string]$item.Uri)) }
+    $url = Get-ItemUrl $item
+    if ((Get-IsPreviewable $name) -or $script:PreviewOK.Contains($url)) { return (Get-FilePreviewKey $url) }
     return ''
 }
 
@@ -471,13 +473,24 @@ function Save-ArchiveEntry($node, [string]$subDir) {
         return "${RD}${BD}Download failed:${R} cannot create folder ${CY}$destDir${R} - $($_.Exception.Message)"
     }
     $dest = Join-Path $destDir (Get-NodeName $node)
+    $info = Get-NodeInfo $node
+    $nsz  = if ($info -and $info.PSObject.Properties['size']) { [long]$info.size } else { [long]-1 }
+    $nrepo = if ($node.PSObject.Properties['repoKey']) { "$($node.repoKey)" } else { '' }
     # Reuse bytes already held in memory from an earlier preview, if present.
     if ($script:MemFiles.ContainsKey($url)) {
-        try { [System.IO.File]::WriteAllBytes($dest, $script:MemFiles[$url]); return "${BD}Saved${R} to ${CY}$dest${R} ${DM}(from preview cache)${R}" } catch { }
+        try {
+            [System.IO.File]::WriteAllBytes($dest, $script:MemFiles[$url])
+            Write-DownloadLog $destDir (Get-NodeName $node) $nrepo (Get-NodeInternalPath $node) $nsz '' $url '' ''
+            Mark-Downloaded $url $url
+            return "${BD}Saved${R} to ${CY}$dest${R} ${DM}(from preview cache)${R}"
+        } catch { }
     }
     $old  = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
     try {
         Invoke-WebRequest -Uri $url -Headers (Get-AuthHeaders) -OutFile $dest -ErrorAction Stop
+        $len = $nsz; try { $len = (Get-Item $dest).Length } catch { }
+        Write-DownloadLog $destDir (Get-NodeName $node) $nrepo (Get-NodeInternalPath $node) $len '' $url '' ''
+        Mark-Downloaded $url $url
         return "${BD}Saved${R} to ${CY}$dest${R}"
     } catch {
         try { if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force } } catch { }
@@ -862,7 +875,10 @@ function Show-ArchiveTree([object]$item) {
                 # collapse) since $seen, unlike IsOpen, never resets. Sub-archives
                 # get neither badge — they're treated as plain, non-expandable files.
                 $unseen = $row.IsFolder -and $row.HasKids -and -not $seen.Contains($row.Key)
-                $pv     = (-not $row.IsFolder) -and (-not $row.IsArchive) -and (Get-IsPreviewable $row.Name)
+                # '·' badge for a previewable plain file, or a non-text file that's
+                # been force-previewed (its url opted into PreviewOK).
+                $pv     = (-not $row.IsFolder) -and (-not $row.IsArchive) -and `
+                          ((Get-IsPreviewable $row.Name) -or $script:PreviewOK.Contains((Get-EntryUrl $row.Node)))
 
                 # Downloaded files render washed-out (dim); a failed preview fetch
                 # (e.g. blacked-out repo) flags the entry red.
@@ -886,8 +902,14 @@ function Show-ArchiveTree([object]$item) {
                          else { '' }
 
                 # Sub-archives share the plain-file styling (same colour); their only
-                # distinction shows in the preview pane.
-                $gutter = if ($sel) { "${BD}${YL}>${R} " } else { '  ' }
+                # distinction shows in the preview pane. The gutter's second column
+                # carries the audit severity marker for flagged file entries.
+                $selCh = if ($sel) { "${BD}${YL}>${R}" } else { ' ' }
+                $mkCh  = ' '
+                if ($script:AuditAvailable -and -not $row.IsFolder) {
+                    $am = Get-AuditMarker (Get-EntryUrl $row.Node); if ($am) { $mkCh = $am }
+                }
+                $gutter = "$selCh$mkCh"
                 $body = if ($row.IsFolder) {
                     if ($sel) { "${BD}${MG}$disp${R}$badge" } else { "${MG}$disp${R}$badge" }
                 } elseif ($entryErr) {
@@ -960,20 +982,39 @@ function Show-ArchiveTree([object]$item) {
         $r2.Add("${BD}${LB}n/p${RB}${R}${DM} next/prev folder${R}")
         $r2.Add("${BD}${LB}/${RB}${R}${DM} search${R}")
         if ($canDownload)                  { $r2.Add("${BD}${LB}d${RB}${R}${DM} download${R}") }
-        if ($previewMode -and $canDownload) { $r2.Add("${BD}${LB}y${RB}${R}${DM} preview big${R}") }
+        if ($previewMode -and $cur -and -not $cur.IsFolder -and -not $cur.IsArchive) {
+            $cuInfo = Get-NodeInfo $cur.Node
+            $cuSz   = if ($cuInfo -and $cuInfo.PSObject.Properties['size']) { [long]$cuInfo.size } else { -1 }
+            switch (Get-PreviewState (Get-NodeName $cur.Node) (Get-EntryUrl $cur.Node) $cuSz) {
+                'large-gated' { $r2.Add("${BD}${LB}y${RB}${R}${DM} preview large${R}") }
+                'force-gated' { $r2.Add("${BD}${LB}y${RB}${R}${DM} force preview${R}") }
+            }
+        }
         if ($previewMode -and $script:PvScrollMax -gt 0) { $r2.Add("${BD}${LB}Shift+$([char]0x2191)$([char]0x2193)${RB}${R}${DM} scroll${R}") }
         $r2.Add("${BD}${LB}q${RB}${R}${DM} back${R}")
+        if ($script:AuditAvailable) {
+            $aLbl = if ($script:AuditState -eq 'passive') { "${YL}audit: passive${R}${DM}" } else { 'audit' }
+            $r2.Add("${BD}${LB}a${RB}${R}${DM} $aLbl${R}")
+        }
         $L.Add((Join-Justified $r1.ToArray() $w))
         $L.Add((Join-Justified $r2.ToArray() $w))
+
+        # Passive audit (if running): enqueue this tree's visible file rows and pump
+        # so markers fill in. Guarded — no-op without the audit component.
+        if ($script:AuditAvailable -and $script:AuditState -eq 'passive') {
+            [void](Invoke-AuditPassiveTickTree $rows $cursor ([string]$item.Name))
+        }
 
         Show-Frame $L.ToArray()
 
         # Poll (non-blocking) while a windowed preview is still loading so the pane
         # and badges fill in live; otherwise block for the next key. A timeout just
         # reaps and loops, redrawing with whatever has landed.
+        $auditPolling = ($script:AuditAvailable -and $script:AuditState -eq 'passive' -and
+                         ($script:AuditQueue.Count -gt 0 -or $script:AuditJobs.Count -gt 0))
         if ($pendingKc) {
             $kc = $pendingKc; $pendingKc = $null
-        } elseif ($previewMode -and $script:CanRawKey -and (Get-PreviewLoadingCount $tvKeys) -gt 0) {
+        } elseif ($script:CanRawKey -and (($previewMode -and (Get-PreviewLoadingCount $tvKeys) -gt 0) -or $auditPolling)) {
             $kc = Read-KeyTimeoutCased 120
         } else {
             # Idle: about to block for the next key. Free the background pools'
@@ -982,7 +1023,11 @@ function Show-ArchiveTree([object]$item) {
             if ($script:PvJobs.Count -eq 0) { Close-PrefetchPools }
             $kc = Read-KeyCased
         }
-        if ($null -eq $kc) { Receive-PreviewPrefetch; continue }
+        if ($null -eq $kc) {
+            Receive-PreviewPrefetch
+            if ($script:AuditAvailable -and $script:AuditState -eq 'passive') { [void](Invoke-AuditPassiveTickTree $rows $cursor ([string]$item.Name)) }
+            continue
+        }
 
         switch -regex -casesensitive ($kc) {
             '^(up|k|down|j)$' {
@@ -1062,9 +1107,15 @@ function Show-ArchiveTree([object]$item) {
 
             '^v$' { $previewMode = -not $previewMode }
             '^y$' {
-                # Opt a large/unknown file into preview despite the size cap.
-                if ($previewMode -and $cur -and -not $cur.IsFolder) {
-                    [void]$script:PreviewOK.Add((Get-EntryUrl $cur.Node))
+                # Opt a file into a large (text) or force (non-text) preview, but only
+                # when it's actually gated — so the 5 MB ceiling can't be bypassed and
+                # nested archives are left alone.
+                if ($previewMode -and $cur -and -not $cur.IsFolder -and -not $cur.IsArchive) {
+                    $u    = Get-EntryUrl $cur.Node
+                    $yInfo = Get-NodeInfo $cur.Node
+                    $ySz   = if ($yInfo -and $yInfo.PSObject.Properties['size']) { [long]$yInfo.size } else { -1 }
+                    $st    = Get-PreviewState (Get-NodeName $cur.Node) $u $ySz
+                    if ($st -eq 'large-gated' -or $st -eq 'force-gated') { [void]$script:PreviewOK.Add($u) }
                 }
             }
 
@@ -1083,6 +1134,25 @@ function Show-ArchiveTree([object]$item) {
                 }
             }
 
+            '^a$' {
+                if ($script:AuditAvailable -and $cur) {
+                    $scopeNode = if (($cur.IsFolder) -or $cur.Node.PSObject.Properties['__root']) { $cur.Node }
+                                 elseif ($cur.Parent) { $cur.Parent } else { $rootNode }
+                    $acc = [Collections.Generic.List[object]]::new()
+                    Get-AuditTreeFiles $scopeNode $subCache $acc
+                    $lbl  = '/' + (Get-NodeInternalPath $scopeNode)
+                    $arc  = [string]$item.Name
+                    $accF = @($acc.ToArray())
+                    $ctx  = @{
+                        LocationLabel = "$($accF.Count) file$(if ($accF.Count -ne 1){'s'}) under $lbl"
+                        LocationKind  = 'nodes'
+                        Label         = "archive $arc : $lbl"
+                        Items         = $accF
+                        ArcName       = $arc
+                    }
+                    [void](Show-AuditMenu $ctx)
+                }
+            }
             '^(b|q|backspace)$' { return }
         }
     }
