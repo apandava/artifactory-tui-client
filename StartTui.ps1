@@ -150,6 +150,12 @@ $pvScroll   = 0        # preview-pane scroll offset for the selected file ([ / ]
 $lastPvId   = ''       # previewed item's id last frame; changing it resets the scroll
 $excludeText = ''      # results exclude-filter terms ('f' edits, 'i' clears)
 $excludeRx   = @()     # compiled glob regexes for $excludeText (empty = no filter)
+$hideDone    = $false  # 'h' hides excluded + already-downloaded results from the list
+
+# Default to passive audit (Tier-1 only, no archive walk — set in Audit.ps1) so every
+# view is flagged for secrets out of the box. The user can turn it off or switch modes
+# from the audit menu ([a]). Guarded so the tool runs unchanged without the component.
+if ($script:AuditAvailable) { Start-AuditPassive }
 
 :main while ($true) {
 
@@ -159,7 +165,9 @@ $excludeRx   = @()     # compiled glob regexes for $excludeText (empty = no filt
     # next redraw. The non-preview views render every row of the page, so the page
     # must not exceed what fits; preview windows its rows and tolerates more.
     if ($autoPage) {
-        $reserve = 9
+        # 8 fixed chrome lines (title, 2 rules, query, 3 table rules/header, spare) plus
+        # however many lines the wrapped footer hints took last render (>=1).
+        $reserve = 8 + $script:NavLineCount
         if ($script:Alert.Message -and ([DateTime]::UtcNow - $script:Alert.At).TotalSeconds -lt 60) { $reserve++ }
         if ($script:Flash.Message -and ([DateTime]::UtcNow - $script:Flash.At).TotalSeconds -lt 15) { $reserve++ }
         if ($excludeRx.Count -gt 0) { $reserve++ }   # header line showing the active filter
@@ -193,6 +201,16 @@ $excludeRx   = @()     # compiled glob regexes for $excludeText (empty = no filt
             if (Test-NameMatchesAny ([string]$it.Name) $excludeRx) { $exc.Add($it) } else { $inc.Add($it) }
         }
         $allItems = @($inc.ToArray()) + @($exc.ToArray())
+    }
+    # Hide toggle ('h'): drop excluded + already-downloaded results from the view. Count
+    # the hideable ones for the footer hint; the surviving set drives pagination/numbering.
+    $hideableCount = @($allItems | Where-Object {
+        (Test-Visited ([string]$_.Uri)) -or (Test-NameMatchesAny ([string]$_.Name) $excludeRx)
+    }).Count
+    if ($hideDone) {
+        $allItems = @($allItems | Where-Object {
+            -not ((Test-Visited ([string]$_.Uri)) -or (Test-NameMatchesAny ([string]$_.Name) $excludeRx))
+        })
     }
     $totalItems = $allItems.Count
     $totalPages = [Math]::Max(1, [Math]::Ceiling($totalItems / $PageSize))
@@ -236,7 +254,7 @@ $excludeRx   = @()     # compiled glob regexes for $excludeText (empty = no filt
     }
 
     Show-Page -Query $query -Items $pageItems -Page $page `
-              -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll -ExcludeRx $excludeRx -Filter $excludeText
+              -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll -ExcludeRx $excludeRx -Filter $excludeText -HideDone $hideDone -HideableCount $hideableCount
 
     # Background warming (non-blocking, detailed view only). Build a prefetch
     # window in priority order — current page first, then pages fanning outward
@@ -311,7 +329,7 @@ $excludeRx   = @()     # compiled glob regexes for $excludeText (empty = no filt
     if ($detailed -and -not $script:CanRawKey -and (Get-MissingMeta $pageItems) -gt 0) {
         Wait-Meta $pageItems 5000
         Show-Page -Query $query -Items $pageItems -Page $page `
-                  -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll -ExcludeRx $excludeRx -Filter $excludeText
+                  -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll -ExcludeRx $excludeRx -Filter $excludeText -HideDone $hideDone -HideableCount $hideableCount
     }
     # Likewise block briefly for the highlighted item's preview on ISE.
     if ($preview -and -not $script:CanRawKey -and $pageItems.Count -gt 0) {
@@ -319,7 +337,7 @@ $excludeRx   = @()     # compiled glob regexes for $excludeText (empty = no filt
         if (Test-PreviewLoading $selKey) {
             Wait-Preview $selKey 5000
             Show-Page -Query $query -Items $pageItems -Page $page `
-                      -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll -ExcludeRx $excludeRx -Filter $excludeText
+                      -TotalPages $totalPages -TotalItems $totalItems -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll -ExcludeRx $excludeRx -Filter $excludeText -HideDone $hideDone -HideableCount $hideableCount
         }
     }
 
@@ -348,7 +366,7 @@ $excludeRx   = @()     # compiled glob regexes for $excludeText (empty = no filt
                                      ((Get-PreviewPendingCount $pvPageKeys) -gt 0 -and (Test-PreviewLookaheadAlive)))) -or
                     ($script:AuditAvailable -and $script:AuditState -eq 'passive' -and
                         ($script:AuditQueue.Count -gt 0 -or $script:AuditJobs.Count -gt 0)))) {
-            $key = Read-KeyTimeout 120
+            $key = Read-KeyTimeoutCased 120
             if ($null -eq $key) {
                 Receive-Prefetch
                 Receive-PreviewPrefetch
@@ -394,7 +412,7 @@ $excludeRx   = @()     # compiled glob regexes for $excludeText (empty = no filt
                 if ($redraw) {
                     Show-Page -Query $query -Items $pageItems -Page $page `
                               -TotalPages $totalPages -TotalItems $totalItems `
-                              -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll -ExcludeRx $excludeRx -Filter $excludeText
+                              -Offset $offset -Mode $mode -SelRow $hl -PvScroll $pvScroll -ExcludeRx $excludeRx -Filter $excludeText -HideDone $hideDone -HideableCount $hideableCount
                 }
                 continue nav
             }
@@ -406,13 +424,24 @@ $excludeRx   = @()     # compiled glob regexes for $excludeText (empty = no filt
             # fetch in flight so an active ahead-prefetch is never aborted.
             Receive-Prefetch; Receive-PreviewPrefetch
             if ($script:PfJobs.Count -eq 0 -and $script:PvJobs.Count -eq 0) { Close-PrefetchPools }
-            $key = Read-Key
+            $key = Read-KeyCased
         }
 
         # For paging keys, swallow the rest of any held-key burst (Invoke-NavBurst)
         # so we render/warm only the page the user actually lands on — preventing a
         # prefetch backlog that would leave the final page half-loaded. Re-render
         # only if the page actually moved (or a non-nav key was queued behind it).
+        # [A] (Shift+A) downloads all not-yet-downloaded, non-excluded results. Handled
+        # case-sensitively BEFORE the (case-insensitive) command switch so it doesn't
+        # collide with lowercase [a] = audit.
+        if ($key -ceq 'A') {
+            if ($totalItems -gt 0) {
+                Save-ItemSet (@($allItems | Where-Object {
+                    -not ((Test-Visited ([string]$_.Uri)) -or (Test-NameMatchesAny ([string]$_.Name) $excludeRx))
+                }))
+            }
+            break nav
+        }
         switch -regex ($key) {
             '^(n|right|pagedown|p|left|pageup|home|end)$' {
                 $before = $page
@@ -485,6 +514,10 @@ $excludeRx   = @()     # compiled glob regexes for $excludeText (empty = no filt
                 if ($excludeRx.Count -gt 0) { $excludeText = ''; $excludeRx = @(); $page = 0; $selRow = 0 }
                 break nav
             }
+            '^h$' {
+                # Toggle hiding excluded + already-downloaded results from the list.
+                $hideDone = -not $hideDone; $page = 0; $selRow = 0; break nav
+            }
             '^a$' {
                 # Open the audit menu (only when the audit component is loaded).
                 if ($script:AuditAvailable) {
@@ -499,17 +532,14 @@ $excludeRx   = @()     # compiled glob regexes for $excludeText (empty = no filt
                 }
             }
             '^q$' { break main }
-            '^\d+$' {
-                # Console captures one digit then reads the rest; ISE's Read-Host
-                # already returns the whole number on one line.
-                $sel = if ($script:CanRawKey -and $key.Length -eq 1) {
-                    Read-ItemNumber $key
-                } else {
-                    $n = 0; if ([int]::TryParse($key, [ref]$n)) { $n } else { $null }
-                }
-                if ($null -ne $sel -and $sel -ge 1 -and $sel -le $totalItems) {
-                    if ((Invoke-ItemAction $allItems[$sel - 1] $sel $mode) -eq 'quit') { break main }
-                }
+            '^\d[\d,\s-]*$' {
+                # Multi-download by number/spec (e.g. 1,3,5-9). The console captures the
+                # first digit then reads the rest; ISE returns the whole spec on one line.
+                # An empty spec (user cleared the prompt) cancels. Numbers index the
+                # displayed list (which excludes hidden rows while hiding is on).
+                $spec = if ($script:CanRawKey -and $key.Length -eq 1) { Read-NumberSpec $key } else { $key }
+                $idx  = @(Parse-NumberSpec $spec $totalItems)   # @() so an empty spec doesn't $null under StrictMode
+                if ($idx.Count -gt 0) { Save-ItemSet (@($idx | ForEach-Object { $allItems[$_ - 1] })) }
                 break nav   # redraw the results page
             }
         }

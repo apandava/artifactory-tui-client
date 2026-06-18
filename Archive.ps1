@@ -396,6 +396,18 @@ function Get-EntryUrl($n) {
     return "$(Get-ArtBase)/$repo/$dp"
 }
 
+# Filename of the archive an internal entry lives in. The entry's download path has the
+# form <...>/<archive>!/<internal-path>, so the segment just before the '!' separator is
+# the containing archive. Returns '' if the node has no such path (not an archive entry).
+function Get-EntryArchiveName($n) {
+    $url = Get-EntryUrl $n
+    if (-not $url) { return '' }
+    $i = $url.IndexOf('!')
+    if ($i -lt 0) { return '' }
+    $before = $url.Substring(0, $i)
+    return ($before -split '/')[-1]
+}
+
 # Internal (within-archive) path of a node, with the archive prefix stripped.
 function Get-NodeInternalPath($n) {
     if ($null -eq $n) { return '' }
@@ -420,6 +432,8 @@ function Get-NodeDetailLines($n, [int]$paneW) {
     $typeStr = if ($isFolder) { 'folder' } elseif ($isArc) { "$(Get-Ext $name) (archive)" } else { Get-Ext $name }
     $L.Add("${DM}$('Type'.PadRight($labelW))${R}${YL}$(Trunc $typeStr $valMax)${R}")
     $L.Add("${DM}$('Path'.PadRight($labelW))${R}$(Trunc ('/' + (Get-NodeInternalPath $n)) $valMax)")
+    $arcN = Get-EntryArchiveName $n
+    if ($arcN) { $L.Add("${DM}$('Archive'.PadRight($labelW))${R}${YL}$(Trunc $arcN $valMax)${R}") }
     if ($info) {
         if ($info.PSObject.Properties['size'])             { $L.Add("${DM}$('Size'.PadRight($labelW))${R}$(Format-Size $info.size)") }
         if ($info.PSObject.Properties['compressed'])       { $L.Add("${DM}$('Compressed'.PadRight($labelW))${R}$(Format-Size $info.compressed)") }
@@ -480,7 +494,7 @@ function Save-ArchiveEntry($node, [string]$subDir) {
     if ($script:MemFiles.ContainsKey($url)) {
         try {
             [System.IO.File]::WriteAllBytes($dest, $script:MemFiles[$url])
-            Write-DownloadLog $destDir (Get-NodeName $node) $nrepo (Get-NodeInternalPath $node) $nsz '' $url '' ''
+            Write-DownloadLog $destDir (Get-NodeName $node) $nrepo (Get-NodeInternalPath $node) (Get-EntryArchiveName $node) $nsz '' $url '' ''
             Mark-Downloaded $url $url
             return "${BD}Saved${R} to ${CY}$dest${R} ${DM}(from preview cache)${R}"
         } catch { }
@@ -489,7 +503,7 @@ function Save-ArchiveEntry($node, [string]$subDir) {
     try {
         Invoke-WebRequest -Uri $url -Headers (Get-AuthHeaders) -OutFile $dest -ErrorAction Stop
         $len = $nsz; try { $len = (Get-Item $dest).Length } catch { }
-        Write-DownloadLog $destDir (Get-NodeName $node) $nrepo (Get-NodeInternalPath $node) $len '' $url '' ''
+        Write-DownloadLog $destDir (Get-NodeName $node) $nrepo (Get-NodeInternalPath $node) (Get-EntryArchiveName $node) $len '' $url '' ''
         Mark-Downloaded $url $url
         return "${BD}Saved${R} to ${CY}$dest${R}"
     } catch {
@@ -532,13 +546,35 @@ function Parse-NumberSpec([string]$spec, [int]$max) {
     return @($set)
 }
 
-# First digit already captured no-echo; echo it then read the rest of a number
-# spec (digits, commas, spaces, dashes). Returns the full typed string.
+# First digit already captured no-echo; echo it then read the rest of a multi-download
+# number spec (digits, commas, spaces, dashes). Returns the full typed string, or ''
+# if the user clears all input (Backspace past the start) or presses Esc — so the caller
+# drops back to the menu. On hosts without raw keys (ISE) the rest is read with Read-Host.
 function Read-NumberSpec([string]$first) {
-    if (-not $script:CanRawKey) { return ("$first").Trim() }
-    Write-Host -NoNewline "`n  ${BD}${CY}Download #${R} ${DM}(e.g. 1,3,5-9):${R} $first"
-    $rest = Read-Host
-    return ("$first$rest").Trim()
+    if (-not $script:CanRawKey) {
+        Write-Host -NoNewline "`n  ${BD}${CY}Download #${R} ${DM}(e.g. 1,3,5-9; empty to cancel):${R} $first"
+        $rest = Read-Host
+        return ("$first$rest").Trim()
+    }
+    $buf = [Text.StringBuilder]::new()
+    [void]$buf.Append("$first")
+    Write-Host -NoNewline "`n  ${BD}${CY}Download #${R} ${DM}(e.g. 1,3,5-9; empty to cancel):${R} ${BD}${CY}"
+    [Console]::Write("$first")
+    while ($true) {
+        $k  = $host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        $vk = $k.VirtualKeyCode
+        $ch = $k.Character
+        if     ($vk -eq 13) { break }                                    # Enter commits
+        elseif ($vk -eq 27) { Write-Host -NoNewline $R; return '' }       # Esc cancels
+        elseif ($vk -eq 8)  {                                            # Backspace
+            if ($buf.Length -gt 0) { [void]$buf.Remove($buf.Length - 1, 1); [Console]::Write("`b `b") }
+            if ($buf.Length -eq 0) { Write-Host -NoNewline $R; return '' }   # cleared all -> cancel
+        }
+        elseif ($ch -and ("$ch" -match '[0-9,\-\s]')) { [void]$buf.Append([char]$ch); [Console]::Write([string]$ch) }
+        # anything else ignored
+    }
+    Write-Host -NoNewline $R
+    return $buf.ToString().Trim()
 }
 
 # Confirm + download a set of entry nodes into a per-archive subfolder, warning
@@ -574,19 +610,27 @@ function Save-Entries($nodes, [string]$arcName) {
 }
 
 # Results view for an in-archive search: a list of matching files navigable with
-# a highlight cursor (like the tree). Enter downloads the highlighted entry;
-# typing a number / spec (e.g. 21,27,53-57) downloads that selection; A downloads
-# all — selections warn with count + total size first. $scopeLabel is the folder
-# the search ran under; $matches are file nodes; $arcName seeds the save subfolder.
-function Show-TreeSearchResults($matches, [string]$query, [string]$scopeLabel, [string]$arcName) {
-    $matches = @($matches)
-    $sub     = ($arcName -replace '[\\/:*?"<>|]', '_')
-    $cursor  = 0
+# a highlight cursor (like the tree). Enter downloads the highlighted entry; typing a
+# number / spec (e.g. 21,27,53-57) multi-downloads that selection; A downloads all
+# not-yet-downloaded matches; h hides/shows already-downloaded matches. Selections warn
+# with count + total size first. $scopeLabel is the folder the search ran under;
+# $fileNodes are file nodes; $arcName seeds the save subfolder.
+function Show-TreeSearchResults($fileNodes, [string]$query, [string]$scopeLabel, [string]$arcName) {
+    $fileNodes = @($fileNodes)
+    $sub      = ($arcName -replace '[\\/:*?"<>|]', '_')
+    $cursor   = 0
+    $hideDone = $false    # hide already-downloaded matches from the list
+    $navFooterLines = 1   # wrapped footer height from last render (reserved in page size)
 
     while ($true) {
         $w        = ((Get-Width) - 1)
-        $total    = $matches.Count
-        $pageSize = [Math]::Max(5, (Get-Height) - 10)
+        # Already-downloaded (visited) matches can be hidden; count them and window the list.
+        $dlCount  = @($fileNodes | Where-Object { Test-Visited (Get-EntryUrl $_) }).Count
+        # @(...) around the if/else: an else-branch that yields an empty collection would
+        # otherwise collapse to $null under StrictMode and break $visible.Count below.
+        $visible  = @(if ($hideDone) { @($fileNodes | Where-Object { -not (Test-Visited (Get-EntryUrl $_)) }) } else { $fileNodes })
+        $total    = $visible.Count
+        $pageSize = [Math]::Max(5, (Get-Height) - 9 - $navFooterLines)
         $totalPages = [Math]::Max(1, [Math]::Ceiling($total / $pageSize))
         if ($cursor -lt 0) { $cursor = 0 }
         if ($cursor -gt $total - 1) { $cursor = [Math]::Max(0, $total - 1) }
@@ -610,23 +654,26 @@ function Show-TreeSearchResults($matches, [string]$query, [string]$scopeLabel, [
         $L.Add("$DM$(HR $w)$R")
 
         if ($total -eq 0) {
-            $L.Add(''); $L.Add("  ${DM}No matches.${R}")
+            $msg = if ($hideDone -and $dlCount -gt 0) { 'All matches downloaded (hidden).' } else { 'No matches.' }
+            $L.Add(''); $L.Add("  ${DM}$msg${R}")
         } else {
             $end = [Math]::Min($offset + $pageSize - 1, $total - 1)
             for ($i = $offset; $i -le $end; $i++) {
-                $n    = $matches[$i]
+                $n    = $visible[$i]
                 $sel  = ($i -eq $cursor)
+                $dl   = Test-Visited (Get-EntryUrl $n)
                 $info = Get-NodeInfo $n
                 $sz   = if ($info -and $info.PSObject.Properties['size']) { Format-Size $info.size } else { '' }
                 $nm   = Get-NodeName $n
                 $arc  = Get-NodeIsArchive $n
+                $nameCol = if ($dl) { $DM } else { $CY }
                 $numCell = "${DM}$(ClipR ([string]($i + 1)) $numW)${R}"
-                $nameCell = if ($arc -and $sel) { "${BD}${CY}$(Clip $nm ([Math]::Max(1, $nameW - 2)))${R}${YL} $script:ArcGlyph${R}" }
-                            elseif ($arc)  { "${CY}$(Clip $nm ([Math]::Max(1, $nameW - 2)))${R}${YL} $script:ArcGlyph${R}" }
-                            elseif ($sel)  { "${BD}${CY}$(Clip $nm $nameW)${R}" }
-                            else           { "${CY}$(Clip $nm $nameW)${R}" }
-                $gutter = if ($sel) { "${BD}${CY}>${R} " } else { '  ' }
-                $L.Add("$gutter$numCell  $nameCell  $(ClipR $sz $sizeW)  ${DM}$(Clip (Get-NodeInternalPath $n) $pathW)${R}")
+                $nameCell = if ($arc -and $sel) { "${BD}${nameCol}$(Clip $nm ([Math]::Max(1, $nameW - 2)))${R}${YL} $script:ArcGlyph${R}" }
+                            elseif ($arc)  { "${nameCol}$(Clip $nm ([Math]::Max(1, $nameW - 2)))${R}${YL} $script:ArcGlyph${R}" }
+                            elseif ($sel)  { "${BD}${nameCol}$(Clip $nm $nameW)${R}" }
+                            else           { "${nameCol}$(Clip $nm $nameW)${R}" }
+                $gutter = if ($dl) { "${DM}d${R} " } elseif ($sel) { "${BD}${CY}>${R} " } else { '  ' }
+                $L.Add("$gutter$numCell  $nameCell  $(ClipR $sz $sizeW)  $(Format-PathCell (Get-NodeInternalPath $n) $pathW $true $DM)")
             }
         }
 
@@ -635,11 +682,15 @@ function Show-TreeSearchResults($matches, [string]$query, [string]$scopeLabel, [
         $nav.Add("${BD}${LB}$([char]0x2191)$([char]0x2193)${RB}${R}${DM} move${R}")
         if ($total -gt 0) {
             $nav.Add("${BD}${LB}$([char]0x21B5)${RB}${R}${DM} download${R}")
-            $nav.Add("${BD}${LB}#${RB}${R}${DM} select (e.g. 1,3,5-9)${R}")
-            $nav.Add("${BD}${LB}A${RB}${R}${DM} all${R}")
+            $nav.Add("${BD}${LB}#${RB}${R}${DM} multi-download${R}")
+            $nav.Add("${BD}${LB}A${RB}${R}${DM} download all${R}")
         }
+        if ($hideDone)          { $nav.Add("${BD}${LB}h${RB}${R}${DM} unhide $dlCount hidden${R}") }
+        elseif ($dlCount -gt 0) { $nav.Add("${BD}${LB}h${RB}${R}${DM} hide $dlCount downloaded${R}") }
         $nav.Add("${BD}${LB}b${RB}${R}${DM} back to tree${R}")
-        $L.Add("  $($nav -join '   ')")
+        $navWrapped = @(Wrap-Hints $nav.ToArray() $w)
+        foreach ($nl in $navWrapped) { $L.Add($nl) }
+        $navFooterLines = [Math]::Max(1, $navWrapped.Count)
         Show-Frame $L.ToArray()
 
         switch -regex (Read-Key) {
@@ -649,9 +700,10 @@ function Show-TreeSearchResults($matches, [string]$query, [string]$scopeLabel, [
             '^(pagedown|right)$'{ $cursor = [Math]::Min($total - 1, $cursor + $pageSize) }
             '^home$'         { $cursor = 0 }
             '^end$'          { $cursor = $total - 1 }
+            '^h$'            { $hideDone = -not $hideDone; $cursor = 0 }
             '^(enter|o)$' {
                 if ($total -gt 0) {
-                    $n = $matches[$cursor]
+                    $n = $visible[$cursor]
                     Show-Popup @("Downloading", (Get-NodeName $n))
                     $res = Save-ArchiveEntry $n $sub
                     if ($res -notlike "*Download failed*") { Mark-Visited (Get-EntryUrl $n) }
@@ -662,16 +714,24 @@ function Show-TreeSearchResults($matches, [string]$query, [string]$scopeLabel, [
             '^\d[\d,\s-]*$' {
                 if ($total -gt 0) {
                     # Console captures one digit then reads the rest; ISE's Read-Host
-                    # already returns the whole spec on one line.
+                    # already returns the whole spec on one line. Numbers index the
+                    # VISIBLE rows (so they match what the user sees while hiding).
                     $spec = if ($script:CanRawKey -and $_.Length -eq 1) { Read-NumberSpec $_ } else { $_ }
-                    $idx  = Parse-NumberSpec $spec $total
+                    $idx  = @(Parse-NumberSpec $spec $total)   # @() so an empty spec doesn't $null under StrictMode
                     if ($idx.Count -gt 0) {
-                        $picked = @($idx | ForEach-Object { $matches[$_ - 1] })
+                        $picked = @($idx | ForEach-Object { $visible[$_ - 1] })
                         Save-Entries $picked $arcName
                     }
                 }
             }
-            '^a$' { if ($total -gt 0) { Save-Entries $matches $arcName } }
+            '^a$' {
+                # Download all matches not already downloaded (a/A; no audit here).
+                if ($total -gt 0) {
+                    $pending = @($visible | Where-Object { -not (Test-Visited (Get-EntryUrl $_)) })
+                    if ($pending.Count -gt 0) { Save-Entries $pending $arcName }
+                    else { Show-Popup @('Nothing to download - all matches already downloaded.', '', 'press any key'); [void](Read-Key) }
+                }
+            }
             '^(b|q)$' { return }
         }
     }
@@ -766,6 +826,7 @@ function Show-ArchiveTree([object]$item) {
     $tee  = "$([char]0x251C)$([char]0x2500)$([char]0x2500) "
     $ell  = "$([char]0x2514)$([char]0x2500)$([char]0x2500) "
     $open = [char]0x25BE; $clsd = [char]0x25B8; $vbar = [char]0x2502
+    $navFooterLines = 2   # wrapped footer height from last render (reserved in body sizing)
 
     while ($true) {
         if ($rebuild) {
@@ -840,7 +901,8 @@ function Show-ArchiveTree([object]$item) {
         # Top border of the tree/detail panes: ┬ at the divider column (leftW+1).
         $L.Add("$DM$(HR-Join $w ($leftW + 1) ([char]0x252C))$R")
 
-        $bodyH = [Math]::Max(3, (Get-Height) - 9)
+        # 7 fixed chrome lines + the wrapped footer height from last render (>=2).
+        $bodyH = [Math]::Max(3, (Get-Height) - 7 - $navFooterLines)
 
         # Build the left (tree) lines, windowed around the cursor with indicators.
         $leftLines = [Collections.Generic.List[string]]::new()
@@ -996,8 +1058,9 @@ function Show-ArchiveTree([object]$item) {
             $aLbl = if ($script:AuditState -eq 'passive') { "${YL}audit: passive${R}${DM}" } else { 'audit' }
             $r2.Add("${BD}${LB}a${RB}${R}${DM} $aLbl${R}")
         }
-        $L.Add((Join-Justified $r1.ToArray() $w))
-        $L.Add((Join-Justified $r2.ToArray() $w))
+        $navWrapped = @(Wrap-Hints (@($r1.ToArray()) + @($r2.ToArray())) $w)
+        foreach ($nl in $navWrapped) { $L.Add($nl) }
+        $navFooterLines = [Math]::Max(2, $navWrapped.Count)
 
         # Passive audit (if running): enqueue this tree's visible file rows and pump
         # so markers fill in. Guarded — no-op without the audit component.
@@ -1136,17 +1199,16 @@ function Show-ArchiveTree([object]$item) {
 
             '^a$' {
                 if ($script:AuditAvailable -and $cur) {
-                    $scopeNode = if (($cur.IsFolder) -or $cur.Node.PSObject.Properties['__root']) { $cur.Node }
-                                 elseif ($cur.Parent) { $cur.Parent } else { $rootNode }
+                    # Audit location scopes to the WHOLE archive, not just the cursor's
+                    # folder — every entry under the synthetic root is collected.
                     $acc = [Collections.Generic.List[object]]::new()
-                    Get-AuditTreeFiles $scopeNode $subCache $acc
-                    $lbl  = '/' + (Get-NodeInternalPath $scopeNode)
+                    Get-AuditTreeFiles $rootNode $subCache $acc
                     $arc  = [string]$item.Name
                     $accF = @($acc.ToArray())
                     $ctx  = @{
-                        LocationLabel = "$($accF.Count) file$(if ($accF.Count -ne 1){'s'}) under $lbl"
+                        LocationLabel = "$($accF.Count) file$(if ($accF.Count -ne 1){'s'}) in archive $arc"
                         LocationKind  = 'nodes'
-                        Label         = "archive $arc : $lbl"
+                        Label         = "archive $arc"
                         Items         = $accF
                         ArcName       = $arc
                     }
@@ -1259,17 +1321,12 @@ function View-Item([object]$item, [int]$Number) {
     }
 }
 
-# Act on a chosen result row, per the current view:
-#   simple              -> open the detail page (archives get a browse/explore
-#                          option inside View-Item, shown like any other file).
-#   detailed / preview  -> archives open the tree browser; plain files download
-#                          straight away and flash the result on the results page.
+# Act on a chosen result row. All views behave the same: an archive opens the tree
+# browser; a plain file downloads straight away and flashes the result on the results
+# page. ($Number/$Mode are retained for call-site compatibility but no longer branch.)
 # Returns 'quit' to exit the app, otherwise ''.
 function Invoke-ItemAction([object]$chosen, [int]$Number, [string]$Mode) {
     Mark-Visited ([string]$chosen.Uri)
-    if ($Mode -eq 'simple') {
-        return (View-Item $chosen $Number)            # 'back' or 'quit'
-    }
     if (Get-IsArchive ([string]$chosen.Name)) {
         Show-ArchiveTree $chosen
         return ''

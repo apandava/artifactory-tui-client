@@ -19,19 +19,16 @@
 # and any non-ASCII glyph that affects execution is a numeric [char] escape.
 
 # ── SEVERITY MODEL ────────────────────────────────────────────────────────────
-# Severities, most to least severe: red > yellow > green > blue. The names are just
-# the colour each is shown in, so key, label and on-screen colour all agree.
-#
-# Historical note: these tiers are ported from Snaffler, whose ruleset names them
-# black > red > yellow > green. Black is unreadable on a dark terminal, so the tool
-# always displayed each one step down the colour scale (black->red, red->yellow,
-# yellow->green, green->blue). The keys have now simply been renamed to the colour
-# they're shown in, dropping the old indirection; the ordering is unchanged (what
-# Snaffler calls "black", the most severe, is our "red").
+# Severities, most to least severe: Critical > High > Medium > Low > Informational.
+# Colours are unchanged from the old tiers (Critical=red, High=yellow, Medium=green,
+# Low=blue); Informational is purple and is used for synthetic, non-match findings
+# (oversize text files, Tier-2 skipped) so they're visible but clearly the lowest tier.
+# Keys are stored capitalised (e.g. 'Critical'); the switches lower-case before
+# matching, so case never matters.
 
 function Get-AuditRank([string]$sev) {
     switch ("$sev".ToLower()) {
-        'red'  { 4 } 'yellow' { 3 } 'green' { 2 } 'blue' { 1 } default { 0 }
+        'critical' { 5 } 'high' { 4 } 'medium' { 3 } 'low' { 2 } 'informational' { 1 } default { 0 }
     }
 }
 
@@ -42,25 +39,31 @@ function Get-AuditColor([string]$sev) {
     if (-not $script:Vt) { return '' }
     $e = [char]27
     switch ("$sev".ToLower()) {
-        'red'    { "$e[38;5;203m" }
-        'yellow' { "$e[38;5;221m" }
-        'green'  { "$e[38;5;113m" }
-        'blue'   { "$e[38;5;75m"  }
-        default  { '' }
+        'critical'      { "$e[38;5;203m" }   # red
+        'high'          { "$e[38;5;221m" }   # yellow
+        'medium'        { "$e[38;5;113m" }   # green
+        'low'           { "$e[38;5;75m"  }   # blue
+        'informational' { "$e[38;5;135m" }   # purple
+        default         { '' }
     }
 }
 
 # Single-letter severity tag, so the marker is distinguishable without colour
-# (ISE / plain cmd) and for the CSV: R/Y/G/B.
+# (ISE / plain cmd) and for the CSV: C/H/M/L/I.
 function Get-AuditLetter([string]$sev) {
     switch ("$sev".ToLower()) {
-        'red'  { 'R' } 'yellow' { 'Y' } 'green' { 'G' } 'blue' { 'B' } default { '?' }
+        'critical' { 'C' } 'high' { 'H' } 'medium' { 'M' } 'low' { 'L' } 'informational' { 'I' } default { '?' }
     }
 }
 
 # Name of the synthetic rule for readable text files skipped only because they
 # exceed the content-scan cap. Lowest severity, default-excluded in the view.
-$script:AuditOversizeRule = 'TextFileAboveSizeLimit'
+$script:AuditOversizeRule = 'SkippedOversizeText'
+
+# Synthetic rule for files that would have had a Tier-2 content scan but were skipped
+# because the audit is running Tier-1 only. Lowest severity, default-excluded — so the
+# candidates are still visible without being pulled into the download set.
+$script:AuditSkippedRule = 'SkippedTier2'
 
 # ── RULESET ───────────────────────────────────────────────────────────────────
 # === USER-EDITABLE RULES =======================================================
@@ -71,7 +74,7 @@ $script:AuditOversizeRule = 'TextFileAboveSizeLimit'
 #   Discard  — { Loc='ext'|'name'|'path'; Match='exact'|'contains'|'regex';
 #               Values=@(...); Enabled=$bool }
 #              A hit drops the file from the audit entirely (noise suppression).
-#   Meta     — { Name; Sev=red|yellow|green|blue; Loc='ext'|'name'|'path';
+#   Meta     — { Name; Sev=Critical|High|Medium|Low; Loc='ext'|'name'|'path';
 #               Match='exact'|'contains'|'endswith'|'regex'; Values=@(...); Enabled }
 #              A "Tier 1" finding decided from filename/extension/path alone — no
 #              download. (.ext values are bare, no dot: 'kdbx' not '.kdbx'.)
@@ -115,90 +118,90 @@ function Get-AuditRuleDefs {
     # ---- META: Tier-1 findings (name / extension / path) ----------------------
     $meta = @(
         # ----- BLACK -----
-        @{ Name='WinHashes';        Sev='red'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='WinHashes';        Sev='Critical'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('NTDS.DIT','SYSTEM','SAM','SECURITY') }
-        @{ Name='NixLocalHashes';   Sev='red'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='NixLocalHashes';   Sev='Critical'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('shadow','pwd.db','passwd') }
-        @{ Name='MemDumpByName';    Sev='red'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='MemDumpByName';    Sev='Critical'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('MEMORY.DMP','hiberfil.sys','lsass.dmp','lsass.exe.dmp') }
-        @{ Name='NetDeviceConfig';  Sev='red'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='NetDeviceConfig';  Sev='Critical'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('running-config.cfg','startup-config.cfg','running-config','startup-config') }
-        @{ Name='CyberArkConfigs';  Sev='red'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='CyberArkConfigs';  Sev='Critical'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('Psmapp.cred','psmgw.cred','backup.key','MasterReplicationUser.pass','RecPrv.key',
                     'ReplicationUser.pass','Server.key','VaultEmergency.pass','VaultUser.pass','Vault.ini',
                     'PADR.ini','PARAgent.ini','CACPMScanner.exe.config','PVConfiguration.xml') }
-        @{ Name='PasswordManagers'; Sev='red'; Loc='ext';  Match='exact'; Enabled=$true;
+        @{ Name='PasswordManagers'; Sev='Critical'; Loc='ext';  Match='exact'; Enabled=$true;
            Values=@('kdbx','kdb','psafe3','kwallet','keychain','agilekeychain','cred') }
-        @{ Name='SSHKeysByName';    Sev='red'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='SSHKeysByName';    Sev='Critical'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('id_rsa','id_dsa','id_ecdsa','id_ed25519') }
-        @{ Name='SSHKeysByExt';     Sev='red'; Loc='ext';  Match='exact'; Enabled=$true;
+        @{ Name='SSHKeysByExt';     Sev='Critical'; Loc='ext';  Match='exact'; Enabled=$true;
            Values=@('ppk') }
-        @{ Name='SSHFilesByPath';   Sev='red'; Loc='path'; Match='contains'; Enabled=$true;
+        @{ Name='SSHFilesByPath';   Sev='Critical'; Loc='path'; Match='contains'; Enabled=$true;
            Values=@('/.ssh/') }
-        @{ Name='RemoteAccessName'; Sev='red'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='RemoteAccessName'; Sev='Critical'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('mobaxterm.ini','mobaxterm backup.zip','confCons.xml') }
-        @{ Name='CloudApiKeysName'; Sev='red'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='CloudApiKeysName'; Sev='Critical'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('.tugboat') }
-        @{ Name='CloudApiKeysPath'; Sev='red'; Loc='path'; Match='contains'; Enabled=$true;
+        @{ Name='CloudApiKeysPath'; Sev='Critical'; Loc='path'; Match='contains'; Enabled=$true;
            Values=@('/.aws/','doctl/config.yaml') }
         # ----- RED -----
-        @{ Name='HtpasswdEtc';      Sev='yellow'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='HtpasswdEtc';      Sev='High'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('.htpasswd','accounts.v4') }
-        @{ Name='MediaWikiConfig';  Sev='yellow'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='MediaWikiConfig';  Sev='High'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('LocalSettings.php') }
-        @{ Name='RubyConfig';       Sev='yellow'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='RubyConfig';       Sev='High'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('database.yml','.secret_token.rb','knife.rb','carrierwave.rb','omniauth.rb') }
-        @{ Name='JenkinsConfig';    Sev='yellow'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='JenkinsConfig';    Sev='High'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('jenkins.plugins.publish_over_ssh.BapSshPublisherPlugin.xml','credentials.xml') }
-        @{ Name='FtpServerConfig';  Sev='yellow'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='FtpServerConfig';  Sev='High'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('proftpdpasswd','filezilla.xml') }
-        @{ Name='FtpClientConfig';  Sev='yellow'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='FtpClientConfig';  Sev='High'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('recentservers.xml','sftp-config.json') }
-        @{ Name='DbMgmtConfig';     Sev='yellow'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='DbMgmtConfig';     Sev='High'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('SqlStudio.bin','.mysql_history','.psql_history','.pgpass',
                     '.dbeaver-data-sources.xml','credentials-config.json','dbvis.xml','robomongo.json') }
-        @{ Name='GitCredentials';   Sev='yellow'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='GitCredentials';   Sev='High'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('.git-credentials') }
-        @{ Name='PasswordFiles';    Sev='yellow'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='PasswordFiles';    Sev='High'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('passwords.txt','pass.txt','accounts.txt','passwords.doc','pass.doc','accounts.doc',
                     'passwords.xls','pass.xls','accounts.xls','passwords.docx','pass.docx','accounts.docx',
                     'passwords.xlsx','pass.xlsx','accounts.xlsx','secrets.txt','secrets.doc','secrets.xls',
                     'secrets.docx','secrets.xlsx','BitlockerLAPSPasswords.csv') }
-        @{ Name='InfraAsCode';      Sev='yellow'; Loc='ext';  Match='exact'; Enabled=$true;
+        @{ Name='InfraAsCode';      Sev='High'; Loc='ext';  Match='exact'; Enabled=$true;
            Values=@('cscfg','ucs','tfvars') }
-        @{ Name='VmDisks';          Sev='yellow'; Loc='ext';  Match='exact'; Enabled=$true;
+        @{ Name='VmDisks';          Sev='High'; Loc='ext';  Match='exact'; Enabled=$true;
            Values=@('vmdk','vdi','vhd','vhdx') }
-        @{ Name='MemDumpByExt';     Sev='yellow'; Loc='ext';  Match='exact'; Enabled=$true;
+        @{ Name='MemDumpByExt';     Sev='High'; Loc='ext';  Match='exact'; Enabled=$true;
            Values=@('dmp') }
-        @{ Name='CyberArkByExt';    Sev='yellow'; Loc='ext';  Match='exact'; Enabled=$true;
+        @{ Name='CyberArkByExt';    Sev='High'; Loc='ext';  Match='exact'; Enabled=$true;
            Values=@('pass') }
-        @{ Name='DomainJoinPath';   Sev='yellow'; Loc='path'; Match='contains'; Enabled=$true;
+        @{ Name='DomainJoinPath';   Sev='High'; Loc='path'; Match='contains'; Enabled=$true;
            Values=@('control/customsettings.ini') }
-        @{ Name='SccmBootVarPath';  Sev='yellow'; Loc='path'; Match='regex'; Enabled=$true;
+        @{ Name='SccmBootVarPath';  Sev='High'; Loc='path'; Match='regex'; Enabled=$true;
            Values=@('reminst/smstemp/.*\.var','sms/data/variables.dat','sms/data/policy.xml') }
         # ----- YELLOW -----
-        @{ Name='Databases';        Sev='green'; Loc='ext'; Match='exact'; Enabled=$true;
+        @{ Name='Databases';        Sev='Medium'; Loc='ext'; Match='exact'; Enabled=$true;
            Values=@('mdf','sdf','sqldump','bak') }
-        @{ Name='DeployImages';     Sev='green'; Loc='ext'; Match='exact'; Enabled=$true;
+        @{ Name='DeployImages';     Sev='Medium'; Loc='ext'; Match='exact'; Enabled=$true;
            Values=@('wim','ova','ovf') }
-        @{ Name='KerberosByExt';    Sev='green'; Loc='ext'; Match='exact'; Enabled=$true;
+        @{ Name='KerberosByExt';    Sev='Medium'; Loc='ext'; Match='exact'; Enabled=$true;
            Values=@('keytab','ccache') }
-        @{ Name='KerberosByName';   Sev='green'; Loc='name'; Match='regex'; Enabled=$true;
+        @{ Name='KerberosByName';   Sev='Medium'; Loc='name'; Match='regex'; Enabled=$true;
            Values=@('^krb5cc_.*') }
-        @{ Name='PacketCapture';    Sev='green'; Loc='ext'; Match='exact'; Enabled=$true;
+        @{ Name='PacketCapture';    Sev='Medium'; Loc='ext'; Match='exact'; Enabled=$true;
            Values=@('pcap','cap','pcapng') }
-        @{ Name='RemoteAccessExt';  Sev='green'; Loc='ext'; Match='exact'; Enabled=$true;
+        @{ Name='RemoteAccessExt';  Sev='Medium'; Loc='ext'; Match='exact'; Enabled=$true;
            Values=@('rdg','rtsz','rtsx','ovpn','tvopt','sdtid') }
-        @{ Name='DefenderConfig';   Sev='green'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='DefenderConfig';   Sev='Medium'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('SensorConfiguration.json','mdatp_managed.json') }
-        @{ Name='DomainJoinName';   Sev='green'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='DomainJoinName';   Sev='Medium'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('customsettings.ini') }
         # ----- GREEN (informational) -----
-        @{ Name='NameContainsSecret'; Sev='blue'; Loc='name'; Match='contains'; Enabled=$true;
+        @{ Name='NameContainsSecret'; Sev='Low'; Loc='name'; Match='contains'; Enabled=$true;
            Values=@('passw','secret','credential','thycotic','cyberark') }
-        @{ Name='ShellHistory';       Sev='blue'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='ShellHistory';       Sev='Low'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('.bash_history','.zsh_history','.sh_history','zhistory','.irb_history','ConsoleHost_History.txt') }
-        @{ Name='ShellRcFiles';       Sev='blue'; Loc='name'; Match='exact'; Enabled=$true;
+        @{ Name='ShellRcFiles';       Sev='Low'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('.netrc','_netrc','.exports','.functions','.extra','.npmrc','.env','.bashrc','.profile','.zshrc') }
     )
 
@@ -206,15 +209,15 @@ function Get-AuditRuleDefs {
     # Single-quoted strings keep backslashes literal; embedded single quotes are
     # doubled. Char classes simplified to ['"] (Snaffler over-escaped them).
     $content = [ordered]@{
-        'InlinePrivateKey' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'InlinePrivateKey' = @{ Sev='High'; Enabled=$true; Patterns=@(
             '-----BEGIN( RSA| OPENSSH| DSA| EC| PGP)? PRIVATE KEY( BLOCK)?-----') }
-        'AwsKeys' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'AwsKeys' = @{ Sev='High'; Enabled=$true; Patterns=@(
             'aws[_\-\.]?key',
             '(\s|[''"^=])(A3T[A-Z0-9]|AKIA|AGPA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z2-7]{12,16}(\s|[''"]|$)') }
-        'SlackTokens' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'SlackTokens' = @{ Sev='High'; Enabled=$true; Patterns=@(
             '(xox[pboa]-[0-9]{12}-[0-9]{12}-[0-9]{12}-[a-z0-9]{32})',
             'https://hooks\.slack\.com/services/T[a-zA-Z0-9_]{8}/B[a-zA-Z0-9_]{8}/[a-zA-Z0-9_]{24}') }
-        'PassOrKeyInCode' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'PassOrKeyInCode' = @{ Sev='High'; Enabled=$true; Patterns=@(
             'passw?o?r?d\s*=\s*[''"][^''"]....',
             'api[Kk]ey\s*=\s*[''"][^''"]....',
             'passw?o?r?d?>\s*[^\s<]+\s*<',
@@ -225,41 +228,41 @@ function Get-AuditRuleDefs {
             'client_secret\s*=*\s*',
             '<ExtendedMatchKey>ClientAuth',
             'GIUserPassword') }
-        'SqlAccountCreation' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'SqlAccountCreation' = @{ Sev='High'; Enabled=$true; Patterns=@(
             'CREATE (USER|LOGIN) .{0,200} (IDENTIFIED BY|WITH PASSWORD)') }
-        'DbConnStringPw' = @{ Sev='green'; Enabled=$true; Patterns=@(
+        'DbConnStringPw' = @{ Sev='Medium'; Enabled=$true; Patterns=@(
             'connectionstring.{1,200}passw') }
-        'S3UriPrefix' = @{ Sev='green'; Enabled=$true; Patterns=@(
+        'S3UriPrefix' = @{ Sev='Medium'; Enabled=$true; Patterns=@(
             's3[a]?:\/\/[a-zA-Z0-9\-\+\/]{2,16}') }
-        'CSharpDbConnRed' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'CSharpDbConnRed' = @{ Sev='High'; Enabled=$true; Patterns=@(
             'Data Source=.+(;|)Password=.+(;|)','Password=.+(;|)Data Source=.+(;|)') }
-        'CSharpDbConnYellow' = @{ Sev='green'; Enabled=$true; Patterns=@(
+        'CSharpDbConnYellow' = @{ Sev='Medium'; Enabled=$true; Patterns=@(
             'Data Source=.+Integrated Security=(SSPI|true)','Integrated Security=(SSPI|true);.*Data Source=.+') }
-        'CSharpViewstateKeys' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'CSharpViewstateKeys' = @{ Sev='High'; Enabled=$true; Patterns=@(
             'validationkey\s*=\s*[''"][^''"]....','decryptionkey\s*=\s*[''"][^''"]....') }
-        'CmdCredentials' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'CmdCredentials' = @{ Sev='High'; Enabled=$true; Patterns=@(
             'passwo?r?d\s*=\s*[''"][^''"]....','schtasks.{1,300}(/rp\s|/p\s)','net user ',
             'psexec .{0,100} -p ','net use .{0,300} /user:','cmdkey ') }
-        'PsCredentials' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'PsCredentials' = @{ Sev='High'; Enabled=$true; Patterns=@(
             '-SecureString','-AsPlainText','\[Net.NetworkCredential\]::new\(') }
-        'JavaDbConnStrings' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'JavaDbConnStrings' = @{ Sev='High'; Enabled=$true; Patterns=@(
             '\.getConnection\("jdbc:','passwo?r?d\s*=\s*[''"][^''"]....') }
-        'PhpDbConnStrings' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'PhpDbConnStrings' = @{ Sev='High'; Enabled=$true; Patterns=@(
             'mysql_connect\s*\(.*\$.*\)','mysql_pconnect\s*\(.*\$.*\)','mysql_change_user\s*\(.*\$.*\)',
             'pg_connect\s*\(.*\$.*\)','pg_pconnect\s*\(.*\$.*\)') }
-        'PerlDbConnStrings' = @{ Sev='yellow'; Enabled=$true; Patterns=@('DBI\-\>connect\(') }
-        'PyDbConnStrings' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'PerlDbConnStrings' = @{ Sev='High'; Enabled=$true; Patterns=@('DBI\-\>connect\(') }
+        'PyDbConnStrings' = @{ Sev='High'; Enabled=$true; Patterns=@(
             'mysql\.connector\.connect\(','psycopg2\.connect\(') }
-        'RubyDbConnStrings' = @{ Sev='yellow'; Enabled=$true; Patterns=@('DBI\.connect\(') }
-        'NetConfigCreds' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'RubyDbConnStrings' = @{ Sev='High'; Enabled=$true; Patterns=@('DBI\.connect\(') }
+        'NetConfigCreds' = @{ Sev='High'; Enabled=$true; Patterns=@(
             'NVRAM config last updated','enable password \.','simple-bind authenticated encrypt',
             'pac key [0-7] ','snmp-server community\s.+\sRW') }
-        'UnattendXml' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'UnattendXml' = @{ Sev='High'; Enabled=$true; Patterns=@(
             '(?s)<AdministratorPassword>.{0,30}<Value>.*<\/Value>',
             '(?s)<AutoLogon>.{0,30}<Value>.*<\/Value>') }
-        'FirefoxLogins' = @{ Sev='yellow'; Enabled=$true; Patterns=@(
+        'FirefoxLogins' = @{ Sev='High'; Enabled=$true; Patterns=@(
             '"encryptedPassword":"[A-Za-z0-9+/=]+"') }
-        'RdpPasswords' = @{ Sev='yellow'; Enabled=$true; Patterns=@('password 51:b') }
+        'RdpPasswords' = @{ Sev='High'; Enabled=$true; Patterns=@('password 51:b') }
     }
 
     # ---- RELAY: route file types to content rules -----------------------------
@@ -451,14 +454,14 @@ $script:AuditDirty   = $false   # set when flags/findings/state change (drives r
 # User setting (toggled from the audit menu; persists across runs, NOT reset by
 # Reset-AuditEngine): when on, a listable archive is expanded via the treebrowser and
 # every internal entry is audited; when off, the archive is classified as a plain
-# file (name/path/content only), with no internal structure pulled.
-$script:AuditWalkArchives = $true
+# file (name/path/content only), with no internal structure pulled. Default off.
+$script:AuditWalkArchives = $false
 
 # User setting (toggled from the audit menu; persists, NOT reset by Reset-AuditEngine):
 # when on, files routed by a relay rule are downloaded and scanned with content regexes
 # (Tier 2). When off, the audit is Tier-1 only — name/extension/path metadata checks
-# with NO file content fetched.
-$script:AuditTier2 = $true
+# with NO file content fetched. Default off (Tier-1 only).
+$script:AuditTier2 = $false
 
 # Marker map read by the base row renderers: key -> highest raw severity. Synchronized
 # only so a stale read during a write can't throw; written on the main thread.
@@ -469,6 +472,21 @@ $script:AuditFindings    = [Collections.Generic.List[object]]::new()
 $script:AuditFindingIdx  = @{}
 $script:AuditSeen        = New-Object 'System.Collections.Generic.HashSet[string]'  # keys already enqueued
 $script:AuditDecided     = New-Object 'System.Collections.Generic.HashSet[string]'  # keys fully scanned (drives the passive * / ? glyph)
+# Content-identity dedup. The same file in one repo can be reached under more than one
+# differently-formatted storage uri (the walker's constructed uri vs a search-result uri;
+# trailing-slash / encoding variants) — which the uri-keyed AuditSeen above can't collapse,
+# producing identical findings in pairs. The identity is repo + path + filename, so a file
+# with the same path and name in a DIFFERENT (unrelated) repo is treated as distinct and
+# kept, as is a different path. Archive entries qualify the identity with their archive name
+# so same-named entries in different archives aren't merged. (The other pair source — a
+# virtual repo re-listing a backing repo's artifacts — is cut off in Get-AuditWalkRepos,
+# which skips virtual repos.)
+$script:AuditSeenPath    = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+function Get-AuditPathIdentity($rec) {
+    $base = "$($rec.Repo)|$($rec.Path)|$($rec.Name)"
+    if ($rec.IsArchiveEntry) { return "$($rec.ArchiveName)!$base" }
+    return $base
+}
 
 # Exclude filter: compiled glob terms ('*.xml', '*testing*', ...). A finding whose
 # Name matches any term is auto-excluded from the bulk download (rendered dim with an
@@ -541,16 +559,22 @@ $script:AuditWkScript = {
     try {
         $size = [int64]$knownSize
         $modified = ''
-        if ($size -lt 0 -and $storageUri) {
+        # Hit the storage API whenever we have a storage uri, to capture lastModified
+        # (ISO) for the Modified column — and the size when it isn't already known.
+        # A failure only aborts when the size is still unknown (we can't safely
+        # download then); if the size is known we proceed and just leave Modified blank.
+        if ($storageUri) {
             try {
                 $info = Invoke-RestMethod -Uri $storageUri -Headers $headers -ErrorAction Stop
-                if ($info.PSObject.Properties['size'])         { $size     = [int64]$info.size }
-                if ($info.PSObject.Properties['lastModified']) { $modified = "$($info.lastModified)" }
+                if ($size -lt 0 -and $info.PSObject.Properties['size']) { $size = [int64]$info.size }
+                if ($info.PSObject.Properties['lastModified'])           { $modified = "$($info.lastModified)" }
             } catch {
                 $we = Get-WkError $_
                 if ($we.Code -eq 429 -or $we.Code -eq 503) { $alert.Message = "Server rate-limited an audit request (HTTP $($we.Code))."; $alert.At = [DateTime]::UtcNow }
-                $cache[$key] = [PSCustomObject]@{ Ok=$false; Size=-1; Modified=''; Text=$null; TooBig=$false; Error=$we.Message }
-                return
+                if ($size -lt 0) {
+                    $cache[$key] = [PSCustomObject]@{ Ok=$false; Size=-1; Modified=''; Text=$null; TooBig=$false; Error=$we.Message }
+                    return
+                }
             }
         }
         if ($size -ge 0 -and $size -gt $cap) {
@@ -623,7 +647,7 @@ function Add-AuditFinding($rec, $resolved, [long]$size = -1, [string]$modified =
             Sev=$resolved.Sev; Rank=$resolved.Rank; Rule=$resolved.Rule; AllRules=$resolved.AllRules
             # Oversize text findings are excluded by default; so is anything matching the
             # active exclude filter (e.g. '*.xml'). Manual [x]/[i] still override per row.
-            Included=(($resolved.Rule -ne $script:AuditOversizeRule) -and -not (Test-AuditExcluded ([string]$rec.Name)))
+            Included=(($resolved.Rule -ne $script:AuditOversizeRule) -and ($resolved.Rule -ne $script:AuditSkippedRule) -and -not (Test-AuditExcluded ([string]$rec.Name)))
             InArchive=[bool]$rec.IsArchiveEntry; ArchiveName=$rec.ArchiveName
         }
         $script:AuditFindings.Add($f)
@@ -682,6 +706,12 @@ function Add-AuditRecord($rec) {
     [void]$script:AuditSeen.Add($rec.Key)
     $m = Test-AuditMeta $rec.Name $rec.Path
     if ($m.Discard) { [void]$script:AuditDecided.Add($rec.Key); return }
+    # Drop a re-encounter of the same file (same repo + path + name) reached under a
+    # differently-formatted uri; the same path + name in a different repo is a distinct
+    # file and kept, as is a different path. See $AuditSeenPath.
+    if (-not $script:AuditSeenPath.Add((Get-AuditPathIdentity $rec))) {
+        [void]$script:AuditDecided.Add($rec.Key); return
+    }
     $script:AuditEnq++
     if ($m.Findings.Count -gt 0) { Add-AuditFinding $rec (Resolve-AuditFindings $m.Findings) }
     # An archive (and not a nested sub-archive) is also expanded: its tree is fetched
@@ -699,6 +729,12 @@ function Add-AuditRecord($rec) {
         $rec.Previewable    = (Get-IsPreviewable $rec.Name)
         $script:AuditQueue.Enqueue($rec)   # decided once its content fetch completes
     } elseif (-not $expand) {
+        # Tier-1-only: a file that would have been content-scanned (has relay content
+        # rules) but earned no Tier-1 finding is surfaced under the synthetic skipped
+        # rule — visible but default-excluded, like the oversize rule.
+        if ($m.ContentRules.Count -gt 0 -and $m.Findings.Count -eq 0) {
+            Add-AuditFinding $rec @{ Sev='Informational'; Rank=1; Rule=$script:AuditSkippedRule; AllRules=$script:AuditSkippedRule; Count=1 }
+        }
         $script:AuditDone++
         [void]$script:AuditDecided.Add($rec.Key)
     }
@@ -807,7 +843,7 @@ function Complete-AuditJob($rec) {
     # No content hit. If it's a readable text file skipped only for size, and it has
     # no other finding, surface it under the synthetic oversize rule (default-excluded).
     if ($res.Ok -and $res.TooBig -and $rec.Previewable -and -not $script:AuditFindingIdx.ContainsKey($key)) {
-        Add-AuditFinding $rec @{ Sev='blue'; Rank=1; Rule=$script:AuditOversizeRule; AllRules=$script:AuditOversizeRule; Count=1 } $res.Size $res.Modified
+        Add-AuditFinding $rec @{ Sev='Informational'; Rank=1; Rule=$script:AuditOversizeRule; AllRules=$script:AuditOversizeRule; Count=1 } $res.Size $res.Modified
     }
 }
 
@@ -915,6 +951,7 @@ function Reset-AuditEngine {
     $script:AuditFindings = [Collections.Generic.List[object]]::new()
     $script:AuditFindingIdx = @{}
     $script:AuditSeen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $script:AuditSeenPath = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $script:AuditDecided = New-Object 'System.Collections.Generic.HashSet[string]'
     $script:AuditMetaTried = New-Object 'System.Collections.Generic.HashSet[string]'
     $script:AuditExcludes = @()
@@ -973,7 +1010,14 @@ $script:AuditWalkScript = {
 function Get-AuditWalkRepos {
     if ($Repos) { return @($Repos -split '[,\s]+' | Where-Object { $_ }) }
     Initialize-RepoMap
-    return @($script:RepoMap.Keys)
+    # Skip virtual repos: they aggregate other repos, so walking them re-enumerates the
+    # same artifacts already reached under their backing local/remote keys — every file
+    # found twice (duplicate findings + wasted requests). An explicit -Repos list above
+    # is honoured as given. If the repo map is empty (anonymous denied /api/repositories)
+    # this yields nothing, exactly as before.
+    return @($script:RepoMap.Keys | Where-Object {
+        "$($script:RepoMap[$_].Type)".ToLower() -ne 'virtual'
+    })
 }
 
 function Start-AuditWalk {
@@ -1097,11 +1141,40 @@ function Get-AuditNearOrder($items, [int]$sel) {
     return $out.ToArray()
 }
 
+# Keep the passive content queue to JUST the on-screen items, ordered nearest-first
+# (the keys, nearest-cursor first). Pending content fetches for items no longer on the
+# page are dropped and forgotten (removed from $AuditSeen) so the engine never lags
+# behind on pages the user has flicked past — and so a revisit re-audits them. Archive
+# expansion jobs (non-file) are left untouched. In-flight fetches are allowed to finish
+# (their result is still a valid finding); only not-yet-started work is discarded.
+function Restrict-AuditPassive([string[]]$orderedKeys) {
+    if ($script:AuditQueue.Count -eq 0) { return }
+    $rank = @{}
+    foreach ($k in $orderedKeys) { if ($k -and -not $rank.ContainsKey($k)) { $rank[$k] = $true } }
+    $kept    = [Collections.Generic.Queue[object]]::new()   # non-file jobs, original order
+    $onPage  = @{}                                           # on-page file recs by key
+    foreach ($rec in $script:AuditQueue) {
+        $kind = [string]$rec.Kind; if (-not $kind) { $kind = 'file' }
+        if ($kind -ne 'file') { $kept.Enqueue($rec); continue }
+        if ($rank.ContainsKey($rec.Key)) { $onPage[$rec.Key] = $rec }
+        else {
+            [void]$script:AuditSeen.Remove($rec.Key)
+            [void]$script:AuditSeenPath.Remove((Get-AuditPathIdentity $rec))
+            if ($script:AuditEnq -gt 0) { $script:AuditEnq-- }
+        }
+    }
+    foreach ($k in $orderedKeys) { if ($onPage.ContainsKey($k)) { $kept.Enqueue($onPage[$k]) } }
+    $script:AuditQueue = $kept
+}
+
 # Called each frame by the base results loop while passive auditing: enqueue the
-# current page (nearest-first), pump, and report whether the view should redraw.
+# current page (nearest-first), drop stale off-page work, pump, and report whether the
+# view should redraw.
 function Invoke-AuditPassiveTick($pageItems, [int]$selRow) {
     if ($script:AuditState -ne 'passive') { return $false }
-    Add-AuditWork (Get-AuditNearOrder $pageItems $selRow)
+    $ordered = @(Get-AuditNearOrder $pageItems $selRow)
+    Add-AuditWork $ordered
+    Restrict-AuditPassive (@($ordered | ForEach-Object { [string]$_.Uri }))
     Invoke-AuditPump
     $d = $script:AuditDirty; $script:AuditDirty = $false
     return $d
@@ -1149,6 +1222,9 @@ function Invoke-AuditPassiveTickTree($rows, [int]$cursor, [string]$arcName) {
         $nodes = [Collections.Generic.List[object]]::new()
         foreach ($idx in $order) { $row = $rows[$idx]; if ($row -and -not $row.IsFolder) { $nodes.Add($row.Node) } }
         Add-AuditWorkNodes $nodes.ToArray() $arcName
+        Restrict-AuditPassive (@($nodes.ToArray() | ForEach-Object { [string](Get-EntryUrl $_) }))
+    } else {
+        Restrict-AuditPassive @()
     }
     Invoke-AuditPump
     $d = $script:AuditDirty; $script:AuditDirty = $false
@@ -1156,12 +1232,11 @@ function Invoke-AuditPassiveTickTree($rows, [int]$cursor, [string]$arcName) {
 }
 
 # One-column status glyph for a file key, used by the base row renderers:
-#   coloured '!'  a finding (severity colour, remapped)
+#   coloured '!'  a finding (severity colour)
 #   grey '?'      passive mode: not yet scanned (or still in flight)
-#   grey '*'      passive mode: scanned, nothing found
-#   ''            not auditing this view
-# The '?'/'*' progress glyphs appear only while a PASSIVE audit is running, so it's
-# obvious the engine is working through the current view; after a one-shot
+#   ''            scanned with nothing found, or not auditing this view
+# The '?' progress glyph appears only while a PASSIVE audit is still working through
+# the current view; a scanned-clean row is left blank (no '*'), and after a one-shot
 # location/full audit only the '!' findings mark the rows.
 function Get-AuditMarker([string]$key) {
     if (-not $key) { return '' }
@@ -1169,16 +1244,24 @@ function Get-AuditMarker([string]$key) {
         $col = Get-AuditColor $script:AuditFlags[$key]
         return "${col}!${R}"   # $col/$R empty on a non-VT host -> plain '!'
     }
-    if ($script:AuditState -eq 'passive') {
-        $g = if ($script:AuditDecided.Contains($key)) { '*' } else { '?' }
-        return "${DM}$g${R}"
+    # Passive: '?' while a row is still pending; blank once scanned with no match.
+    if ($script:AuditState -eq 'passive' -and -not $script:AuditDecided.Contains($key)) {
+        return "${DM}?${R}"
     }
     return ''
 }
 
+# Matched audit rule(s) for an item key (its storage uri), or '' when the item isn't
+# flagged. Used by the search view to show the matched rule while passive auditing.
+function Get-AuditRuleLabel([string]$key) {
+    if ($key -and $script:AuditFindingIdx.ContainsKey($key)) { return [string]$script:AuditFindingIdx[$key].AllRules }
+    return ''
+}
+
 # ── FINDINGS SORTING ──────────────────────────────────────────────────────────
-# Sorted view of the findings: included first / excluded last, then highest severity,
-# then repo/path/name. Re-sort only when the count changed OR an exclusion toggled,
+# Sorted view of the findings: downloaded last of all, then excluded, then highest
+# severity, then repo/path/name. Re-sort only when the count changed OR an exclusion or
+# download toggled (both set AuditSortDirty; a download also marks the key visited),
 # AND either the audit isn't actively running or it's been a beat since the last sort
 # — so a fast scan doesn't re-sort thousands of rows every frame (the cause of the
 # navigation lag / periodic freezes). When paused or done it sorts immediately.
@@ -1191,7 +1274,8 @@ function Get-AuditSortedFindings {
     $stale   = (([DateTime]::UtcNow - $script:AuditSortAt).TotalMilliseconds -ge 750)
     if ($changed -and ($stale -or $script:AuditState -ne 'running')) {
         $script:AuditSorted = @($script:AuditFindings |
-            Sort-Object @{ Expression = { -not $_.Included } },
+            Sort-Object @{ Expression = { (Test-Visited $_.Key) } },
+                        @{ Expression = { -not $_.Included } },
                         @{ Expression = { $_.Rank }; Descending = $true },
                         @{ Expression = { $_.Repo } }, @{ Expression = { $_.Path } },
                         @{ Expression = { $_.Name } })
@@ -1216,7 +1300,10 @@ function Get-AuditStatusLines([int]$w) {
     $fps = '{0,6:0.0}' -f [double]$script:AuditRate.FPS
     $bps = ((Format-Size $script:AuditRate.BPS) + '/s').PadLeft(11)
     $rate = "${DM}$qps req/s  $fps files/s  $bps${R}"
-    $l1 = "  ${DM}Audit:${R} $(Trunc $script:AuditScope ([Math]::Max(8,$w-40)))   $st   $prog"
+    # Settings the run was started with (constant for the run): scan tier and whether
+    # listable archives are walked and their entries audited.
+    $set = "${DM}$(if ($script:AuditTier2) { 'Tier 2' } else { 'Tier 1' }) | archives $(if ($script:AuditWalkArchives) { 'on' } else { 'off' })${R}"
+    $l1 = "  ${DM}Audit:${R} $(Trunc $script:AuditScope ([Math]::Max(8,$w-64)))   $set   $st   $prog"
     $l2 = "  $rate   $thr"
     return @($l1, $l2)
 }
@@ -1261,12 +1348,21 @@ function Get-AuditPreviewLines($f, [int]$paneW, [int]$maxLines, [int]$scroll = 0
         return $L.ToArray()
     }
 
-    if ((Test-Visited $f.Key) -or (Test-Downloaded ([string]$f.Url))) {
+    $url    = [string]$f.Url
+    $forced = $script:PreviewOK.Contains($url)
+    # Downloaded and excluded findings have their preview content freed; both can be
+    # brought back with [y] (re-fetched). Skip these messages once force-opted so the
+    # actual content renders below.
+    if (((Test-Visited $f.Key) -or (Test-Downloaded $url)) -and -not $forced) {
         $L.Add("${DM}Downloaded - content cleared from memory.${R}")
-        $L.Add("${DM}Press [d] to download again.${R}")
+        $L.Add("${DM}Press [d] to download again, or ${YL}[y]${R}${DM} to preview again.${R}")
         return $L.ToArray()
     }
-    $url   = [string]$f.Url
+    if ((-not $f.Included) -and -not $forced) {
+        $L.Add("${DM}Excluded - content cleared from memory.${R}")
+        $L.Add("${YL}Press [y] to force preview${R}${DM} again.${R}")
+        return $L.ToArray()
+    }
     $sz    = [long]$f.Size
     $state = Get-AuditPreviewability $name $url $sz
     $szTxt = if ($sz -ge 0) { Format-Size $sz } else { 'unknown size' }
@@ -1281,12 +1377,12 @@ function Get-AuditPreviewLines($f, [int]$paneW, [int]$maxLines, [int]$scroll = 0
             return $L.ToArray()
         }
         'force-gated' {
-            $L.Add("${DM}This file format can't be previewed.${R}")
+            $L.Add("${DM}This is not a known text format.${R}")
             $L.Add("${YL}Press [y] to force preview${R}${DM} (extract readable text).${R}")
             return $L.ToArray()
         }
         'force-toolarge' {
-            $L.Add("${DM}This file format can't be previewed.${R}")
+            $L.Add("${DM}This is not a known text format.${R}")
             $L.Add("${RD}File too large to force preview ($szTxt).${R}")
             $L.Add("${DM}The 5 MB preview limit can't be overridden.${R}")
             return $L.ToArray()
@@ -1335,8 +1431,11 @@ function Save-AuditFinding($f) {
     try {
         Invoke-WebRequest -Uri $f.Url -Headers (Get-AuthHeaders) -OutFile $dest -ErrorAction Stop
         $len = -1; try { $len = (Get-Item $dest).Length } catch { }
-        Write-DownloadLog $OutDir $f.Name $f.Repo $f.Path $len $f.Modified $f.Url $f.Sev $f.AllRules
+        Write-DownloadLog $OutDir $f.Name $f.Repo $f.Path $(if ($f.InArchive) { [string]$f.ArchiveName } else { '' }) $len $f.Modified $f.Url $f.Sev $f.AllRules
         Mark-Downloaded $f.Key $f.Url
+        # Re-sort so the now-downloaded row drops to the very back (Mark-Downloaded only
+        # changed the visited set, not the findings count, so nudge the sort explicitly).
+        $script:AuditSortDirty = $true
         $sz = if ($len -ge 0) { ' (' + (Format-Size $len) + ')' } else { '' }
         return "${BD}Saved${R} to ${CY}$dest${R}$sz"
     } catch {
@@ -1345,19 +1444,29 @@ function Save-AuditFinding($f) {
     } finally { $ProgressPreference = $old }
 }
 
-# Confirm + download all INCLUDED findings, warning with count + total size first.
-function Save-AuditIncluded {
-    $inc = @(Get-AuditSortedFindings | Where-Object { $_.Included -and -not (Test-Visited $_.Key) })
+# Confirm + download a set of findings, warning with count + total size first. Findings
+# that would save under the same filename collide on disk (Save-AuditFinding writes to
+# $OutDir/<Name>), so each filename is downloaded once — keeping the first (the list is
+# pre-sorted highest-severity-first); the rest are counted as deduped and reported.
+# Shared by 'A' (download all included) and the numeric multi-download.
+function Save-AuditFindingSet($candidates) {
+    $candidates = @($candidates)
+    $seenName = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $incList = [Collections.Generic.List[object]]::new()
+    foreach ($f in $candidates) { if ($seenName.Add([string]$f.Name)) { [void]$incList.Add($f) } }
+    $inc = @($incList.ToArray())
+    $deduped = $candidates.Count - $inc.Count
     $total = $inc.Count
     if ($total -eq 0) { Show-Popup @('Nothing to download.', '', 'press any key'); [void](Read-Key); return }
     $bytes = 0L; $haveAll = $true
     foreach ($f in $inc) { if ($f.Size -ge 0) { $bytes += [long]$f.Size } else { $haveAll = $false } }
     $szStr = if ($haveAll) { Format-Size $bytes } else { "$(Format-Size $bytes)+ (some sizes unknown)" }
-    $ok = Confirm-Prompt @(
-        "${BD}Download $total flagged file$(if ($total -ne 1){'s'})?${R}",
-        "Total size: ${CY}$szStr${R}",
-        "Into: ${CY}$OutDir${R}",
-        "${DM}Each file and its download URL is logged to download-log.csv there.${R}")
+    $lines = @("${BD}Download $total file$(if ($total -ne 1){'s'})?${R}")
+    if ($deduped -gt 0) { $lines += "${DM}$deduped duplicate filename$(if ($deduped -ne 1){'s'}) deduped (same name).${R}" }
+    $lines += "Total size: ${CY}$szStr${R}"
+    $lines += "Into: ${CY}$OutDir${R}"
+    $lines += "${DM}Each file and its download URL is logged to download-log.csv there.${R}"
+    $ok = Confirm-Prompt $lines
     if (-not $ok) { return }
     $done = 0; $fail = 0; $i = 0
     foreach ($f in $inc) {
@@ -1366,8 +1475,14 @@ function Save-AuditIncluded {
         $res = Save-AuditFinding $f
         if ($res -like '*Download failed*') { $fail++ } else { $done++ }
     }
-    Show-Popup @("Done.  Saved $done, failed $fail.", "Into $OutDir", '', 'press any key')
+    $sum = "Done.  Saved $done, failed $fail$(if ($deduped -gt 0) { ", deduped $deduped" })."
+    Show-Popup @($sum, "Into $OutDir", '', 'press any key')
     [void](Read-Key)
+}
+
+# 'A' download all: every INCLUDED, not-yet-downloaded finding.
+function Save-AuditIncluded {
+    Save-AuditFindingSet (@(Get-AuditSortedFindings | Where-Object { $_.Included -and -not (Test-Visited $_.Key) }))
 }
 
 # ── EXCLUDE FILTER ────────────────────────────────────────────────────────────
@@ -1413,7 +1528,15 @@ function Test-AuditExcluded([string]$name) {
 # rest are left as-is (so manual [x] toggles on non-matching rows are preserved).
 function Update-AuditExclusions {
     foreach ($f in $script:AuditFindings) {
-        if (Test-AuditExcluded ([string]$f.Name)) { $f.Included = $false }
+        if (Test-AuditExcluded ([string]$f.Name)) {
+            # Newly excluded: free its cached preview and reset the force-opt, matching
+            # the manual [x] path so an excluded finding holds no preview content.
+            if ($f.Included) {
+                Clear-PreviewMem ([string]$f.Url)
+                [void]$script:PreviewOK.Remove([string]$f.Url)
+            }
+            $f.Included = $false
+        }
     }
     $script:AuditSortDirty = $true; $script:AuditDirty = $true
 }
@@ -1531,7 +1654,12 @@ function Get-AuditPreviewRequest($f) {
                   Uri=$rq.Uri; Body=$rq.Body; Headers=$rq.Headers; Ua=$rq.Ua }
     }
     $url = [string]$f.Url
-    if (-not $url -or (Test-Downloaded $url)) { return $null }
+    if (-not $url) { return $null }
+    # A downloaded or excluded finding has its preview content freed and is NOT warmed,
+    # unless the user force-opted it back in with [y] (tracked in PreviewOK).
+    $forced = $script:PreviewOK.Contains($url)
+    if ((Test-Downloaded $url) -and -not $forced) { return $null }
+    if ((-not $f.Included)     -and -not $forced) { return $null }
     $sz  = if ($f.Size -ge 0) { [long]$f.Size } else { -1 }
     if (Test-AuditPreviewLoadable (Get-AuditPreviewability $name $url $sz)) {
         return @{ Key=(Get-FilePreviewKey $url); Kind='file'; Url=$url; Headers=(Get-AuthHeaders) }
@@ -1588,6 +1716,8 @@ function Stop-AuditPreviewWarm {
 # in/out of the bulk download; 'a' downloads all included.
 function Show-AuditView {
     $sel = 0; $mode = 'results'; $pvScroll = 0; $lastPvKey = ''; $lastWarmKey = ''; $selKey = ''
+    $hideDone = $false    # hide excluded + already-downloaded findings from the list
+    $navFooterLines = 1   # wrapped footer height from last render (reserved in body sizing)
     $notice = if ($script:AuditState -eq 'paused') {
         @{ Message = "${YL}Paused - set delay with ${LB}+/-${RB} (0-5000ms) and workers with ${LB}w${RB} (1-5), then ${LB}p${RB} to start.${R}"; At = [DateTime]::UtcNow }
     } else { @{ Message = ''; At = [DateTime]::MinValue } }
@@ -1595,7 +1725,13 @@ function Show-AuditView {
 
     while ($true) {
         $active = ($script:AuditState -eq 'running' -or $script:AuditState -eq 'paused')
-        $list   = @(Get-AuditSortedFindings)
+        $full   = @(Get-AuditSortedFindings)
+        # Excluded + already-downloaded findings can be hidden from the list. Count them
+        # for the footer hint; window the list when hiding is on.
+        $hideableCount = @($full | Where-Object { (-not $_.Included) -or (Test-Visited $_.Key) }).Count
+        # @(...) around the if/else: an else-branch that yields an empty collection would
+        # otherwise collapse to $null under StrictMode and break $list.Count below.
+        $list   = @(if ($hideDone) { @($full | Where-Object { $_.Included -and -not (Test-Visited $_.Key) }) } else { $full })
         $total  = $list.Count
         # Keep the cursor on the SAME finding when the list re-sorts (new results
         # loading in, or an exclude moving a row): if we know the selected item's key
@@ -1625,18 +1761,17 @@ function Show-AuditView {
         # Column geometry.
         $rightW = if ($preview) { [Math]::Max(28, [int]($w * 0.42)) } else { 0 }
         $colW   = if ($preview) { $w - $rightW - 3 } else { $w }
-        $numW = 4; $sevW = 4; $typeW = 5; $sizeW = 9; $modW = 10
-        # Preview keeps the compact set (# Sev Name Type Size Modified Rule) since the
-        # right pane carries repo/path/etc.; the full table adds the same detail columns
-        # the regular search view shows (Repo / RType / PType / Path). The matched-rule
-        # column is always shown; Name (and Path, when shown) absorb the remaining width.
+        # Tight fixed widths (Sev is a single letter; Rule is capped low) so columns
+        # pack together like the search view instead of leaving wide mid-table gaps;
+        # Name (and Path, when shown) absorb the slack.
+        $numW = 4; $sevW = 3; $typeW = 5; $sizeW = 9; $modW = 10
         $repoW = 0; $rtypeW = 0; $ptypeW = 0; $pathW = 0
         if ($preview) {
-            $ruleW = [Math]::Min(16, [Math]::Max(8, [int]($colW * 0.20)))
+            $ruleW = [Math]::Min(16, [Math]::Max(8, [int]($colW * 0.18)))
             $fixed = $numW + $sevW + $typeW + $sizeW + $modW + $ruleW + 14
             $nameW = [Math]::Max(10, $colW - $fixed)
         } else {
-            $ruleW  = [Math]::Min(26, [Math]::Max(12, [int]($colW * 0.22)))
+            $ruleW  = [Math]::Min(18, [Math]::Max(10, [int]($colW * 0.15)))
             $rtypeW = 6; $ptypeW = 8
             $repoW  = [Math]::Min(16, [Math]::Max(8, [int]($colW * 0.14)))
             $fixed  = $numW + $sevW + $typeW + $sizeW + $modW + $ruleW + $repoW + $rtypeW + $ptypeW + 18
@@ -1659,7 +1794,9 @@ function Show-AuditView {
         # we only ever format the rows actually on screen — formatting the whole
         # findings list every frame was the cause of the navigation lag.
         $L.Add("$DM$(HR-Join $w ($(if ($preview) { $colW + 1 } else { $w }) ) ([char]0x252C))$R")
-        $bodyH = [Math]::Max(4, (Get-Height) - $L.Count - 3)
+        # Reserve the bottom border + the wrapped footer (its height from last frame)
+        # + one spare, so a multi-line footer is never clipped.
+        $bodyH = [Math]::Max(4, (Get-Height) - $L.Count - (2 + $navFooterLines))
         $rowsH = [Math]::Max(1, $bodyH - 2)          # minus the column header + its divider
         $totalPages = [Math]::Max(1, [int][Math]::Ceiling($total / $rowsH))
         $page = [int][Math]::Floor($sel / $rowsH)
@@ -1686,8 +1823,8 @@ function Show-AuditView {
         $leftLines.Add("  $hdrLine")
         $leftLines.Add($script:HeaderRuleTag)
         if ($total -eq 0) {
-            $msg = if ($active) { 'Scanning... findings will appear here.' } else { 'No findings.' }
-            $leftLines.Add("  ${DM}$msg${R}")
+            # No placeholder while active (startup / scanning); rows appear as they're found.
+            if (-not $active) { $leftLines.Add("  ${DM}No findings.${R}") }
         } else {
             for ($ri = $offset; $ri -le $end; $ri++) {
                 $f   = $list[$ri]
@@ -1705,7 +1842,11 @@ function Show-AuditView {
                 $sevCol = if ($dim) { $DM } else { Get-AuditColor $f.Sev }
                 $sevCell = if ($script:Vt) { "${sevCol}$(Clip (Get-AuditLetter $f.Sev) $sevW)${R}" } else { Clip (Get-AuditLetter $f.Sev) $sevW }
                 $size = if ($f.Size -ge 0) { Format-Size $f.Size } else { '?' }
+                # Show '?' until the storage-metadata warm lands a date (mirrors the
+                # search view's Modified column and the Size cell above); a blank cell
+                # otherwise looks like the column is broken when the fetch is slow/denied.
                 $modd = Format-AuditModified ([string]$f.Modified)
+                if (-not $modd) { $modd = '?' }
                 $cells = @(
                     "${DM}$(ClipR ([string]($ri + 1)) $numW)${R}",
                     $sevCell,
@@ -1721,9 +1862,9 @@ function Show-AuditView {
                     $cells += "${cRepo}$(Clip $repo $repoW)${R}"
                     $cells += "${cDim}$(Clip ([string]$rmeta.Type) $rtypeW)${R}"
                     $cells += "${cRepo}$(Clip ([string]$rmeta.PackageType) $ptypeW)${R}"
-                    if ($pathW -gt 0) { $cells += "${DM}$(Clip ([string]$f.Path) $pathW)${R}" }
+                    if ($pathW -gt 0) { $cells += (Format-PathCell ([string]$f.Path) $pathW ([bool]$f.InArchive) $DM $cDim) }
                 }
-                $mark = if ($excluded) { "${DM}x${R} " } elseif ($downloaded) { "${DM}.${R} " } elseif ($sels) { "${BD}${YL}>${R} " } else { '  ' }
+                $mark = if ($downloaded) { "${DM}d${R} " } elseif ($excluded) { "${DM}x${R} " } elseif ($sels) { "${BD}${YL}>${R} " } else { '  ' }
                 $line = "$mark$($cells -join ' ')"
                 if ($sels) { $line = Highlight-Row $line $colW }
                 $leftLines.Add($line)
@@ -1732,7 +1873,7 @@ function Show-AuditView {
 
         if (-not $preview) {
             foreach ($ll in $leftLines) {
-                if ($ll -eq $script:HeaderRuleTag) { $L.Add("  ${DM}$(HR ($w - 2))${R}") } else { $L.Add($ll) }
+                if ($ll -eq $script:HeaderRuleTag) { $L.Add("${DM}$(HR $w)${R}") } else { $L.Add($ll) }
             }
             for ($i = $leftLines.Count; $i -lt $bodyH; $i++) { $L.Add('') }
         } else {
@@ -1751,6 +1892,7 @@ function Show-AuditView {
                 $rl.Add('')
                 $rl.Add("${DM}$('Repository'.PadRight($labelW))${R}${MG}$(Trunc ([string]$cur.Repo) $valMax)${R}")
                 $rl.Add("${DM}$('Path'.PadRight($labelW))${R}$(Trunc ([string]$cur.Path) $valMax)")
+                if ($cur.InArchive) { $rl.Add("${DM}$('Archive'.PadRight($labelW))${R}${YL}$(Trunc ([string]$cur.ArchiveName) $valMax)${R}") }
                 $rl.Add("${DM}$('Type'.PadRight($labelW))${R}${YL}$(Trunc ([string]$cur.FileType) $valMax)${R}")
                 $rl.Add("${DM}$('Size'.PadRight($labelW))${R}$szTxt")
                 if ($modTxt) { $rl.Add("${DM}$('Modified'.PadRight($labelW))${R}$(Trunc $modTxt $valMax)") }
@@ -1783,19 +1925,28 @@ function Show-AuditView {
             $nav.Add("${DM}Page ${BD}$($page + 1)${R}${DM}/$totalPages${R}")
             $nav.Add("${BD}${LB}$([char]0x2191)$([char]0x2193)${RB}${R}${DM} move${R}")
             $nav.Add("${BD}${LB}$([char]0x2190)$([char]0x2192)${RB}${R}${DM} page${R}")
-            $nav.Add("${BD}${LB}d${RB}${R}${DM} download${R}")
-            $nav.Add("${BD}${LB}x${RB}${R}${DM} $(if ($cur -and $cur.Included) { 'exclude' } else { 'include' })${R}")
-            $nav.Add("${BD}${LB}a${RB}${R}${DM} download all${R}")
+            $nav.Add("${BD}${LB}$([char]0x21B5)${RB}${R}${DM} download${R}")
+            $nav.Add("${BD}${LB}#${RB}${R}${DM} multi-download${R}")
+            $nav.Add("${BD}${LB}x${RB}${R}${DM} $(if ($cur -and (Test-Visited $cur.Key)) { 'un-download' } elseif ($cur -and $cur.Included) { 'exclude' } else { 'include' })${R}")
+            $nav.Add("${BD}${LB}A${RB}${R}${DM} download all${R}")
             $nav.Add("${BD}${LB}f${RB}${R}${DM} filter$(if (@($script:AuditExcludes).Count -gt 0) { " ($(@($script:AuditExcludes).Count))" })${R}")
             $nav.Add("${BD}${LB}i${RB}${R}${DM} include all${R}")
-            $nav.Add("${BD}${LB}v${RB}${R}${DM} $(if ($preview) { 'preview off' } else { 'preview on' })${R}")
+            $nav.Add("${BD}${LB}d${RB}${R}${DM} $(if ($preview) { 'results view' } else { 'preview view' })${R}")
             if ($preview -and $cur) {
-                $pst = Get-AuditPreviewability ([string]$cur.Name) ([string]$cur.Url) ([long]$cur.Size)
-                if ($pst -eq 'large-gated')     { $nav.Add("${BD}${LB}y${RB}${R}${DM} preview large${R}") }
+                $curUrl = [string]$cur.Url
+                $pst = Get-AuditPreviewability ([string]$cur.Name) $curUrl ([long]$cur.Size)
+                $hidden = ((Test-Visited $cur.Key) -or (Test-Downloaded $curUrl) -or (-not $cur.Included)) `
+                          -and -not $script:PreviewOK.Contains($curUrl)
+                if ($hidden)                    { $nav.Add("${BD}${LB}y${RB}${R}${DM} preview again${R}") }
+                elseif ($pst -eq 'large-gated') { $nav.Add("${BD}${LB}y${RB}${R}${DM} preview large${R}") }
                 elseif ($pst -eq 'force-gated') { $nav.Add("${BD}${LB}y${RB}${R}${DM} force preview${R}") }
             }
             if ($preview -and $script:PvScrollMax -gt 0) { $nav.Add("${BD}${LB}Shift+$([char]0x2191)$([char]0x2193)${RB}${R}${DM} scroll${R}") }
         }
+        # Hide/show excluded + downloaded findings. Outside the $total>0 block so the
+        # 'unhide' hint still shows when everything is hidden (the list is then empty).
+        if ($hideDone)                { $nav.Add("${BD}${LB}h${RB}${R}${DM} unhide $hideableCount hidden${R}") }
+        elseif ($hideableCount -gt 0) { $nav.Add("${BD}${LB}h${RB}${R}${DM} hide $hideableCount excluded/done${R}") }
         if ($active) {
             $nav.Add("${BD}${LB}p${RB}${R}${DM} $(if ($script:AuditState -eq 'paused') { 'resume' } else { 'pause' })${R}")
             $nav.Add("${BD}${LB}c${RB}${R}${DM} cancel${R}")
@@ -1803,7 +1954,9 @@ function Show-AuditView {
             $nav.Add("${BD}${LB}w${RB}${R}${DM} workers $($script:AuditThrottle.MaxConcurrent)${R}")
         }
         $nav.Add("${BD}${LB}q${RB}${R}${DM} back${R}")
-        $L.Add((Join-Justified $nav.ToArray() $w))
+        $navWrapped = @(Wrap-Hints $nav.ToArray() $w)
+        foreach ($nl in $navWrapped) { $L.Add($nl) }
+        $navFooterLines = [Math]::Max(1, $navWrapped.Count)
         Show-Frame $L.ToArray()
 
         # Input: poll while the engine is active OR while metadata/preview fetches are
@@ -1833,16 +1986,31 @@ function Show-AuditView {
                 if ($preview) { $d = if ($key -eq 'shift+down') { 1 } else { -1 }
                     Invoke-ScrollBurst ([ref]$pvScroll) $script:PvScrollMax ([ref]$pendingKey) $d }
             }
-            '^v$' {
+            '^d$' {
                 if ($preview) { $mode = 'results'; Stop-AuditPreviewWarm } else { $mode = 'results-preview' }
                 $script:AuditPvKey = ''; $lastWarmKey = ''
             }
             '^(x| )$' {
                 if ($cur) {
-                    $cur.Included = (-not $cur.Included); $script:AuditSortDirty = $true
-                    # Excluding drops the row to the back; advance to the next row so the
-                    # cursor doesn't follow the excluded item down there.
-                    if (-not $cur.Included) { $sel = [Math]::Min($sel + 1, [Math]::Max(0, $total - 1)) }
+                    if (Test-Visited $cur.Key) {
+                        # On a downloaded entry, [x] returns it to its normal un-downloaded
+                        # state (rather than toggling exclude); it re-sorts back up out of
+                        # the downloaded group.
+                        Unmark-Downloaded ([string]$cur.Key) ([string]$cur.Url)
+                        $script:AuditSortDirty = $true
+                    } else {
+                        $cur.Included = (-not $cur.Included); $script:AuditSortDirty = $true
+                        # Excluding drops the row to the back; advance to the next row so the
+                        # cursor doesn't follow the excluded item down there. Free its cached
+                        # preview (like a download) and reset the force-opt so [y] is required
+                        # to bring the preview back.
+                        if (-not $cur.Included) {
+                            Clear-PreviewMem ([string]$cur.Url)
+                            [void]$script:PreviewOK.Remove([string]$cur.Url)
+                            $script:AuditPvKey = ''
+                            $sel = [Math]::Min($sel + 1, [Math]::Max(0, $total - 1))
+                        }
+                    }
                 }
             }
             '^f$' {
@@ -1858,26 +2026,42 @@ function Show-AuditView {
                 Enable-AllAuditFindings
                 $notice = @{ Message = "${YL}All findings included (exclude filter cleared).${R}"; At = [DateTime]::UtcNow }
             }
-            '^(d|enter|o)$' {
+            '^(enter|o)$' {
                 if ($cur) {
                     Show-Popup @('Downloading', $cur.Name)
                     $notice = @{ Message = (Save-AuditFinding $cur); At = [DateTime]::UtcNow }
                     $script:AuditPvKey = ''
+                    # The downloaded row drops to the very back; advance so the cursor
+                    # stays put rather than following it down there.
+                    $sel = [Math]::Min($sel + 1, [Math]::Max(0, $total - 1))
                 }
             }
             '^y$' {
-                # Opt the selected file into a large/force preview, but only when it's
-                # actually gated (and thus within the 5 MB ceiling); re-warm so the
-                # content is fetched and the badge/pane update.
+                # Opt the selected file into a preview again: a gated large/non-text file
+                # (within the 5 MB ceiling), or a downloaded/excluded finding whose preview
+                # was cleared. Re-warm so the content is fetched and the badge/pane update.
                 if ($preview -and $cur) {
-                    $st = Get-AuditPreviewability ([string]$cur.Name) ([string]$cur.Url) ([long]$cur.Size)
-                    if ($st -eq 'large-gated' -or $st -eq 'force-gated') {
-                        [void]$script:PreviewOK.Add([string]$cur.Url)
+                    $url = [string]$cur.Url
+                    $st  = Get-AuditPreviewability ([string]$cur.Name) $url ([long]$cur.Size)
+                    $hidden = ((Test-Visited $cur.Key) -or (Test-Downloaded $url) -or (-not $cur.Included)) `
+                              -and -not $script:PreviewOK.Contains($url)
+                    if ($st -eq 'large-gated' -or $st -eq 'force-gated' -or $hidden) {
+                        [void]$script:PreviewOK.Add($url)
                         $script:AuditPvKey = ''; $lastWarmKey = ''
                     }
                 }
             }
             '^a$' { Save-AuditIncluded }
+            '^h$' { $hideDone = -not $hideDone; $sel = 0; $selKey = '' }
+            '^\d[\d,\s-]*$' {
+                # Multi-download by number; the spec indexes the VISIBLE rows. An empty
+                # spec (the user cleared the prompt) cancels back to the list.
+                if ($total -gt 0) {
+                    $spec = if ($script:CanRawKey -and $key.Length -eq 1) { Read-NumberSpec $key } else { $key }
+                    $idx  = @(Parse-NumberSpec $spec $total)   # @() so an empty spec doesn't $null under StrictMode
+                    if ($idx.Count -gt 0) { Save-AuditFindingSet (@($idx | ForEach-Object { $list[$_ - 1] })); $script:AuditPvKey = '' }
+                }
+            }
             '^p$' { if ($script:AuditState -eq 'paused') { Resume-AuditEngine } else { Suspend-AuditEngine } }
             '^c$' {
                 if ($active) {
@@ -1920,8 +2104,8 @@ function Show-AuditMenu($ctx) {
         $passiveLine = if ($passiveOn) { '1  Passive   - currently ON; select to turn off' }
                        else            { '1  Passive   - scan the current view in the background, flag matches' }
         $walkState = if ($script:AuditWalkArchives) { 'ON' } else { 'OFF' }
-        $tierLine  = if ($script:AuditTier2) { 't  Analysis: Tier 1 + 2 (metadata + file content)' }
-                     else                    { 't  Analysis: Tier 1 only (metadata: name / ext / path)' }
+        $tierLine  = if ($script:AuditTier2) { 't  Analysis: Tier 2 (metadata + content)' }
+                     else                    { 't  Analysis: Tier 1 (metadata only)' }
         Show-Popup @(
             'Audit mode  (credential / secret discovery)',
             '',
@@ -1929,10 +2113,9 @@ function Show-AuditMenu($ctx) {
             "2  Location  - $($ctx.LocationLabel)",
             '3  Full      - scan the entire Artifactory instance',
             '',
+            'Audit settings (applies on new audit)',
             $tierLine,
-            '   (Tier 1 only = no file contents downloaded or scanned)',
             "w  Walk through listable archives: $walkState",
-            '   (off = scan archives as plain files, no internal expansion)',
             '',
             'q  cancel')
         switch (Read-Key) {
