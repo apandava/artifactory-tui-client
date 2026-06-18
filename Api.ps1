@@ -114,6 +114,7 @@ function Apply-Meta([object[]]$Items) {
         if ($it -and $script:MetaCache.ContainsKey($it.Uri)) {
             $m = $script:MetaCache[$it.Uri]
             $it.Size = $m.Size; $it.Modified = $m.Modified
+            if ($m.PSObject.Properties['Hash']) { $it.Hash = $m.Hash }
         }
     }
 }
@@ -172,8 +173,9 @@ function Convert-UriToItem([string]$uri) {
         Path     = $path
         Uri      = $uri
         FileType = Get-Ext $name
-        Size     = ''           # size + modified filled lazily, detailed view only
+        Size     = ''           # size + modified + hash filled lazily from storage metadata
         Modified = ''
+        Hash     = ''           # content identity as '<algo>:<hex>' (sha256/sha1/md5)
     }
 }
 

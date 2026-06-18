@@ -157,7 +157,7 @@ function Read-KeyTimeoutCased([int]$TimeoutMs) {
 # next instead of dropping it.
 function Invoke-NavBurst([ref]$Page, [int]$TotalPages, [ref]$Pending) {
     while ($true) {
-        $k = Read-KeyNow            # non-blocking; drains key-up events
+        $k = Read-KeyNowCased       # non-blocking; drains key-up events (case preserved)
         if ($null -eq $k) { break }
         switch -regex ($k) {
             '^(n|right|pagedown)$' { if ($Page.Value -lt $TotalPages - 1) { $Page.Value++ } }
@@ -183,7 +183,7 @@ function Invoke-RowBurst([ref]$Page, [ref]$SelRow, [int]$PageSize, [int]$TotalIt
     $delta = $InitialDelta
     $stop  = $false
     while (-not $stop) {
-        $k = Read-KeyNow            # non-blocking; drains key-up events
+        $k = Read-KeyNowCased       # non-blocking; drains key-up events (case preserved)
         if ($null -eq $k) { break }
         switch -regex ($k) {
             '^(down|j)$' { $delta++ }
@@ -432,14 +432,104 @@ function Get-Ext([string]$name) {
 
 # ── INPUT ─────────────────────────────────────────────────────────────────────
 
+# Blocking line input seeded with an editable initial value, so a filter can be
+# tweaked instead of retyped from scratch. On a real console the initial text is
+# echoed and the user edits from the end (type to append, Backspace to delete);
+# Enter commits. ISE / no-raw-key hosts can't prefill, so they fall back to a plain
+# Read-Host. The caller prints the prompt prefix (and any colour) first.
+function Read-LineEdit([string]$initial) {
+    if (-not $script:CanRawKey) { return (Read-Host).Trim() }
+    $buf = [Text.StringBuilder]::new()
+    [void]$buf.Append("$initial")
+    [Console]::Write("$initial")
+    while ($true) {
+        $k  = $host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        $vk = $k.VirtualKeyCode
+        $ch = $k.Character
+        if     ($vk -eq 13) { break }                                  # Enter commits
+        elseif ($vk -eq 8)  { if ($buf.Length -gt 0) { [void]$buf.Remove($buf.Length - 1, 1); [Console]::Write("`b `b") } }  # Backspace
+        elseif ($ch -and ([int][char]$ch) -ge 32) { [void]$buf.Append([char]$ch); [Console]::Write([string]$ch) }            # printable
+        # arrows / Esc / function keys: ignored (end-of-line editing only)
+    }
+    [Console]::Write("`r`n")
+    return $buf.ToString().Trim()
+}
+
 function Read-Query {
-    Clear-Screen
-    Write-Host "  ${BD}${MG}ARTCA${R}  ${DM}$BaseUrl${R}`n"
-    Write-Host "  ${DM}Examples:  *.env   *.properties   myapp   secret.xml${R}`n"
-    Write-Host -NoNewline "  Search: ${BD}${CY}"
-    $q = Read-Host
+    # Non-VT hosts (ISE / plain cmd) can't address the cursor to host a field inside a
+    # box, so they keep the plain top-left prompt.
+    if (-not $script:Vt) {
+        Clear-Screen
+        Write-Host "  ${BD}${MG}ARTCA${R}  ${DM}$BaseUrl${R}`n"
+        Write-Host "  ${DM}Examples:  *.env   *.properties   myapp   secret.xml${R}`n"
+        Write-Host -NoNewline "  Search: ${BD}${CY}"
+        $q = Read-Host
+        Write-Host -NoNewline $R
+        return $q.Trim()
+    }
+
+    # VT host: draw a centred message box (same style as Show-Popup) and read the query
+    # in a field inside it.
+    $w       = [Math]::Max(20, (Get-Width) - 1)
+    $screenH = [Math]::Max(6, (Get-Height) - 1)
+    $label   = "${BD}Search:${R} "
+    $body = @(
+        "${BD}${MG}ARTCA${R}  ${DM}$BaseUrl${R}",
+        '',
+        "${DM}Examples:  *.env   *.properties   myapp   secret.xml${R}",
+        '',
+        $label
+    )
+    # Inner width: widest line, with headroom to type, capped to the screen. Lines wider
+    # than the cap (e.g. a long base URL) are truncated so nothing overruns the border.
+    $innerW = 44
+    foreach ($l in $body) { $innerW = [Math]::Max($innerW, (Vis-Len $l)) }
+    $innerW = [Math]::Min($innerW, $w - 8)
+    $body   = @($body | ForEach-Object { if ((Vis-Len $_) -gt $innerW) { Fit-Vis $_ $innerW } else { $_ } })
+    $boxW   = $innerW + 4
+    $atCol  = [Math]::Max(0, [int](($w - $boxW) / 2))
+    $boxH   = $body.Count + 2
+    $top    = [Math]::Max(0, [int](($screenH - $boxH) / 2))
+
+    $tl=[char]0x250C; $tr=[char]0x2510; $bl=[char]0x2514; $br=[char]0x2518; $hz=[char]0x2500; $vt=[char]0x2502
+    $box = [Collections.Generic.List[string]]::new()
+    $box.Add("${MG}$tl$([string]$hz * ($boxW - 2))$tr${R}")
+    foreach ($l in $body) {
+        $pad = [Math]::Max(0, $innerW - (Vis-Len $l))
+        $box.Add("${MG}$vt${R} $l$(' ' * $pad) ${MG}$vt${R}")
+    }
+    $box.Add("${MG}$bl$([string]$hz * ($boxW - 2))$br${R}")
+
+    # Compose the box onto a blank, full-height screen so it sits centred.
+    $out = [Collections.Generic.List[string]]::new()
+    for ($i = 0; $i -lt $screenH; $i++) {
+        $rr = $i - $top
+        if ($rr -ge 0 -and $rr -lt $box.Count) { $out.Add((' ' * $atCol) + $box[$rr]) } else { $out.Add('') }
+    }
+    Show-Frame $out.ToArray()
+
+    # Park the cursor just past the "Search:" label inside the box (ANSI is 1-based) and
+    # read the line there so the typed query appears in the box.
+    $rowAbs = $top + 1 + ($body.Count - 1)        # +1 skips the top border
+    $colAbs = $atCol + 2 + (Vis-Len $label)       # border + space + label
+    [Console]::Out.Write("$([char]27)[$($rowAbs + 1);$($colAbs + 1)H${BD}${CY}")
+    $q = Read-LineEdit ''
     Write-Host -NoNewline $R
     return $q.Trim()
+}
+
+# Full-screen prompt to edit the results exclude filter; the field is prefilled with
+# the current terms so they can be tweaked. Returns the entered string (blank clears).
+function Read-ExcludeFilter([string]$current) {
+    Clear-Screen
+    Write-Host "  ${BD}${MG}ARTCA${R}  ${DM}Exclude filter${R}`n"
+    Write-Host "  ${DM}Space/comma-separated name globs to EXCLUDE (matches are dimmed${R}"
+    Write-Host "  ${DM}and sent to the back).  e.g.  *.sha1   *.pom   *sources*    (clear = no filter)${R}`n"
+    if (-not $script:CanRawKey -and $current) { Write-Host "  ${DM}Current:${R} $current`n" }
+    Write-Host -NoNewline "  Exclude: ${BD}${CY}"
+    $s = Read-LineEdit $current
+    Write-Host -NoNewline $R
+    return $s
 }
 
 # The first digit was already captured (no-echo); echo it, then read the rest.

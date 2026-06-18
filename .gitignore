@@ -3,7 +3,7 @@ CLAUDE.md
 .claude/
 
 # Downloads created at runtime (default -OutDir)
-artca-downloads/
+art-downloads/
 
 # Secrets / local config — never commit tokens or API keys
 *.secret

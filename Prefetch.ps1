@@ -19,9 +19,18 @@ $script:PfScript = {
     param($uri, $headers, $cache, $alert)
     try {
         $info = Invoke-RestMethod -Uri $uri -Headers $headers -ErrorAction Stop
-        $m = [PSCustomObject]@{ Size = ''; Modified = '' }
+        $m = [PSCustomObject]@{ Size = ''; Modified = ''; Hash = '' }
         if ($info.PSObject.Properties['size'])         { $m.Size     = $info.size }
         if ($info.PSObject.Properties['lastModified']) { $m.Modified = "$($info.lastModified)" }
+        # Content identity, recorded as '<algo>:<hex>'. Artifactory often leaves sha256
+        # blank (only sha1/md5 populated), so fall back through the strongest available.
+        if ($info.PSObject.Properties['checksums'] -and $info.checksums) {
+            foreach ($algo in 'sha256','sha1','md5') {
+                if ($info.checksums.PSObject.Properties[$algo] -and "$($info.checksums.$algo)") {
+                    $m.Hash = "${algo}:" + ("$($info.checksums.$algo)").ToLower(); break
+                }
+            }
+        }
         $cache[$uri] = $m
     } catch {
         $code = 0
@@ -111,9 +120,17 @@ $script:LaScript = {
         if (-not $cache.ContainsKey($u)) {
             try {
                 $info = Invoke-RestMethod -Uri $u -Headers $headers -ErrorAction Stop
-                $m = [PSCustomObject]@{ Size = ''; Modified = '' }
+                $m = [PSCustomObject]@{ Size = ''; Modified = ''; Hash = '' }
                 if ($info.PSObject.Properties['size'])         { $m.Size     = $info.size }
                 if ($info.PSObject.Properties['lastModified']) { $m.Modified = "$($info.lastModified)" }
+                # Content identity '<algo>:<hex>', strongest available (sha256 is often blank).
+                if ($info.PSObject.Properties['checksums'] -and $info.checksums) {
+                    foreach ($algo in 'sha256','sha1','md5') {
+                        if ($info.checksums.PSObject.Properties[$algo] -and "$($info.checksums.$algo)") {
+                            $m.Hash = "${algo}:" + ("$($info.checksums.$algo)").ToLower(); break
+                        }
+                    }
+                }
                 $cache[$u] = $m
             } catch {
                 $code = 0
@@ -502,6 +519,10 @@ function Get-PreviewPlan($pageItems, [int]$selRow, [int]$radius = 4) {
     $restReqs = [Collections.Generic.List[object]]::new()
     $allKeys  = [Collections.Generic.List[string]]::new()
     if ($null -ne $pageItems -and $pageItems.Count -gt 0) {
+        # Clamp the cursor into range first: a stale/out-of-range selRow (e.g. right after
+        # hiding rows shrinks the page) would otherwise index past the array or onto a $null.
+        if ($selRow -lt 0) { $selRow = 0 }
+        if ($selRow -ge $pageItems.Count) { $selRow = $pageItems.Count - 1 }
         $order = [Collections.Generic.List[int]]::new()
         $order.Add($selRow)
         $max = [Math]::Max($selRow, $pageItems.Count - 1 - $selRow)
@@ -510,7 +531,10 @@ function Get-PreviewPlan($pageItems, [int]$selRow, [int]$radius = 4) {
             if ($selRow - $d -ge 0)                { $order.Add($selRow - $d) }
         }
         foreach ($idx in $order) {
-            $rq = Get-ItemPreviewRequest $pageItems[$idx]
+            if ($idx -lt 0 -or $idx -ge $pageItems.Count) { continue }
+            $it = $pageItems[$idx]
+            if ($null -eq $it) { continue }
+            $rq = Get-ItemPreviewRequest $it
             if (-not $rq) { continue }
             $allKeys.Add($rq.Key)
             if ([Math]::Abs($idx - $selRow) -le $radius) { $winReqs.Add($rq); $winKeys.Add($rq.Key) }

@@ -14,8 +14,9 @@ $script:Visited      = New-Object 'System.Collections.Generic.HashSet[string]'
 $script:MemFiles     = @{}                                              # url -> [byte[]]
 $script:MemOrder     = [Collections.Generic.List[string]]::new()        # insertion order, for eviction
 $script:MemFilesCap  = 32                                               # max files held for download reuse
-$script:PreviewOK    = New-Object 'System.Collections.Generic.HashSet[string]'  # large files user opted to preview
-$script:PreviewLimit = 512000                                           # 0.5 MB preview cap
+$script:PreviewOK    = New-Object 'System.Collections.Generic.HashSet[string]'  # large/non-text files user opted to preview
+$script:PreviewLimit = 512000                                           # 0.5 MB auto-preview cap
+$script:PreviewHardLimit = 5242880                                      # 5 MB hard ceiling for manual opt-in (large + force preview)
 
 # Preview-pane scrolling. The selected file's wrapped contents (or an archive's
 # entry listing) can exceed the pane height; the user scrolls with Shift+Up/Down.
@@ -25,6 +26,17 @@ $script:PreviewLimit = 512000                                           # 0.5 MB
 # url/uri + pane width) and reused across scroll steps and neighbour redraws instead
 # of being rebuilt on every keystroke.
 $script:PvScrollMax       = 0
+# Number of lines the wrapped footer hints occupied on the last search-view render, so
+# the next page-size calc (StartTui) and the preview body height reserve that space.
+# A one-frame lag on resize self-corrects; defaults to one line.
+$script:NavLineCount      = 1
+# Stable footer reservation for the preview pane's body-height calc. The footer gains and
+# loses selection-dependent hints ([y] preview / Shift+scroll) as you move the cursor, so
+# its wrapped height flips between one and two lines. Reserving the *tallest* footer seen
+# at the current width (rather than the last render's) keeps the body — and the bottom
+# divider — from bobbing up and down during navigation. Reset when the width changes.
+$script:NavReserve        = 1
+$script:NavReserveW       = 0
 $script:WrapCacheKey      = ''
 $script:WrapCacheLines    = @()
 $script:ArcListCacheKey   = ''
@@ -34,9 +46,11 @@ $script:ArcListCacheLines = @()
 # "N more above" / "N more below" indicator row (each consuming one line) whenever
 # content lies off-pane in that direction. Sets $script:PvScrollMax so the nav loop
 # can clamp the offset; returns the lines unchanged when everything already fits.
-# The +1 in $PvScrollMax accounts for the top indicator's row, so the last content
-# line is still reachable at maximum scroll. A pane too short for indicators
-# (< 3 rows) falls back to a plain window.
+# The top indicator costs a row, so a raw offset of 1 would merely replace the first
+# line with the indicator and not move the text. To avoid that dead first step, once
+# scrolled at all we advance the first visible line by an extra row, so every step
+# scrolls the content by one and the last line is still reachable at PvScrollMax.
+# A pane too short for indicators (< 3 rows) falls back to a plain window.
 function Get-ScrolledLines([string[]]$lines, [int]$avail, [int]$scroll) {
     if ($null -eq $lines) { $lines = @() }
     $avail = [Math]::Max(1, $avail)
@@ -52,16 +66,19 @@ function Get-ScrolledLines([string[]]$lines, [int]$avail, [int]$scroll) {
         return $o.ToArray()
     }
 
-    $script:PvScrollMax = $total - $avail + 1
-    $sc  = [Math]::Max(0, [Math]::Min($scroll, $script:PvScrollMax))
-    $top = ($sc -gt 0)
+    $script:PvScrollMax = $total - $avail
+    $sc    = [Math]::Max(0, [Math]::Min($scroll, $script:PvScrollMax))
+    # Skip the dead first step: any positive offset advances the first visible line an
+    # extra row to pay for the top indicator, so the content actually moves by one.
+    $first = if ($sc -gt 0) { $sc + 1 } else { 0 }
+    $top   = ($first -gt 0)
     $contentH = $avail - $(if ($top) { 1 } else { 0 })
-    $end = [Math]::Min($total - 1, $sc + $contentH - 1)
-    if (($total - 1 - $end) -gt 0) { $contentH--; $end = $sc + $contentH - 1 }   # reserve bottom indicator
+    $end = [Math]::Min($total - 1, $first + $contentH - 1)
+    if (($total - 1 - $end) -gt 0) { $contentH--; $end = $first + $contentH - 1 }   # reserve bottom indicator
     $below = $total - 1 - $end
     $out = [Collections.Generic.List[string]]::new()
-    if ($top)         { $out.Add("${DM}$([char]0x2191) $sc more above${R}") }
-    for ($i = $sc; $i -le $end; $i++) { $out.Add($lines[$i]) }
+    if ($top)         { $out.Add("${DM}$([char]0x2191) $first more above${R}") }
+    for ($i = $first; $i -le $end; $i++) { $out.Add($lines[$i]) }
     if ($below -gt 0) { $out.Add("${DM}$([char]0x2193) $below more below${R}") }
     return $out.ToArray()
 }
@@ -95,6 +112,70 @@ $script:HeaderRuleTag = "$([char]0)HDR_RULE$([char]0)"
 function Mark-Visited([string]$key) { if ($key) { [void]$script:Visited.Add($key) } }
 function Test-Visited([string]$key) { return ($key -and $script:Visited.Contains($key)) }
 
+# Files written to disk this session (keyed by both storage key and download url).
+# A downloaded file's preview is no longer fetched/shown and its cached bytes are
+# purged: re-download is the way to see it again. Keeps memory down and avoids
+# re-fetching content the user already has on disk.
+$script:Downloaded = New-Object 'System.Collections.Generic.HashSet[string]'
+function Test-Downloaded([string]$k) { return ($k -and $script:Downloaded.Contains($k)) }
+
+# Purge a url's cached preview bytes and resolved preview from memory so held content
+# is freed; a later preview re-fetches. Used both when a file is downloaded and when an
+# audit finding is excluded.
+function Clear-PreviewMem([string]$url) {
+    if (-not $url) { return }
+    if ($script:MemFiles.ContainsKey($url)) {
+        [void]$script:MemFiles.Remove($url)
+        $idx = $script:MemOrder.IndexOf($url); if ($idx -ge 0) { $script:MemOrder.RemoveAt($idx) }
+    }
+    $pk = Get-FilePreviewKey $url
+    if ($script:PreviewCache.ContainsKey($pk)) { [void]$script:PreviewCache.Remove($pk) }
+}
+
+# Mark a file downloaded: record it (so it greys out + is skipped for preview),
+# drop any cached bytes, and evict its resolved preview so it isn't redrawn.
+function Mark-Downloaded([string]$key, [string]$url) {
+    Mark-Visited $key
+    if ($key) { [void]$script:Downloaded.Add($key) }
+    if ($url) {
+        [void]$script:Downloaded.Add($url)
+        Clear-PreviewMem $url
+    }
+}
+
+# Reverse Mark-Downloaded: forget a file was downloaded so it returns to its normal
+# (un-downloaded) state — no longer dimmed, and re-sorted out of the downloaded group.
+# Purged preview bytes are not restored; a later preview just re-fetches them.
+function Unmark-Downloaded([string]$key, [string]$url) {
+    if ($key) { [void]$script:Visited.Remove($key); [void]$script:Downloaded.Remove($key) }
+    if ($url) { [void]$script:Downloaded.Remove($url) }
+}
+
+# Append one row to download-log.csv in the folder the file was saved to (created
+# with a header on first write). Every download — audit or not — is logged here;
+# non-audit downloads pass 'N/A' for severity/rule. Quoting is RFC-4180; the file
+# is UTF-8. Failures are swallowed so logging never blocks a download.
+function Write-DownloadLog([string]$dir, [string]$name, [string]$repo, [string]$path, [string]$archive,
+                           [long]$sizeBytes, [string]$modified, [string]$url,
+                           [string]$severity, [string]$rule, [string]$hash = '') {
+    try {
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $csv  = Join-Path $dir 'download-log.csv'
+        $q    = { param($v) '"' + ("$v" -replace '"','""') + '"' }
+        # FileName is always the original Artifactory filename; Hash (its sha256) follows
+        # so a bulk download saved under a disambiguated name can still be traced back.
+        $cols = @('Timestamp','FileName','Hash','Repository','Path','Archive','SizeBytes','Modified','DownloadUrl','Severity','MatchedRule')
+        $sz   = if ($sizeBytes -ge 0) { "$sizeBytes" } else { '' }
+        $row  = @((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $name, $hash, $repo, $path, $archive, $sz, $modified, $url,
+                  $(if ($severity) { $severity } else { 'N/A' }), $(if ($rule) { $rule } else { 'N/A' }))
+        $new = -not (Test-Path -LiteralPath $csv)
+        $sb  = [Text.StringBuilder]::new()
+        if ($new) { [void]$sb.AppendLine((@($cols | ForEach-Object { & $q $_ }) -join ',')) }
+        [void]$sb.AppendLine((@($row | ForEach-Object { & $q $_ }) -join ','))
+        [System.IO.File]::AppendAllText($csv, $sb.ToString(), [Text.UTF8Encoding]::new($false))
+    } catch { }
+}
+
 # Apply a background to a whole row so the highlight survives the per-cell resets:
 # re-assert the background after every reset, then pad to width under it. No-op on
 # non-VT hosts (where $R is empty and the regex would misbehave).
@@ -111,6 +192,29 @@ function Get-ItemUrl($item) {
     $repo = if ($item.Repo) { $item.Repo } else { '' }
     $seg  = if ($item.Path) { "$($item.Path)/" } else { '' }
     return "$(Get-ArtBase)/$repo/$seg$($item.Name)"
+}
+
+# Name of the archive an item/finding came from (its content lives inside this archive
+# file), or '' for a normal top-level artifact. Audit findings carry InArchive/ArchiveName;
+# plain search items have neither, so they always return '' (never archive entries). The
+# property guards keep this safe under Set-StrictMode.
+function Get-ItemArchiveName($item) {
+    if ($null -eq $item) { return '' }
+    if ($item.PSObject.Properties['InArchive'] -and $item.InArchive -and
+        $item.PSObject.Properties['ArchiveName']) { return [string]$item.ArchiveName }
+    return ''
+}
+
+# Render a fixed-width ($w columns) Path-column cell in colour $dim. When $isArc — the
+# file came from an archive listing — an 'A' marker (colour $markCol, default the plain
+# value colour) is appended just past the path text, with the cell padded out so column
+# alignment is preserved.
+function Format-PathCell([string]$path, [int]$w, [bool]$isArc, [string]$dim, [string]$markCol = '') {
+    if ($w -le 0) { return '' }
+    if (-not $isArc) { return "${dim}$(Clip $path $w)${R}" }
+    $txt = Trunc $path ([Math]::Max(1, $w - 2))      # truncated (ellipsis if long), not padded
+    $pad = [Math]::Max(0, $w - $txt.Length - 2)      # reserve " A"
+    return "${dim}${txt}${R} ${markCol}A${R}$(' ' * $pad)"
 }
 
 # Extensions we treat as human-readable text (previewable).
@@ -170,6 +274,24 @@ function Convert-BytesToText([byte[]]$bytes) {
     return [Text.Encoding]::UTF8.GetString($bytes)
 }
 
+# 'strings'-like extraction of the human-readable characters from arbitrary bytes,
+# for force-previewing a non-text file. Printable ASCII (and tabs) are kept; runs are
+# separated by newlines wherever a non-printable byte breaks them, so unrelated
+# strings don't merge into one line. Bounded to the 5 MB hard preview limit.
+function Convert-BytesToReadable([byte[]]$bytes) {
+    if ($null -eq $bytes -or $bytes.Length -eq 0) { return '' }
+    $n  = [Math]::Min($bytes.Length, $script:PreviewHardLimit)
+    $sb = [Text.StringBuilder]::new()
+    $inRun = $false
+    for ($i = 0; $i -lt $n; $i++) {
+        $b = $bytes[$i]
+        if ($b -eq 9 -or ($b -ge 32 -and $b -le 126)) { [void]$sb.Append([char]$b); $inRun = $true }       # tab + printable ASCII
+        elseif ($b -eq 10 -or $b -eq 13)              { [void]$sb.Append([char]$b); $inRun = $false }       # LF / CR pass through
+        elseif ($inRun)                               { [void]$sb.Append("`n");     $inRun = $false }       # break the run on a binary byte
+    }
+    return $sb.ToString()
+}
+
 # Word-wrap text to $width columns, hard-breaking tokens longer than the width and
 # stripping control chars. Returns an array of lines.
 function Wrap-Text([string]$s, [int]$width) {
@@ -226,29 +348,77 @@ function Get-PreviewMessageLines([string]$msg, [int]$paneW) {
     return $L.ToArray()
 }
 
+# Classify how a file can be previewed, given its name, url and size. The single
+# source of truth shared by the search, tree and audit views:
+#   auto           - text type within the 512 KB auto cap (fetched without asking)
+#   large          - text type, opted in via [y], within the 5 MB hard ceiling
+#   large-gated    - text type over the auto cap; offer [y] preview large
+#   toolarge       - text type over the 5 MB ceiling; no option
+#   force          - non-text type, opted in via [y] (force preview), within 5 MB
+#   force-gated    - non-text type; offer [y] force preview
+#   force-toolarge - non-text type over the 5 MB ceiling; no option
+# Unknown sizes (-1) are allowed to opt in (the ceiling can't be pre-checked).
+# NOTE: callers must exclude browsable archives before calling this (an archive name
+# isn't "previewable", so it would otherwise classify as force-gated).
+function Get-PreviewState([string]$name, [string]$url, [long]$sz) {
+    $overHard = ($sz -ge 0 -and $sz -gt $script:PreviewHardLimit)
+    if (Get-IsPreviewable $name) {
+        if ($sz -ge 0 -and $sz -le $script:PreviewLimit) { return 'auto' }
+        if ($overHard) { return 'toolarge' }
+        if ($script:PreviewOK.Contains($url)) { return 'large' }
+        return 'large-gated'
+    }
+    if ($overHard) { return 'force-toolarge' }
+    if ($script:PreviewOK.Contains($url)) { return 'force' }
+    return 'force-gated'
+}
+
+# True if the preview content should be fetched in the background now.
+function Test-PreviewLoadable([string]$state) {
+    return ($state -eq 'auto' -or $state -eq 'large' -or $state -eq 'force')
+}
+
 # Build the preview-section lines for a file: a "Preview" header then either the
-# wrapped contents, or a message (not previewable / large / failed). $sizeBytes is
-# -1 when unknown. Honours the size cap unless the url is in $PreviewOK.
-# The leading divider is emitted as $PaneRuleTag so the two-pane compositor can
-# connect it to the pane separator (see Format-PaneRule).
+# wrapped contents (force preview extracts readable characters from a non-text file),
+# or a message (gated large / force / too large / downloaded / failed). $sizeBytes is
+# -1 when unknown. The leading divider is emitted as $PaneRuleTag so the two-pane
+# compositor can connect it to the pane separator (see Format-PaneRule).
 function Get-PreviewLines([string]$name, [string]$url, [long]$sizeBytes, [int]$paneW, [int]$maxLines, [int]$scroll = 0) {
     $script:PvScrollMax = 0   # not scrollable unless the success path below says so
     $L = [Collections.Generic.List[string]]::new()
     $L.Add($script:PaneRuleTag)
     $L.Add("${BD}${YL}Preview${R}")
-    if (-not (Get-IsPreviewable $name)) {
-        $L.Add("${DM}This file format can't be previewed.${R}")
+    # A downloaded file's bytes were purged from memory; don't re-fetch a preview.
+    if (Test-Downloaded $url) {
+        $L.Add("${DM}Downloaded - content cleared from memory.${R}")
         return $L.ToArray()
     }
-    $tooBig = ($sizeBytes -gt $script:PreviewLimit) -or ($sizeBytes -lt 0)
-    if ($tooBig -and -not $script:PreviewOK.Contains($url)) {
-        $szTxt = if ($sizeBytes -ge 0) { Format-Size $sizeBytes } else { 'unknown size' }
-        $L.Add("${YL}Large file ($szTxt).${R}")
-        $L.Add("${DM}Press [y] to preview it anyway.${R}")
-        return $L.ToArray()
+    $state = Get-PreviewState $name $url $sizeBytes
+    $szTxt = if ($sizeBytes -ge 0) { Format-Size $sizeBytes } else { 'unknown size' }
+    switch ($state) {
+        'large-gated' {
+            $L.Add("${YL}Large file ($szTxt).${R}"); $L.Add("${DM}Press [y] to preview it anyway.${R}")
+            return $L.ToArray()
+        }
+        'toolarge' {
+            $L.Add("${RD}File too large to preview ($szTxt).${R}")
+            $L.Add("${DM}The 5 MB preview limit can't be overridden.${R}")
+            return $L.ToArray()
+        }
+        'force-gated' {
+            $L.Add("${DM}This is not a known text format.${R}")
+            $L.Add("${YL}Press [y] to force preview${R}${DM} (extract readable text).${R}")
+            return $L.ToArray()
+        }
+        'force-toolarge' {
+            $L.Add("${DM}This is not a known text format.${R}")
+            $L.Add("${RD}File too large to force preview ($szTxt).${R}")
+            $L.Add("${DM}The 5 MB preview limit can't be overridden.${R}")
+            return $L.ToArray()
+        }
     }
-    # Contents come from the background preview cache (warmed by the nav loop); the
-    # pane shows a loading line until the fetch lands, never blocking input.
+    # 'auto' / 'large' / 'force': contents come from the background preview cache
+    # (warmed by the nav loop); the pane shows a loading line until the fetch lands.
     $key = Get-FilePreviewKey $url
     if (-not $script:PreviewCache.ContainsKey($key)) {
         $L.Add("${DM}Loading preview...${R}"); return $L.ToArray()
@@ -263,16 +433,26 @@ function Get-PreviewLines([string]$name, [string]$url, [long]$sizeBytes, [int]$p
     if ($null -eq $bytes) { $L.Add("${RD}Could not load file for preview.${R}"); return $L.ToArray() }
     # Seed the byte cache so a later download of this file reuses the fetch.
     Add-MemFile $url $bytes
-    # Decoding + wrapping is O(file size); memoize the last file's wrapped lines
-    # (keyed by url + pane width) so scrolling and neighbour redraws reuse them
-    # instead of re-wrapping on every keystroke.
-    $wrapKey = "$url|$paneW"
+    # Decoding + wrapping is O(file size); memoize the last file's wrapped lines (keyed
+    # by url + pane width + mode) so scrolling and neighbour redraws reuse them instead
+    # of re-wrapping on every keystroke. Force preview extracts readable characters.
+    $force   = ($state -eq 'force')
+    $wrapKey = "$url|$paneW|$(if ($force) { 'R' } else { 'T' })"
     if ($script:WrapCacheKey -eq $wrapKey) {
-        $wrapped = $script:WrapCacheLines
+        $wrapped = @($script:WrapCacheLines)
     } else {
-        $wrapped = Wrap-Text (Convert-BytesToText $bytes) $paneW
+        # @(...) keeps a single-line result an array (so .Count is always valid); the
+        # try/catch guards against a decode/extraction failure on malformed content.
+        try {
+            $text    = if ($force) { Convert-BytesToReadable $bytes } else { Convert-BytesToText $bytes }
+            $wrapped = @(Wrap-Text $text $paneW)
+        } catch {
+            $L.Add("${RD}Failed to $(if ($force) { 'force ' })preview file.${R}")
+            return $L.ToArray()
+        }
         $script:WrapCacheKey = $wrapKey; $script:WrapCacheLines = $wrapped
     }
+    if ($force -and $wrapped.Count -eq 0) { $L.Add("${DM}(no readable text found)${R}"); return $L.ToArray() }
     # Window the wrapped lines around the scroll offset, with above/below indicators
     # when the file overflows the pane (Shift+Up/Down scrolls; see Get-ScrolledLines).
     foreach ($wl in (Get-ScrolledLines $wrapped $maxLines $scroll)) { $L.Add($wl) }
@@ -345,6 +525,39 @@ function Get-ArchivePreviewLines($item, [int]$paneW, [int]$maxLines, [int]$scrol
     return $L.ToArray()
 }
 
+# Pack footer hint segments across as many lines as needed so none are cut off on a
+# narrow window (Join-Justified crams them onto one line, which the frame then
+# truncates). Segments are kept whole and left-packed with a fixed gap; a new line
+# starts whenever the next segment wouldn't fit. Returns the array of lines.
+function Wrap-Hints([string[]]$Segments, [int]$width, [int]$lead = 2, [int]$gap = 3) {
+    $segs = @($Segments | Where-Object { "$_" -ne '' })
+    if ($segs.Count -eq 0) { return @() }
+    $w = [Math]::Max(1, $width)
+    $budget = [Math]::Max(1, $w - $lead)
+    # Greedily pack whole segments into lines (fixed gap between them).
+    $rows = [Collections.Generic.List[object]]::new()
+    $line = [Collections.Generic.List[string]]::new(); $curLen = 0
+    foreach ($s in $segs) {
+        $sl = Vis-Len $s
+        if ($line.Count -eq 0) { [void]$line.Add($s); $curLen = $sl }
+        elseif (($curLen + $gap + $sl) -le $budget) { [void]$line.Add($s); $curLen += $gap + $sl }
+        else { $rows.Add($line); $line = [Collections.Generic.List[string]]::new(); [void]$line.Add($s); $curLen = $sl }
+    }
+    if ($line.Count -gt 0) { $rows.Add($line) }
+    # A single line stays left-aligned (lead margin). When the hints wrap onto multiple
+    # lines, centre each line within the width so they sit balanced rather than left-crammed.
+    $out = [Collections.Generic.List[string]]::new()
+    foreach ($lrow in $rows) {
+        $joined = (@($lrow) -join (' ' * $gap))
+        if ($rows.Count -le 1) { $out.Add((' ' * $lead) + $joined) }
+        else {
+            $pad = [Math]::Max(0, [int](($w - (Vis-Len $joined)) / 2))
+            $out.Add((' ' * $pad) + $joined)
+        }
+    }
+    return $out.ToArray()
+}
+
 # Evenly distribute footer hint segments across $width (justified), so the key
 # tooltips span the window instead of crowding the left.
 function Join-Justified([string[]]$Segments, [int]$width) {
@@ -369,17 +582,18 @@ function Join-Justified([string[]]$Segments, [int]$width) {
 
 # Build a fixed-width ($nameW) name cell, left-aligned and padded to the column
 # edge, with an optional one-char badge placed immediately after the name text:
-# '+' for a browsable archive, '·' for a previewable file. Space for the badge is
-# reserved before truncating, so even an ellipsised long name still shows it.
-# In preview mode the badge starts dim (grey) and turns yellow once that item's
-# preview has loaded in the background; elsewhere it's always yellow.
+# '+' for a browsable archive, '·' for a previewable file. A non-previewable file
+# gets the '·' badge too, but ONLY once it has been force-previewed (its url opted
+# into PreviewOK). Space for the badge is reserved before truncating, so even an
+# ellipsised long name still shows it. In preview mode the badge starts dim (grey)
+# and turns yellow once that item's preview has loaded; elsewhere it's always yellow.
 function Format-NameCell([object]$item, [int]$nameW, [bool]$vis, [bool]$preview = $false) {
     $name = [string]$item.Name
     # A preview/fetch error (e.g. blacked-out repo) flags the whole cell red.
     $errored = Test-ItemPreviewError $item
     $col  = if ($errored) { $RD } elseif ($vis) { $DM } else { $CY }
-    if     (Get-IsArchive $name)     { $glyph = $script:ArcGlyph }
-    elseif (Get-IsPreviewable $name) { $glyph = $script:PreviewGlyph }
+    if     (Get-IsArchive $name) { $glyph = $script:ArcGlyph }
+    elseif ((Get-IsPreviewable $name) -or $script:PreviewOK.Contains((Get-ItemUrl $item))) { $glyph = $script:PreviewGlyph }
     else   { return "${col}$(Clip $name $nameW)${R}" }
 
     $gcol = if ($errored) { $RD }
@@ -400,14 +614,15 @@ function Format-NameCell([object]$item, [int]$nameW, [bool]$vis, [bool]$preview 
 # washed-out (dim).
 # In preview mode only #, Name, Type, Size, Modified are shown (the right pane
 # carries repo/path/etc.); Name takes all the freed width.
-function Format-DetailedRow($item, [int]$Number, [int]$colW, [bool]$vis, [bool]$preview = $false) {
-    $numW = 4; $typeW = 5; $sizeW = 9; $modW = 10; $rtypeW = 6; $ptypeW = 8
+function Format-DetailedRow($item, [int]$Number, [int]$colW, [bool]$vis, [bool]$preview = $false, [bool]$showRule = $false) {
+    $numW = 4; $typeW = 5; $sizeW = 9; $modW = 10; $rtypeW = 6; $ptypeW = 8; $ruleW = 0
     $repoW = [Math]::Min(16, [Math]::Max(8, [int]($colW * 0.14)))
     if ($preview) {
         $nameW = [Math]::Max(10, $colW - ($numW + $typeW + $sizeW + $modW + 8))  # 4 gaps + 2 gutter + 2 margin
         $pathW = 0
     } else {
-        $fixed = $numW + $typeW + $sizeW + $modW + $repoW + $rtypeW + $ptypeW + 12  # 8 gaps + 2 gutter + 2 margin
+        if ($showRule) { $ruleW = [Math]::Min(20, [Math]::Max(10, [int]($colW * 0.16))) }
+        $fixed = $numW + $typeW + $sizeW + $modW + $repoW + $rtypeW + $ptypeW + 12 + $(if ($showRule) { $ruleW + 1 } else { 0 })
         $rest  = [Math]::Max(12, $colW - $fixed)
         $nameW = [Math]::Max(10, [int]($rest * 0.55))
         $pathW = [Math]::Max(0, $rest - $nameW)
@@ -437,38 +652,83 @@ function Format-DetailedRow($item, [int]$Number, [int]$colW, [bool]$vis, [bool]$
         $cells += "${cRepo}$(Clip $repo $repoW)${R}"
         $cells += "${cDim}$(Clip ([string]$rmeta.Type) $rtypeW)${R}"
         $cells += "${cRepo}$(Clip ([string]$rmeta.PackageType) $ptypeW)${R}"
-        if ($pathW -gt 0) { $cells += "${DM}$(Clip ([string]$item.Path) $pathW)${R}" }
+        if ($pathW -gt 0) { $cells += (Format-PathCell ([string]$item.Path) $pathW ([bool](Get-ItemArchiveName $item)) $DM $cDim) }
+        if ($showRule)    { $cells += "${cDim}$(Clip (Get-AuditRuleLabel ([string]$item.Uri)) $ruleW)${R}" }
     }
     return ($cells -join ' ')
 }
 
-function Format-DetailedHeader([int]$colW, [bool]$preview = $false) {
-    $numW = 4; $typeW = 5; $sizeW = 9; $modW = 10; $rtypeW = 6; $ptypeW = 8
+function Format-DetailedHeader([int]$colW, [bool]$preview = $false, [bool]$showRule = $false) {
+    $numW = 4; $typeW = 5; $sizeW = 9; $modW = 10; $rtypeW = 6; $ptypeW = 8; $ruleW = 0
     $repoW = [Math]::Min(16, [Math]::Max(8, [int]($colW * 0.14)))
     if ($preview) {
         $nameW = [Math]::Max(10, $colW - ($numW + $typeW + $sizeW + $modW + 8))  # match Format-DetailedRow
         $hdr = @((ClipR '#' $numW), (Clip 'Name' $nameW), (Clip 'Type' $typeW), (ClipR 'Size' $sizeW),
                  (Clip 'Modified' $modW))
     } else {
-        $fixed = $numW + $typeW + $sizeW + $modW + $repoW + $rtypeW + $ptypeW + 18
+        if ($showRule) { $ruleW = [Math]::Min(20, [Math]::Max(10, [int]($colW * 0.16))) }
+        $fixed = $numW + $typeW + $sizeW + $modW + $repoW + $rtypeW + $ptypeW + 18 + $(if ($showRule) { $ruleW + 1 } else { 0 })
         $rest  = [Math]::Max(12, $colW - $fixed)
         $nameW = [Math]::Max(10, [int]($rest * 0.55))
         $pathW = [Math]::Max(0, $rest - $nameW)
         $hdr = @((ClipR '#' $numW), (Clip 'Name' $nameW), (Clip 'Type' $typeW), (ClipR 'Size' $sizeW),
                  (Clip 'Modified' $modW), (Clip 'Repo' $repoW), (Clip 'RType' $rtypeW), (Clip 'PType' $ptypeW))
         if ($pathW -gt 0) { $hdr += (Clip 'Path' $pathW) }
+        if ($showRule)    { $hdr += (Clip 'Rule' $ruleW) }
     }
     return "${BD}${YL}$($hdr -join ' ')${R}"
 }
 
+# ── NAME GLOB FILTER ──────────────────────────────────────────────────────────
+# Shared exclude-filter helpers (used by the search view; mirror of the audit view's
+# glob exclude). '*' = any run, '?' = one char; matching is case-insensitive and
+# anchored to the whole name.
+function ConvertTo-GlobRegex([string]$glob) {
+    $g = "$glob".Trim()
+    if (-not $g) { return $null }
+    $sb = [Text.StringBuilder]::new()
+    [void]$sb.Append('^')
+    foreach ($ch in $g.ToCharArray()) {
+        switch ($ch) {
+            '*' { [void]$sb.Append('.*') }
+            '?' { [void]$sb.Append('.') }
+            default { [void]$sb.Append([regex]::Escape([string]$ch)) }
+        }
+    }
+    [void]$sb.Append('$')
+    return [regex]::new($sb.ToString(), ([Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'))
+}
+
+# Parse a filter string (terms separated by commas/whitespace) into compiled regexes.
+function Get-GlobRegexes([string]$terms) {
+    $out = [Collections.Generic.List[object]]::new()
+    foreach ($t in @("$terms" -split '[,\s]+')) {
+        if (-not $t) { continue }
+        $rx = ConvertTo-GlobRegex $t
+        if ($rx) { [void]$out.Add($rx) }
+    }
+    return @($out.ToArray())
+}
+
+# True if a name matches any of the compiled glob regexes.
+function Test-NameMatchesAny([string]$name, $rxList) {
+    foreach ($rx in @($rxList)) { if ($rx -and $rx.IsMatch("$name")) { return $true } }
+    return $false
+}
+
 function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
                    [int]$TotalPages, [int]$TotalItems, [int]$Offset,
-                   [string]$Mode = 'simple', [int]$SelRow = -1, [int]$PvScroll = 0) {
+                   [string]$Mode = 'simple', [int]$SelRow = -1, [int]$PvScroll = 0,
+                   [object[]]$ExcludeRx = @(), [string]$Filter = '',
+                   [bool]$HideDone = $false, [int]$HideableCount = 0) {
 
     if ($null -eq $Items) { $Items = @() }
     $w = ((Get-Width) - 1)
     $detailed = ($Mode -eq 'detailed' -or $Mode -eq 'preview')
     $preview  = ($Mode -eq 'preview')
+    # While a passive audit is running, surface the matched rule: a Rule column in the
+    # simple/detailed tables, and a Rule line in the preview detail pane.
+    $showRule = ($script:AuditAvailable -and $script:AuditState -eq 'passive')
     $L = [Collections.Generic.List[string]]::new()
 
     # Header bar.
@@ -483,6 +743,9 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
     $pageStr = "Page $($Page + 1) of $TotalPages  ($TotalItems result$(if ($TotalItems -ne 1) {'s'}))"
     $rPad    = [Math]::Max(0, $w - 9 - $Query.Length - $pageStr.Length)
     $L.Add("  Query: ${BD}${CY}${Query}${R}$(' ' * $rPad)${DM}${pageStr}${R}")
+    if ($Filter) {
+        $L.Add("  ${DM}Excluding (dimmed, sent to back):${R} ${YL}$(Trunc $Filter ($w - 36))${R}")
+    }
     $al = $script:Alert
     if ($al.Message -and ([DateTime]::UtcNow - $al.At).TotalSeconds -lt 60) {
         $L.Add("  ${RD}${BD}! $(Trunc $al.Message ($w - 4))${R}")
@@ -497,14 +760,18 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
     $colW   = if ($preview) { $w - $rightW - 3 } else { $w }
 
     # Build the column header + data rows (each row already includes its gutter).
-    if ($detailed) { $hdrLine = Format-DetailedHeader $colW $preview }
+    $ruleW = 0
+    if ($detailed) { $hdrLine = Format-DetailedHeader $colW $preview $showRule }
     else {
         # Budget: gutter(2) + num + 3 single-space gaps = 5 overhead columns.
         $numW = 4; $repoW = 22
-        $avail = [Math]::Max(20, $colW - $numW - $repoW - 8)   # 3 gaps + 2 gutter + margin
+        if ($showRule) { $ruleW = [Math]::Min(20, [Math]::Max(10, [int]($colW * 0.16))) }
+        $avail = [Math]::Max(20, $colW - $numW - $repoW - 8 - $(if ($showRule) { $ruleW + 1 } else { 0 }))
         $nameW = [Math]::Max(16, [int]($avail * 0.55))
         $pathW = [Math]::Max(8, $avail - $nameW)
-        $hdrLine = "${BD}${YL}$(ClipR '#' $numW) $(Clip 'Name' $nameW) $(Clip 'Repository' $repoW) $(Clip 'Path' $pathW)${R}"
+        $hdr = "$(ClipR '#' $numW) $(Clip 'Name' $nameW) $(Clip 'Repository' $repoW) $(Clip 'Path' $pathW)"
+        if ($showRule) { $hdr += " $(Clip 'Rule' $ruleW)" }
+        $hdrLine = "${BD}${YL}$hdr${R}"
     }
 
     $rowStrs = [Collections.Generic.List[string]]::new()
@@ -512,10 +779,12 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
     # alias $R (the ANSI reset) and corrupt every ${R} in this function.
     for ($ri = 0; $ri -lt $Items.Count; $ri++) {
         $item = $Items[$ri]
-        $vis  = Test-Visited ([string]$item.Uri)
+        # Excluded (filter-matched) rows wash out like visited rows; the nav loop has
+        # already sorted them to the back.
+        $vis  = (Test-Visited ([string]$item.Uri)) -or (Test-NameMatchesAny ([string]$item.Name) $ExcludeRx)
         $sel  = ($ri -eq $SelRow)
         if ($detailed) {
-            $rowBody = Format-DetailedRow $item ($Offset + $ri + 1) $colW $vis $preview
+            $rowBody = Format-DetailedRow $item ($Offset + $ri + 1) $colW $vis $preview $showRule
         } else {
             # Simple view shows no archive/preview badges (detailed/preview only).
             $name = if ($item.Name) { $item.Name } else { '?' }
@@ -523,10 +792,20 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
             $cName = if (Test-ItemPreviewError $item) { $RD } elseif ($vis) { $DM } else { $CY }
             $cRepo = if ($vis) { $DM } else { $MG }
             $nameCell = "${cName}$(Clip $name $nameW)${R}"
-            $rowBody = "${DM}$(ClipR ([string]($Offset + $ri + 1)) $numW)${R} $nameCell ${cRepo}$(Clip $repo $repoW)${R} ${DM}$(Clip ([string]$item.Path) $pathW)${R}"
+            $pathCell = Format-PathCell ([string]$item.Path) $pathW ([bool](Get-ItemArchiveName $item)) $DM $(if ($vis) { $DM } else { '' })
+            $rowBody = "${DM}$(ClipR ([string]($Offset + $ri + 1)) $numW)${R} $nameCell ${cRepo}$(Clip $repo $repoW)${R} $pathCell"
+            # Rule cell uses the plain value colour (light), washed to dim only on visited
+            # rows — matching the detailed view (was always dim here).
+            if ($showRule) { $cRule = if ($vis) { $DM } else { '' }; $rowBody += " ${cRule}$(Clip (Get-AuditRuleLabel ([string]$item.Uri)) $ruleW)${R}" }
         }
-        $g = if ($sel) { "${BD}${YL}>${R} " } else { '  ' }
-        $line = "$g$rowBody"
+        # Gutter is two visible columns: selection caret + audit severity marker
+        # ('!' coloured by remapped severity). The marker only appears when the
+        # audit component is loaded and this row has a finding (guarded so the base
+        # tool works unchanged without it).
+        $selCh = if ($sel) { "${BD}${YL}>${R}" } else { ' ' }
+        $mkCh  = ' '
+        if ($script:AuditAvailable) { $am = Get-AuditMarker ([string]$item.Uri); if ($am) { $mkCh = $am } }
+        $line = "$selCh$mkCh$rowBody"
         if ($sel) { $line = Highlight-Row $line $colW }
         $rowStrs.Add($line)
     }
@@ -541,7 +820,9 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
         # Two-pane: column table on the left, file preview on the right. The rule
         # carries a ┬ at the divider column (colW+1) so it joins the vertical bar.
         $L.Add("$DM$(HR-Join $w ($colW + 1) ([char]0x252C))$R")
-        $bodyH = [Math]::Max(4, (Get-Height) - $L.Count - 3)
+        # Reserve the bottom border + the footer (its tallest height seen at this width,
+        # so the divider doesn't bob as hints wrap) + one spare against clipping.
+        $bodyH = [Math]::Max(4, (Get-Height) - $L.Count - (2 + $script:NavReserve))
 
         # Window the rows around the cursor (2 lines reserved: column header + the
         # header divider beneath it).
@@ -559,9 +840,12 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
         $leftLines.Add($script:HeaderRuleTag)   # divider between header and rows
         if ($Items.Count -eq 0) { $leftLines.Add("  ${DM}No results.${R}") }
         else {
-            if ($indTop) { $leftLines.Add("  ${DM}$([char]0x2191) $sIdx more${R}") }
+            # The two indicator slots stay reserved while scrolling (so the window height
+            # is constant), but each shows its arrow only when rows are actually hidden in
+            # that direction — otherwise it's blank, never a meaningless "0 more".
+            if ($indTop) { $leftLines.Add($(if ($sIdx -gt 0) { "  ${DM}$([char]0x2191) $sIdx more${R}" } else { '' })) }
             for ($ri = $sIdx; $ri -le $eIdx; $ri++) { $leftLines.Add($rowStrs[$ri]) }   # gutter already included
-            if ($indBot) { $leftLines.Add("  ${DM}$([char]0x2193) $($rowStrs.Count - 1 - $eIdx) more${R}") }
+            if ($indBot) { $belowN = $rowStrs.Count - 1 - $eIdx; $leftLines.Add($(if ($belowN -gt 0) { "  ${DM}$([char]0x2193) $belowN more${R}" } else { '' })) }
         }
 
         # Right pane: details + preview for the selected item.
@@ -581,11 +865,28 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
             $rl.Add('')
             $rl.Add("${DM}$('Repository'.PadRight($labelW))${R}${MG}$(Trunc $repo $valMax)${R}")
             $rl.Add("${DM}$('Path'.PadRight($labelW))${R}$(Trunc ([string]$sItem.Path) $valMax)")
+            $sArc = Get-ItemArchiveName $sItem
+            if ($sArc) { $rl.Add("${DM}$('Archive'.PadRight($labelW))${R}${YL}$(Trunc $sArc $valMax)${R}") }
             $rl.Add("${DM}$('Type'.PadRight($labelW))${R}${YL}$(Trunc ([string]$sItem.FileType) $valMax)${R}")
             $rl.Add("${DM}$('Size'.PadRight($labelW))${R}$szTxt")
             if ($sItem.Modified) { $rl.Add("${DM}$('Modified'.PadRight($labelW))${R}$(Trunc ([string]$sItem.Modified) $valMax)") }
+            $sHash = if ("$($sItem.Hash)") { [string]$sItem.Hash }
+                     elseif ($sItem.Uri -and $script:MetaCache.ContainsKey($sItem.Uri) -and
+                             $script:MetaCache[$sItem.Uri].PSObject.Properties['Hash']) { [string]$script:MetaCache[$sItem.Uri].Hash }
+                     else { '' }
+            if ($sHash) {
+                # Stored as '<algo>:<hex>'; show the algorithm as the label, the hex as the value.
+                $hParts = $sHash -split ':', 2
+                $hLabel = switch ($hParts[0]) { 'sha256' { 'SHA-256' } 'sha1' { 'SHA-1' } 'md5' { 'MD5' } default { 'Hash' } }
+                $hVal   = if ($hParts.Count -gt 1) { $hParts[1] } else { $sHash }
+                $rl.Add("${DM}$($hLabel.PadRight($labelW))${R}$(Trunc $hVal $valMax)")
+            }
             $rl.Add("${DM}$('Repo type'.PadRight($labelW))${R}$($rmeta.Type)")
             $rl.Add("${DM}$('Pkg type'.PadRight($labelW))${R}${MG}$($rmeta.PackageType)${R}")
+            if ($showRule) {
+                $rule = Get-AuditRuleLabel ([string]$sItem.Uri)
+                if ($rule) { $rl.Add("${DM}$('Rule'.PadRight($labelW))${R}${YL}$(Trunc $rule $valMax)${R}") }
+            }
             $pvMax  = [Math]::Max(1, $bodyH - $rl.Count - 2)
             $pvLines = if (Get-IsArchive ([string]$sItem.Name)) {
                 Get-ArchivePreviewLines $sItem $rightW $pvMax $PvScroll
@@ -617,14 +918,42 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
     if ($Page -gt 0)               { $nav.Add("${BD}${LB}p${RB}/${arrowL}${R}${DM} prev${R}") }
     if ($Page -lt $TotalPages - 1) { $nav.Add("${BD}${LB}n${RB}/${arrowR}${R}${DM} next${R}") }
     if ($TotalPages -gt 1) { $nav.Add("${BD}${LB}g${RB}${R}${DM} page${R}") }
-    if ($preview) { $nav.Add("${BD}${LB}y${RB}${R}${DM} preview big${R}") }
+    if ($preview -and $SelRow -ge 0 -and $SelRow -lt $Items.Count) {
+        $sIt = $Items[$SelRow]
+        if (-not (Get-IsArchive ([string]$sIt.Name))) {
+            $sUrl = Get-ItemUrl $sIt
+            $sSz  = if ("$($sIt.Size)" -ne '' -and "$($sIt.Size)" -ne '?') { [long]$sIt.Size } else { -1 }
+            switch (Get-PreviewState ([string]$sIt.Name) $sUrl $sSz) {
+                'large-gated' { $nav.Add("${BD}${LB}y${RB}${R}${DM} preview large${R}") }
+                'force-gated' { $nav.Add("${BD}${LB}y${RB}${R}${DM} force preview${R}") }
+            }
+        }
+    }
     if ($preview -and $script:PvScrollMax -gt 0) { $nav.Add("${BD}${LB}Shift+$([char]0x2191)$([char]0x2193)${RB}${R}${DM} scroll${R}") }
-    $nav.Add("${BD}${LB}#${RB}${R}${DM} view${R}")
+    if ($TotalItems -gt 0) {
+        $nav.Add("${BD}${LB}#${RB}${R}${DM} multi-download${R}")
+        $nav.Add("${BD}${LB}A${RB}${R}${DM} download all${R}")
+    }
     $nextMode = switch ($Mode) { 'simple' { 'detailed' } 'detailed' { 'preview' } default { 'simple' } }
     $nav.Add("${BD}${LB}d${RB}${R}${DM} $nextMode view${R}")
     $nav.Add("${BD}${LB}s${RB}${R}${DM} search${R}")
+    $nav.Add("${BD}${LB}f${RB}${R}${DM} filter$(if (@($ExcludeRx).Count -gt 0) { " ($(@($ExcludeRx).Count))" })${R}")
+    if (@($ExcludeRx).Count -gt 0) { $nav.Add("${BD}${LB}i${RB}${R}${DM} show all${R}") }
+    if ($HideDone)                { $nav.Add("${BD}${LB}h${RB}${R}${DM} unhide $HideableCount hidden${R}") }
+    elseif ($HideableCount -gt 0) { $nav.Add("${BD}${LB}h${RB}${R}${DM} hide $HideableCount${R}") }
+    if ($script:AuditAvailable) {
+        $aLbl = if ($script:AuditState -eq 'passive') { "${YL}audit: passive${R}${DM}" } else { 'audit' }
+        $nav.Add("${BD}${LB}a${RB}${R}${DM} $aLbl${R}")
+    }
     $nav.Add("${BD}${LB}q${RB}${R}${DM} quit${R}")
-    $L.Add((Join-Justified $nav.ToArray() $w))
+    $navLines = @(Wrap-Hints $nav.ToArray() $w)
+    foreach ($nl in $navLines) { $L.Add($nl) }
+    # Remember the wrapped footer height so the next page-size calc reserves for it.
+    $script:NavLineCount = [Math]::Max(1, $navLines.Count)
+    # Grow the stable preview reservation to the tallest footer seen at this width; reset
+    # it when the width changes (a resize re-wraps everything, so start fresh).
+    if ($script:NavReserveW -ne $w) { $script:NavReserveW = $w; $script:NavReserve = $script:NavLineCount }
+    else { $script:NavReserve = [Math]::Max($script:NavReserve, $script:NavLineCount) }
 
     Show-Frame $L.ToArray()
 }
@@ -648,7 +977,7 @@ function Show-Loading([string]$Query) {
 # On failure, the server's response body (Artifactory returns a JSON error with
 # a human-readable reason, e.g. a "blacked out" repo) is surfaced verbatim
 # rather than the bare "(404) Not Found" from the exception message.
-function Save-Item([object]$item, [string]$url) {
+function Save-Item([object]$item, [string]$url, [string]$DestName = '') {
     try {
         if (-not (Test-Path -LiteralPath $OutDir)) {
             New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
@@ -656,12 +985,23 @@ function Save-Item([object]$item, [string]$url) {
     } catch {
         return "${RD}${BD}Download failed:${R} cannot create folder ${CY}$OutDir${R} - $($_.Exception.Message)"
     }
-    $dest = Join-Path $OutDir $item.Name
+    # $DestName is the (possibly hash-tagged) on-disk filename from a bulk download; the
+    # CSV still logs $item.Name (the original) plus the hash ('<algo>:<hex>' storage checksum).
+    $fn   = if ($DestName) { $DestName } else { [string]$item.Name }
+    $hash = if ("$($item.Hash)") { [string]$item.Hash }
+            elseif ($item.Uri -and $script:MetaCache.ContainsKey($item.Uri) -and
+                    $script:MetaCache[$item.Uri].PSObject.Properties['Hash']) { [string]$script:MetaCache[$item.Uri].Hash }
+            else { '' }
+    $dest = Join-Path $OutDir $fn
     # Reuse bytes already held in memory from an earlier preview, if present.
     if ($script:MemFiles.ContainsKey($url)) {
         try {
             [System.IO.File]::WriteAllBytes($dest, $script:MemFiles[$url])
-            $sz = ''; try { $sz = ' (' + (Format-Size (Get-Item $dest).Length) + ')' } catch { }
+            $len = -1; try { $len = (Get-Item $dest).Length } catch { }
+            if (-not $hash) { $hash = 'sha256:' + (Get-BytesSha256 $script:MemFiles[$url]) }
+            Write-DownloadLog $OutDir ([string]$item.Name) ([string]$item.Repo) ([string]$item.Path) (Get-ItemArchiveName $item) $len ([string]$item.Modified) $url '' '' $hash
+            Mark-Downloaded ([string]$item.Uri) $url
+            $sz = if ($len -ge 0) { ' (' + (Format-Size $len) + ')' } else { '' }
             return "${BD}Saved${R} to ${CY}$dest${R}$sz ${DM}(from preview cache)${R}"
         } catch { }   # fall through to a normal download on any write error
     }
@@ -669,8 +1009,11 @@ function Save-Item([object]$item, [string]$url) {
     $ProgressPreference = 'SilentlyContinue'
     try {
         Invoke-WebRequest -Uri $url -Headers (Get-AuthHeaders) -OutFile $dest -ErrorAction Stop
-        $sz = ''
-        try { $sz = ' (' + (Format-Size (Get-Item $dest).Length) + ')' } catch { }
+        $len = -1; try { $len = (Get-Item $dest).Length } catch { }
+        if (-not $hash) { $hash = Get-FileSha256 $dest }
+        Write-DownloadLog $OutDir ([string]$item.Name) ([string]$item.Repo) ([string]$item.Path) (Get-ItemArchiveName $item) $len ([string]$item.Modified) $url '' '' $hash
+        Mark-Downloaded ([string]$item.Uri) $url
+        $sz = if ($len -ge 0) { ' (' + (Format-Size $len) + ')' } else { '' }
         return "${BD}Saved${R} to ${CY}$dest${R}$sz"
     } catch {
         # A failed -OutFile request may leave an empty/partial file behind.
@@ -679,5 +1022,186 @@ function Save-Item([object]$item, [string]$url) {
     } finally {
         $ProgressPreference = $old
     }
+}
+
+# ── BULK-DOWNLOAD DEDUP ───────────────────────────────────────────────────────
+# Shared by the search results view (Save-ItemSet) and the audit view
+# (Save-AuditFindingSet). The two together: download a set without (a) fetching the
+# same bytes twice, and (b) clobbering one file with another that shares its name.
+
+# Insert a short content tag before a filename's final extension, so two different
+# files that share a name don't overwrite each other on disk. The tag goes at the FRONT
+# so collided copies sort together and the original name stays readable:
+#   credentials.xml -> 7F7C415.credentials.xml
+function Add-NameTag([string]$name, [string]$tag) {
+    return "$tag.$name"
+}
+
+# 7-char (uppercase) content tag for collision disambiguation: the first 7 hex of the
+# file's checksum when known, else a deterministic MD5 of its identity string (so a given
+# file always tags the same way regardless of what else is in the batch). $hash is
+# '<algo>:<hex>', so drop the algorithm prefix before keeping hex digits (otherwise 'sha1:'
+# would leak an 'a1').
+function Get-DedupTag([string]$hash, [string]$fallback) {
+    $hex = (("$hash" -split ':')[-1] -replace '[^0-9A-Fa-f]', '')
+    if ($hex.Length -ge 7) { return $hex.Substring(0, 7).ToUpper() }
+    $md5 = [Security.Cryptography.MD5]::Create()
+    try {
+        $h = $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes("$fallback"))
+        return ((($h | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 7)).ToUpper()
+    } finally { $md5.Dispose() }
+}
+
+# SHA-256 of a byte array as lowercase hex. Used to derive a content identity for items
+# that have no storage checksum (notably archive entries), by hashing the bytes directly.
+function Get-BytesSha256([byte[]]$bytes) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '') }
+    finally { $sha.Dispose() }
+}
+
+# Content hash of a just-saved file as '<algo>:<hex>', for logging a download whose hash
+# wasn't known up front (archive entries have no storage checksum). Streams the file via
+# Get-FileHash so a large download isn't read wholly into memory. '' on any failure.
+function Get-FileSha256([string]$path) {
+    try { return 'sha256:' + ((Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()) }
+    catch { return '' }
+}
+
+# Fetch an entry's bytes for hashing/writing, reusing preview-cache bytes when held.
+function Get-DedupBytes($e) {
+    if ($script:MemFiles.ContainsKey([string]$e.Url)) { return $script:MemFiles[[string]$e.Url] }
+    return Get-FileBytes ([string]$e.Url)
+}
+
+# Write $bytes to $dest. Returns $true on success.
+function Save-DedupFile([string]$dest, [byte[]]$bytes) {
+    try { [System.IO.File]::WriteAllBytes($dest, $bytes); return $true } catch { return $false }
+}
+
+# Log a download-log.csv row for $e (its original name + the content $hash) and mark it
+# downloaded. Called once per entry even when several share one on-disk file.
+function Write-DedupEntry($e, [string]$hash) {
+    $sz = if ($e.Size -ge 0) { [long]$e.Size } else { -1 }
+    Write-DownloadLog $OutDir ([string]$e.Name) ([string]$e.Repo) ([string]$e.Path) ([string]$e.Archive) `
+                      $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) ([string]$e.Rule) ([string]$hash)
+    Mark-Downloaded ([string]$e.VisitKey) ([string]$e.Url)
+}
+
+# Shared bulk-download engine for the results view and the audit view. Identical CONTENT is
+# written to disk ONCE — the same bytes under different paths, repos or archives collapse to a
+# single file — but a download-log.csv row is written for EVERY entry, so each listed
+# occurrence stays individually recorded (mirroring the UI). Every entry is marked downloaded.
+#
+# Hashing is only done where it's needed to resolve a conflict: entries are grouped by
+# filename first, and only files that SHARE a name are hashed (to tell duplicates apart from
+# distinct content). A unique filename can't collide, so it's saved straight away — its hash
+# is still computed from the bytes we download to write it, so the log records it. Distinct
+# contents under one name each get a front hash tag (7F7C415.name) so neither clobbers the
+# other. $entries are objects with:
+#   .Ref .Name .Url .KnownHash .Repo .Path .Archive .Size(long,-1 ok) .Modified .Sev .Rule .VisitKey
+# Returns @{ Files; Entries; Renamed; Failed; Identical }.
+function Invoke-DedupDownload($entries) {
+    $entries = @($entries | Where-Object { $_ })
+    $total = $entries.Count
+    try { if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null } } catch { }
+
+    # Group by filename (case-insensitive), preserving first-seen order.
+    $nameGroups = [Collections.Generic.List[object]]::new()
+    $byName = @{}
+    foreach ($e in $entries) {
+        $nm = [string]$e.Name
+        if ($byName.ContainsKey($nm)) { [void]$byName[$nm].Add($e) }
+        else { $lst = [Collections.Generic.List[object]]::new(); [void]$lst.Add($e); $byName[$nm] = $lst; [void]$nameGroups.Add($lst) }
+    }
+
+    $files = 0; $renamed = 0; $logged = 0; $failed = 0; $gi = 0
+    foreach ($grp in $nameGroups) {
+        $gi++
+        $members = @($grp)
+        if ($members.Count -eq 1) {
+            # Unique filename — no collision possible; save under its own name. Hash comes
+            # from the storage checksum if known, else the bytes we just fetched (no extra
+            # download, no separate hashing pass).
+            $e = $members[0]
+            Show-Popup @("Saving $gi / $($nameGroups.Count)", [string]$e.Name)
+            $b = Get-DedupBytes $e
+            if ($null -eq $b) { $failed++; continue }
+            $h = if ("$($e.KnownHash)") { [string]$e.KnownHash } else { 'sha256:' + (Get-BytesSha256 $b) }
+            if (Save-DedupFile (Join-Path $OutDir ([string]$e.Name)) $b) { Write-DedupEntry $e $h; $files++; $logged++ } else { $failed++ }
+            continue
+        }
+        # Shared filename — hash each member (storage checksum if known, else the bytes) and
+        # split into distinct-content sub-groups. Bytes fetched for hashing are kept for the
+        # write so each copy is downloaded only once.
+        $contents = [Collections.Generic.List[object]]::new()
+        $byHash   = @{}
+        $mi = 0
+        foreach ($e in $members) {
+            $mi++
+            Show-Popup @("Hashing $gi / $($nameGroups.Count)", "$([string]$e.Name)  ($mi/$($members.Count))")
+            $h = [string]$e.KnownHash
+            $b = $null
+            if (-not $h) { $b = Get-DedupBytes $e; if ($b) { $h = 'sha256:' + (Get-BytesSha256 $b) } }
+            $key = if ($h) { 'h:' + $h.ToLower() } else { 'fb:' + [string]$e.Url }
+            if ($byHash.ContainsKey($key)) { [void]$byHash[$key].Members.Add($e) }
+            else {
+                $c = [PSCustomObject]@{ Hash = $h; Key = $key; Bytes = $b; Members = [Collections.Generic.List[object]]::new() }
+                [void]$c.Members.Add($e); $byHash[$key] = $c; [void]$contents.Add($c)
+            }
+        }
+        $tagged = ($contents.Count -gt 1)   # >1 distinct content under one name -> disambiguate
+        foreach ($c in $contents) {
+            $primary  = $c.Members[0]
+            $destName = if ($tagged) { Add-NameTag ([string]$primary.Name) (Get-DedupTag $c.Hash $c.Key) } else { [string]$primary.Name }
+            Show-Popup @("Saving $gi / $($nameGroups.Count)", $destName)
+            $b = if ($c.Bytes) { $c.Bytes } else { Get-DedupBytes $primary }
+            if ($null -eq $b) { $failed += $c.Members.Count; continue }
+            if (Save-DedupFile (Join-Path $OutDir $destName) $b) {
+                $files++; if ($tagged) { $renamed++ }
+                foreach ($e in $c.Members) { Write-DedupEntry $e $c.Hash; $logged++ }
+            } else { $failed += $c.Members.Count }
+        }
+    }
+    return [PSCustomObject]@{ Files = $files; Entries = $total; Renamed = $renamed; Failed = $failed; Identical = ($logged - $files) }
+}
+
+# Done-popup summary line for a bulk download: files written vs. entries, plus how many
+# entries collapsed onto a shared file and how many names were tagged.
+function Get-DedupDoneLine($res) {
+    $extra = @()
+    if ($res.Identical -gt 0) { $extra += "$($res.Identical) duplicate$(if ($res.Identical -ne 1){'s'}) merged" }
+    if ($res.Renamed -gt 0)   { $extra += "$($res.Renamed) name-tagged" }
+    if ($res.Failed -gt 0)    { $extra += "$($res.Failed) failed" }
+    $tail = if ($extra.Count -gt 0) { ' (' + ($extra -join ', ') + ')' } else { '' }
+    return "Done.  Saved $($res.Files) file$(if ($res.Files -ne 1){'s'}) from $($res.Entries) entr$(if ($res.Entries -ne 1){'ies'}else{'y'})$tail."
+}
+
+# Confirm + download a set of search-result items. Identical content is saved once; every
+# item is still logged. Shared by the results view's 'A' (download all) and numeric multi-download.
+function Save-ItemSet($items) {
+    $items = @($items | Where-Object { $_ })
+    if ($items.Count -eq 0) { Show-Popup @('Nothing to download.', '', 'press any key'); [void](Read-Key); return }
+    $bytes = 0L; $haveAll = $true
+    foreach ($it in $items) {
+        if ("$($it.Size)" -ne '' -and "$($it.Size)" -ne '?') { try { $bytes += [long]$it.Size } catch { $haveAll = $false } }
+        else { $haveAll = $false }
+    }
+    $szStr = if ($haveAll) { Format-Size $bytes } else { "$(Format-Size $bytes)+ (some sizes unknown)" }
+    $lines = @("${BD}Download $($items.Count) item$(if ($items.Count -ne 1){'s'})?${R}",
+               "${DM}Identical files are saved once on disk; each entry is still logged.${R}",
+               "Total size: ${CY}$szStr${R}", "Into: ${CY}$OutDir${R}")
+    if (-not (Confirm-Prompt $lines)) { return }
+    $entries = @($items | ForEach-Object {
+        [PSCustomObject]@{
+            Ref = $_; Name = [string]$_.Name; Url = (Get-ItemUrl $_); KnownHash = [string]$_.Hash
+            Repo = [string]$_.Repo; Path = [string]$_.Path; Archive = (Get-ItemArchiveName $_)
+            Size = $(if ("$($_.Size)" -ne '' -and "$($_.Size)" -ne '?') { try { [long]$_.Size } catch { [long]-1 } } else { [long]-1 })
+            Modified = [string]$_.Modified; Sev = ''; Rule = ''; VisitKey = [string]$_.Uri
+        }
+    })
+    $res = Invoke-DedupDownload $entries
+    Show-Popup @((Get-DedupDoneLine $res), "Into $OutDir", '', 'press any key')
+    [void](Read-Key)
 }
 
