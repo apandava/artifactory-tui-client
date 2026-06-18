@@ -688,7 +688,13 @@ function New-AuditWorkNode($n, [string]$arcName) {
     $known = -1
     $kmod  = ''
     if ($info -and $info.PSObject.Properties['size']) { try { $known = [long]$info.size } catch { $known = -1 } }
-    if ($info -and $info.PSObject.Properties['lastModified'] -and "$($info.lastModified)" -ne '') { $kmod = "$($info.lastModified)" }
+    # Archive-tree node info reports its date as 'modificationTime' (epoch millis) — NOT
+    # the storage API's 'lastModified' (ISO). Reading the wrong field left KnownModified
+    # empty, so the findings Modified column never filled for archive entries (size, from
+    # 'size' above, worked — hence the column looked selectively broken). Prefer the
+    # archive field; fall back to lastModified in case a node carries the storage shape.
+    if ($info -and $info.PSObject.Properties['modificationTime'] -and "$($info.modificationTime)" -ne '') { $kmod = "$($info.modificationTime)" }
+    elseif ($info -and $info.PSObject.Properties['lastModified'] -and "$($info.lastModified)" -ne '')     { $kmod = "$($info.lastModified)" }
     return @{
         Key=$url; Name=(Get-NodeName $n); Repo=$(if ($n.PSObject.Properties['repoKey']) { "$($n.repoKey)" } else { '' })
         Path=(Get-NodeInternalPath $n); Uri=''; Url=$url; KnownSize=$known; KnownModified=$kmod
