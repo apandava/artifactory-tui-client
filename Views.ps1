@@ -30,6 +30,13 @@ $script:PvScrollMax       = 0
 # the next page-size calc (StartTui) and the preview body height reserve that space.
 # A one-frame lag on resize self-corrects; defaults to one line.
 $script:NavLineCount      = 1
+# Stable footer reservation for the preview pane's body-height calc. The footer gains and
+# loses selection-dependent hints ([y] preview / Shift+scroll) as you move the cursor, so
+# its wrapped height flips between one and two lines. Reserving the *tallest* footer seen
+# at the current width (rather than the last render's) keeps the body — and the bottom
+# divider — from bobbing up and down during navigation. Reset when the width changes.
+$script:NavReserve        = 1
+$script:NavReserveW       = 0
 $script:WrapCacheKey      = ''
 $script:WrapCacheLines    = @()
 $script:ArcListCacheKey   = ''
@@ -150,14 +157,16 @@ function Unmark-Downloaded([string]$key, [string]$url) {
 # is UTF-8. Failures are swallowed so logging never blocks a download.
 function Write-DownloadLog([string]$dir, [string]$name, [string]$repo, [string]$path, [string]$archive,
                            [long]$sizeBytes, [string]$modified, [string]$url,
-                           [string]$severity, [string]$rule) {
+                           [string]$severity, [string]$rule, [string]$hash = '') {
     try {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $csv  = Join-Path $dir 'download-log.csv'
         $q    = { param($v) '"' + ("$v" -replace '"','""') + '"' }
-        $cols = @('Timestamp','FileName','Repository','Path','Archive','SizeBytes','Modified','DownloadUrl','Severity','MatchedRule')
+        # FileName is always the original Artifactory filename; Hash (its sha256) follows
+        # so a bulk download saved under a disambiguated name can still be traced back.
+        $cols = @('Timestamp','FileName','Hash','Repository','Path','Archive','SizeBytes','Modified','DownloadUrl','Severity','MatchedRule')
         $sz   = if ($sizeBytes -ge 0) { "$sizeBytes" } else { '' }
-        $row  = @((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $name, $repo, $path, $archive, $sz, $modified, $url,
+        $row  = @((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $name, $hash, $repo, $path, $archive, $sz, $modified, $url,
                   $(if ($severity) { $severity } else { 'N/A' }), $(if ($rule) { $rule } else { 'N/A' }))
         $new = -not (Test-Path -LiteralPath $csv)
         $sb  = [Text.StringBuilder]::new()
@@ -811,9 +820,9 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
         # Two-pane: column table on the left, file preview on the right. The rule
         # carries a ┬ at the divider column (colW+1) so it joins the vertical bar.
         $L.Add("$DM$(HR-Join $w ($colW + 1) ([char]0x252C))$R")
-        # Reserve the bottom border + the wrapped footer (its height from last frame)
-        # + one spare, so a multi-line footer never gets clipped.
-        $bodyH = [Math]::Max(4, (Get-Height) - $L.Count - (2 + $script:NavLineCount))
+        # Reserve the bottom border + the footer (its tallest height seen at this width,
+        # so the divider doesn't bob as hints wrap) + one spare against clipping.
+        $bodyH = [Math]::Max(4, (Get-Height) - $L.Count - (2 + $script:NavReserve))
 
         # Window the rows around the cursor (2 lines reserved: column header + the
         # header divider beneath it).
@@ -831,9 +840,12 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
         $leftLines.Add($script:HeaderRuleTag)   # divider between header and rows
         if ($Items.Count -eq 0) { $leftLines.Add("  ${DM}No results.${R}") }
         else {
-            if ($indTop) { $leftLines.Add("  ${DM}$([char]0x2191) $sIdx more${R}") }
+            # The two indicator slots stay reserved while scrolling (so the window height
+            # is constant), but each shows its arrow only when rows are actually hidden in
+            # that direction — otherwise it's blank, never a meaningless "0 more".
+            if ($indTop) { $leftLines.Add($(if ($sIdx -gt 0) { "  ${DM}$([char]0x2191) $sIdx more${R}" } else { '' })) }
             for ($ri = $sIdx; $ri -le $eIdx; $ri++) { $leftLines.Add($rowStrs[$ri]) }   # gutter already included
-            if ($indBot) { $leftLines.Add("  ${DM}$([char]0x2193) $($rowStrs.Count - 1 - $eIdx) more${R}") }
+            if ($indBot) { $belowN = $rowStrs.Count - 1 - $eIdx; $leftLines.Add($(if ($belowN -gt 0) { "  ${DM}$([char]0x2193) $belowN more${R}" } else { '' })) }
         }
 
         # Right pane: details + preview for the selected item.
@@ -858,6 +870,17 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
             $rl.Add("${DM}$('Type'.PadRight($labelW))${R}${YL}$(Trunc ([string]$sItem.FileType) $valMax)${R}")
             $rl.Add("${DM}$('Size'.PadRight($labelW))${R}$szTxt")
             if ($sItem.Modified) { $rl.Add("${DM}$('Modified'.PadRight($labelW))${R}$(Trunc ([string]$sItem.Modified) $valMax)") }
+            $sHash = if ("$($sItem.Hash)") { [string]$sItem.Hash }
+                     elseif ($sItem.Uri -and $script:MetaCache.ContainsKey($sItem.Uri) -and
+                             $script:MetaCache[$sItem.Uri].PSObject.Properties['Hash']) { [string]$script:MetaCache[$sItem.Uri].Hash }
+                     else { '' }
+            if ($sHash) {
+                # Stored as '<algo>:<hex>'; show the algorithm as the label, the hex as the value.
+                $hParts = $sHash -split ':', 2
+                $hLabel = switch ($hParts[0]) { 'sha256' { 'SHA-256' } 'sha1' { 'SHA-1' } 'md5' { 'MD5' } default { 'Hash' } }
+                $hVal   = if ($hParts.Count -gt 1) { $hParts[1] } else { $sHash }
+                $rl.Add("${DM}$($hLabel.PadRight($labelW))${R}$(Trunc $hVal $valMax)")
+            }
             $rl.Add("${DM}$('Repo type'.PadRight($labelW))${R}$($rmeta.Type)")
             $rl.Add("${DM}$('Pkg type'.PadRight($labelW))${R}${MG}$($rmeta.PackageType)${R}")
             if ($showRule) {
@@ -927,6 +950,10 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
     foreach ($nl in $navLines) { $L.Add($nl) }
     # Remember the wrapped footer height so the next page-size calc reserves for it.
     $script:NavLineCount = [Math]::Max(1, $navLines.Count)
+    # Grow the stable preview reservation to the tallest footer seen at this width; reset
+    # it when the width changes (a resize re-wraps everything, so start fresh).
+    if ($script:NavReserveW -ne $w) { $script:NavReserveW = $w; $script:NavReserve = $script:NavLineCount }
+    else { $script:NavReserve = [Math]::Max($script:NavReserve, $script:NavLineCount) }
 
     Show-Frame $L.ToArray()
 }
@@ -950,7 +977,7 @@ function Show-Loading([string]$Query) {
 # On failure, the server's response body (Artifactory returns a JSON error with
 # a human-readable reason, e.g. a "blacked out" repo) is surfaced verbatim
 # rather than the bare "(404) Not Found" from the exception message.
-function Save-Item([object]$item, [string]$url) {
+function Save-Item([object]$item, [string]$url, [string]$DestName = '') {
     try {
         if (-not (Test-Path -LiteralPath $OutDir)) {
             New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
@@ -958,13 +985,21 @@ function Save-Item([object]$item, [string]$url) {
     } catch {
         return "${RD}${BD}Download failed:${R} cannot create folder ${CY}$OutDir${R} - $($_.Exception.Message)"
     }
-    $dest = Join-Path $OutDir $item.Name
+    # $DestName is the (possibly hash-tagged) on-disk filename from a bulk download; the
+    # CSV still logs $item.Name (the original) plus the hash ('<algo>:<hex>' storage checksum).
+    $fn   = if ($DestName) { $DestName } else { [string]$item.Name }
+    $hash = if ("$($item.Hash)") { [string]$item.Hash }
+            elseif ($item.Uri -and $script:MetaCache.ContainsKey($item.Uri) -and
+                    $script:MetaCache[$item.Uri].PSObject.Properties['Hash']) { [string]$script:MetaCache[$item.Uri].Hash }
+            else { '' }
+    $dest = Join-Path $OutDir $fn
     # Reuse bytes already held in memory from an earlier preview, if present.
     if ($script:MemFiles.ContainsKey($url)) {
         try {
             [System.IO.File]::WriteAllBytes($dest, $script:MemFiles[$url])
             $len = -1; try { $len = (Get-Item $dest).Length } catch { }
-            Write-DownloadLog $OutDir ([string]$item.Name) ([string]$item.Repo) ([string]$item.Path) (Get-ItemArchiveName $item) $len ([string]$item.Modified) $url '' ''
+            if (-not $hash) { $hash = 'sha256:' + (Get-BytesSha256 $script:MemFiles[$url]) }
+            Write-DownloadLog $OutDir ([string]$item.Name) ([string]$item.Repo) ([string]$item.Path) (Get-ItemArchiveName $item) $len ([string]$item.Modified) $url '' '' $hash
             Mark-Downloaded ([string]$item.Uri) $url
             $sz = if ($len -ge 0) { ' (' + (Format-Size $len) + ')' } else { '' }
             return "${BD}Saved${R} to ${CY}$dest${R}$sz ${DM}(from preview cache)${R}"
@@ -975,7 +1010,8 @@ function Save-Item([object]$item, [string]$url) {
     try {
         Invoke-WebRequest -Uri $url -Headers (Get-AuthHeaders) -OutFile $dest -ErrorAction Stop
         $len = -1; try { $len = (Get-Item $dest).Length } catch { }
-        Write-DownloadLog $OutDir ([string]$item.Name) ([string]$item.Repo) ([string]$item.Path) (Get-ItemArchiveName $item) $len ([string]$item.Modified) $url '' ''
+        if (-not $hash) { $hash = Get-FileSha256 $dest }
+        Write-DownloadLog $OutDir ([string]$item.Name) ([string]$item.Repo) ([string]$item.Path) (Get-ItemArchiveName $item) $len ([string]$item.Modified) $url '' '' $hash
         Mark-Downloaded ([string]$item.Uri) $url
         $sz = if ($len -ge 0) { ' (' + (Format-Size $len) + ')' } else { '' }
         return "${BD}Saved${R} to ${CY}$dest${R}$sz"
@@ -988,38 +1024,184 @@ function Save-Item([object]$item, [string]$url) {
     }
 }
 
-# Confirm + download a set of search-result items, warning with count + total size first.
-# Items that would save under the same filename collide on disk ($OutDir/<Name>), so each
-# name downloads once; the rest are counted as deduped. Shared by the results view's 'A'
-# (download all) and the numeric multi-download.
+# ── BULK-DOWNLOAD DEDUP ───────────────────────────────────────────────────────
+# Shared by the search results view (Save-ItemSet) and the audit view
+# (Save-AuditFindingSet). The two together: download a set without (a) fetching the
+# same bytes twice, and (b) clobbering one file with another that shares its name.
+
+# Insert a short content tag before a filename's final extension, so two different
+# files that share a name don't overwrite each other on disk. The tag goes at the FRONT
+# so collided copies sort together and the original name stays readable:
+#   credentials.xml -> 7F7C415.credentials.xml
+function Add-NameTag([string]$name, [string]$tag) {
+    return "$tag.$name"
+}
+
+# 7-char (uppercase) content tag for collision disambiguation: the first 7 hex of the
+# file's checksum when known, else a deterministic MD5 of its identity string (so a given
+# file always tags the same way regardless of what else is in the batch). $hash is
+# '<algo>:<hex>', so drop the algorithm prefix before keeping hex digits (otherwise 'sha1:'
+# would leak an 'a1').
+function Get-DedupTag([string]$hash, [string]$fallback) {
+    $hex = (("$hash" -split ':')[-1] -replace '[^0-9A-Fa-f]', '')
+    if ($hex.Length -ge 7) { return $hex.Substring(0, 7).ToUpper() }
+    $md5 = [Security.Cryptography.MD5]::Create()
+    try {
+        $h = $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes("$fallback"))
+        return ((($h | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 7)).ToUpper()
+    } finally { $md5.Dispose() }
+}
+
+# SHA-256 of a byte array as lowercase hex. Used to derive a content identity for items
+# that have no storage checksum (notably archive entries), by hashing the bytes directly.
+function Get-BytesSha256([byte[]]$bytes) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '') }
+    finally { $sha.Dispose() }
+}
+
+# Content hash of a just-saved file as '<algo>:<hex>', for logging a download whose hash
+# wasn't known up front (archive entries have no storage checksum). Streams the file via
+# Get-FileHash so a large download isn't read wholly into memory. '' on any failure.
+function Get-FileSha256([string]$path) {
+    try { return 'sha256:' + ((Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()) }
+    catch { return '' }
+}
+
+# Fetch an entry's bytes for hashing/writing, reusing preview-cache bytes when held.
+function Get-DedupBytes($e) {
+    if ($script:MemFiles.ContainsKey([string]$e.Url)) { return $script:MemFiles[[string]$e.Url] }
+    return Get-FileBytes ([string]$e.Url)
+}
+
+# Write $bytes to $dest. Returns $true on success.
+function Save-DedupFile([string]$dest, [byte[]]$bytes) {
+    try { [System.IO.File]::WriteAllBytes($dest, $bytes); return $true } catch { return $false }
+}
+
+# Log a download-log.csv row for $e (its original name + the content $hash) and mark it
+# downloaded. Called once per entry even when several share one on-disk file.
+function Write-DedupEntry($e, [string]$hash) {
+    $sz = if ($e.Size -ge 0) { [long]$e.Size } else { -1 }
+    Write-DownloadLog $OutDir ([string]$e.Name) ([string]$e.Repo) ([string]$e.Path) ([string]$e.Archive) `
+                      $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) ([string]$e.Rule) ([string]$hash)
+    Mark-Downloaded ([string]$e.VisitKey) ([string]$e.Url)
+}
+
+# Shared bulk-download engine for the results view and the audit view. Identical CONTENT is
+# written to disk ONCE — the same bytes under different paths, repos or archives collapse to a
+# single file — but a download-log.csv row is written for EVERY entry, so each listed
+# occurrence stays individually recorded (mirroring the UI). Every entry is marked downloaded.
+#
+# Hashing is only done where it's needed to resolve a conflict: entries are grouped by
+# filename first, and only files that SHARE a name are hashed (to tell duplicates apart from
+# distinct content). A unique filename can't collide, so it's saved straight away — its hash
+# is still computed from the bytes we download to write it, so the log records it. Distinct
+# contents under one name each get a front hash tag (7F7C415.name) so neither clobbers the
+# other. $entries are objects with:
+#   .Ref .Name .Url .KnownHash .Repo .Path .Archive .Size(long,-1 ok) .Modified .Sev .Rule .VisitKey
+# Returns @{ Files; Entries; Renamed; Failed; Identical }.
+function Invoke-DedupDownload($entries) {
+    $entries = @($entries | Where-Object { $_ })
+    $total = $entries.Count
+    try { if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null } } catch { }
+
+    # Group by filename (case-insensitive), preserving first-seen order.
+    $nameGroups = [Collections.Generic.List[object]]::new()
+    $byName = @{}
+    foreach ($e in $entries) {
+        $nm = [string]$e.Name
+        if ($byName.ContainsKey($nm)) { [void]$byName[$nm].Add($e) }
+        else { $lst = [Collections.Generic.List[object]]::new(); [void]$lst.Add($e); $byName[$nm] = $lst; [void]$nameGroups.Add($lst) }
+    }
+
+    $files = 0; $renamed = 0; $logged = 0; $failed = 0; $gi = 0
+    foreach ($grp in $nameGroups) {
+        $gi++
+        $members = @($grp)
+        if ($members.Count -eq 1) {
+            # Unique filename — no collision possible; save under its own name. Hash comes
+            # from the storage checksum if known, else the bytes we just fetched (no extra
+            # download, no separate hashing pass).
+            $e = $members[0]
+            Show-Popup @("Saving $gi / $($nameGroups.Count)", [string]$e.Name)
+            $b = Get-DedupBytes $e
+            if ($null -eq $b) { $failed++; continue }
+            $h = if ("$($e.KnownHash)") { [string]$e.KnownHash } else { 'sha256:' + (Get-BytesSha256 $b) }
+            if (Save-DedupFile (Join-Path $OutDir ([string]$e.Name)) $b) { Write-DedupEntry $e $h; $files++; $logged++ } else { $failed++ }
+            continue
+        }
+        # Shared filename — hash each member (storage checksum if known, else the bytes) and
+        # split into distinct-content sub-groups. Bytes fetched for hashing are kept for the
+        # write so each copy is downloaded only once.
+        $contents = [Collections.Generic.List[object]]::new()
+        $byHash   = @{}
+        $mi = 0
+        foreach ($e in $members) {
+            $mi++
+            Show-Popup @("Hashing $gi / $($nameGroups.Count)", "$([string]$e.Name)  ($mi/$($members.Count))")
+            $h = [string]$e.KnownHash
+            $b = $null
+            if (-not $h) { $b = Get-DedupBytes $e; if ($b) { $h = 'sha256:' + (Get-BytesSha256 $b) } }
+            $key = if ($h) { 'h:' + $h.ToLower() } else { 'fb:' + [string]$e.Url }
+            if ($byHash.ContainsKey($key)) { [void]$byHash[$key].Members.Add($e) }
+            else {
+                $c = [PSCustomObject]@{ Hash = $h; Key = $key; Bytes = $b; Members = [Collections.Generic.List[object]]::new() }
+                [void]$c.Members.Add($e); $byHash[$key] = $c; [void]$contents.Add($c)
+            }
+        }
+        $tagged = ($contents.Count -gt 1)   # >1 distinct content under one name -> disambiguate
+        foreach ($c in $contents) {
+            $primary  = $c.Members[0]
+            $destName = if ($tagged) { Add-NameTag ([string]$primary.Name) (Get-DedupTag $c.Hash $c.Key) } else { [string]$primary.Name }
+            Show-Popup @("Saving $gi / $($nameGroups.Count)", $destName)
+            $b = if ($c.Bytes) { $c.Bytes } else { Get-DedupBytes $primary }
+            if ($null -eq $b) { $failed += $c.Members.Count; continue }
+            if (Save-DedupFile (Join-Path $OutDir $destName) $b) {
+                $files++; if ($tagged) { $renamed++ }
+                foreach ($e in $c.Members) { Write-DedupEntry $e $c.Hash; $logged++ }
+            } else { $failed += $c.Members.Count }
+        }
+    }
+    return [PSCustomObject]@{ Files = $files; Entries = $total; Renamed = $renamed; Failed = $failed; Identical = ($logged - $files) }
+}
+
+# Done-popup summary line for a bulk download: files written vs. entries, plus how many
+# entries collapsed onto a shared file and how many names were tagged.
+function Get-DedupDoneLine($res) {
+    $extra = @()
+    if ($res.Identical -gt 0) { $extra += "$($res.Identical) duplicate$(if ($res.Identical -ne 1){'s'}) merged" }
+    if ($res.Renamed -gt 0)   { $extra += "$($res.Renamed) name-tagged" }
+    if ($res.Failed -gt 0)    { $extra += "$($res.Failed) failed" }
+    $tail = if ($extra.Count -gt 0) { ' (' + ($extra -join ', ') + ')' } else { '' }
+    return "Done.  Saved $($res.Files) file$(if ($res.Files -ne 1){'s'}) from $($res.Entries) entr$(if ($res.Entries -ne 1){'ies'}else{'y'})$tail."
+}
+
+# Confirm + download a set of search-result items. Identical content is saved once; every
+# item is still logged. Shared by the results view's 'A' (download all) and numeric multi-download.
 function Save-ItemSet($items) {
-    $items = @($items)
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $list = [Collections.Generic.List[object]]::new()
-    foreach ($it in $items) { if ($it -and $seen.Add([string]$it.Name)) { [void]$list.Add($it) } }
-    $inc = @($list.ToArray())
-    $deduped = $items.Count - $inc.Count
-    $total = $inc.Count
-    if ($total -eq 0) { Show-Popup @('Nothing to download.', '', 'press any key'); [void](Read-Key); return }
+    $items = @($items | Where-Object { $_ })
+    if ($items.Count -eq 0) { Show-Popup @('Nothing to download.', '', 'press any key'); [void](Read-Key); return }
     $bytes = 0L; $haveAll = $true
-    foreach ($it in $inc) {
+    foreach ($it in $items) {
         if ("$($it.Size)" -ne '' -and "$($it.Size)" -ne '?') { try { $bytes += [long]$it.Size } catch { $haveAll = $false } }
         else { $haveAll = $false }
     }
     $szStr = if ($haveAll) { Format-Size $bytes } else { "$(Format-Size $bytes)+ (some sizes unknown)" }
-    $lines = @("${BD}Download $total file$(if ($total -ne 1){'s'})?${R}")
-    if ($deduped -gt 0) { $lines += "${DM}$deduped duplicate filename$(if ($deduped -ne 1){'s'}) deduped (same name).${R}" }
-    $lines += "Total size: ${CY}$szStr${R}"
-    $lines += "Into: ${CY}$OutDir${R}"
+    $lines = @("${BD}Download $($items.Count) item$(if ($items.Count -ne 1){'s'})?${R}",
+               "${DM}Identical files are saved once on disk; each entry is still logged.${R}",
+               "Total size: ${CY}$szStr${R}", "Into: ${CY}$OutDir${R}")
     if (-not (Confirm-Prompt $lines)) { return }
-    $done = 0; $fail = 0; $i = 0
-    foreach ($it in $inc) {
-        $i++
-        Show-Popup @("Downloading $i / $total", [string]$it.Name)
-        $res = Save-Item $it (Get-ItemUrl $it)
-        if ($res -like '*Download failed*') { $fail++ } else { $done++ }
-    }
-    Show-Popup @("Done.  Saved $done, failed $fail$(if ($deduped -gt 0) { ", deduped $deduped" }).", "Into $OutDir", '', 'press any key')
+    $entries = @($items | ForEach-Object {
+        [PSCustomObject]@{
+            Ref = $_; Name = [string]$_.Name; Url = (Get-ItemUrl $_); KnownHash = [string]$_.Hash
+            Repo = [string]$_.Repo; Path = [string]$_.Path; Archive = (Get-ItemArchiveName $_)
+            Size = $(if ("$($_.Size)" -ne '' -and "$($_.Size)" -ne '?') { try { [long]$_.Size } catch { [long]-1 } } else { [long]-1 })
+            Modified = [string]$_.Modified; Sev = ''; Rule = ''; VisitKey = [string]$_.Uri
+        }
+    })
+    $res = Invoke-DedupDownload $entries
+    Show-Popup @((Get-DedupDoneLine $res), "Into $OutDir", '', 'press any key')
     [void](Read-Key)
 }
 

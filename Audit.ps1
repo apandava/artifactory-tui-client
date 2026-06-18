@@ -510,12 +510,12 @@ $script:AuditPendingNodes = [Collections.Generic.Queue[object]]::new()
 
 # Throttle (read live by the dispatcher; adjustable from the view). Two knobs:
 #   MinIntervalMs  - delay between request launches, 0..5000 ms (+/- in the view)
-#   MaxConcurrent  - number of parallel workers, 1..5 (w cycles in the view)
+#   MaxConcurrent  - number of parallel workers, 1..10 (w fewer / W more in the view)
 # Defaults to a moderate pace (3 workers, 150 ms) so an automatic audit makes steady
 # progress out of the box; the user dials it up or down from the audit view.
 $script:AuditThrottle = @{ MaxConcurrent = 3; MinIntervalMs = 150 }
 $script:AuditLastLaunch = [DateTime]::MinValue
-$script:AuditMaxWorkers = 5   # ceiling for the w-key cycle (and the runspace pool)
+$script:AuditMaxWorkers = 10   # ceiling for the w/W worker control (and the runspace pool)
 
 # Delay ladder for the +/- controls: increments are small near 0 and grow toward
 # 5000 ms, so fine control where it matters and coarse steps at the slow end.
@@ -1295,17 +1295,16 @@ function Get-AuditStatusLines([int]$w) {
     $walk = if (Test-AuditWalkActive) { ' +walking' } else { '' }
     $prog = "audited ${BD}$script:AuditDone${R}${DM}/$script:AuditEnq$walk${R}  found ${BD}$($script:AuditFindings.Count)${R}"
     $thr  = "workers ${BD}$($script:AuditThrottle.MaxConcurrent)${R} delay ${BD}$($script:AuditThrottle.MinIntervalMs)${R}ms"
-    # Fixed-width rate values so the line doesn't jitter as the numbers change.
-    $qps = '{0,6:0.0}' -f [double]$script:AuditRate.QPS
+    # Fixed-width rate value so the line doesn't jitter as the number changes.
     $fps = '{0,6:0.0}' -f [double]$script:AuditRate.FPS
-    $bps = ((Format-Size $script:AuditRate.BPS) + '/s').PadLeft(11)
-    $rate = "${DM}$qps req/s  $fps files/s  $bps${R}"
+    $rate = "${DM}$fps files/s${R}"
     # Settings the run was started with (constant for the run): scan tier and whether
     # listable archives are walked and their entries audited.
     $set = "${DM}$(if ($script:AuditTier2) { 'Tier 2' } else { 'Tier 1' }) | archives $(if ($script:AuditWalkArchives) { 'on' } else { 'off' })${R}"
-    $l1 = "  ${DM}Audit:${R} $(Trunc $script:AuditScope ([Math]::Max(8,$w-64)))   $set   $st   $prog"
-    $l2 = "  $rate   $thr"
-    return @($l1, $l2)
+    # Everything on one line; the scope is truncated hard so the rate/workers/delay on the
+    # right stay visible (Write-Frame clips anything still over the width as a backstop).
+    $l1 = "  ${DM}Audit:${R} $(Trunc $script:AuditScope ([Math]::Max(8,$w-110)))   $set   $st   $prog   $rate   $thr"
+    return @($l1)
 }
 
 # ── PREVIEW (synchronous, on demand) ──────────────────────────────────────────
@@ -1422,16 +1421,23 @@ function Get-AuditPreviewLines($f, [int]$paneW, [int]$maxLines, [int]$scroll = 0
 # ── DOWNLOAD (with CSV tracking) ──────────────────────────────────────────────
 # Download one finding into $OutDir, log it, and purge it (mark downloaded). Returns
 # a status line styled like Save-Item.
-function Save-AuditFinding($f) {
+function Save-AuditFinding($f, [string]$DestName = '') {
     try {
         if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
     } catch { return "${RD}${BD}Download failed:${R} cannot create ${CY}$OutDir${R}" }
-    $dest = Join-Path $OutDir $f.Name
+    # $DestName is the (possibly hash-tagged) on-disk name from a bulk download; the CSV
+    # still logs $f.Name (the original). Hash = storage checksum '<algo>:<hex>' when known;
+    # archive entries have none, so it's computed from the saved bytes after the download.
+    $fn   = if ($DestName) { $DestName } else { [string]$f.Name }
+    $hash = if (-not $f.InArchive -and $f.Uri -and $script:MetaCache.ContainsKey($f.Uri) -and
+                $script:MetaCache[$f.Uri].PSObject.Properties['Hash']) { [string]$script:MetaCache[$f.Uri].Hash } else { '' }
+    $dest = Join-Path $OutDir $fn
     $old = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
     try {
         Invoke-WebRequest -Uri $f.Url -Headers (Get-AuthHeaders) -OutFile $dest -ErrorAction Stop
         $len = -1; try { $len = (Get-Item $dest).Length } catch { }
-        Write-DownloadLog $OutDir $f.Name $f.Repo $f.Path $(if ($f.InArchive) { [string]$f.ArchiveName } else { '' }) $len $f.Modified $f.Url $f.Sev $f.AllRules
+        if (-not $hash) { $hash = Get-FileSha256 $dest }
+        Write-DownloadLog $OutDir $f.Name $f.Repo $f.Path $(if ($f.InArchive) { [string]$f.ArchiveName } else { '' }) $len $f.Modified $f.Url $f.Sev $f.AllRules $hash
         Mark-Downloaded $f.Key $f.Url
         # Re-sort so the now-downloaded row drops to the very back (Mark-Downloaded only
         # changed the visited set, not the findings count, so nudge the sort explicitly).
@@ -1444,39 +1450,43 @@ function Save-AuditFinding($f) {
     } finally { $ProgressPreference = $old }
 }
 
-# Confirm + download a set of findings, warning with count + total size first. Findings
-# that would save under the same filename collide on disk (Save-AuditFinding writes to
-# $OutDir/<Name>), so each filename is downloaded once — keeping the first (the list is
-# pre-sorted highest-severity-first); the rest are counted as deduped and reported.
-# Shared by 'A' (download all included) and the numeric multi-download.
+# Confirm + download a set of findings. Identical content is written to disk once (the same
+# bytes under different paths/archives collapse to one file), but every finding is still
+# logged to download-log.csv, so each occurrence stays individually recorded — matching the
+# UI rows. Archive entries have no storage checksum, so their content is hashed from the
+# bytes at download time. Shared by 'A' (download all included) and the numeric multi-download.
 function Save-AuditFindingSet($candidates) {
-    $candidates = @($candidates)
-    $seenName = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $incList = [Collections.Generic.List[object]]::new()
-    foreach ($f in $candidates) { if ($seenName.Add([string]$f.Name)) { [void]$incList.Add($f) } }
-    $inc = @($incList.ToArray())
-    $deduped = $candidates.Count - $inc.Count
-    $total = $inc.Count
-    if ($total -eq 0) { Show-Popup @('Nothing to download.', '', 'press any key'); [void](Read-Key); return }
+    $candidates = @($candidates | Where-Object { $_ })
+    if ($candidates.Count -eq 0) { Show-Popup @('Nothing to download.', '', 'press any key'); [void](Read-Key); return }
     $bytes = 0L; $haveAll = $true
-    foreach ($f in $inc) { if ($f.Size -ge 0) { $bytes += [long]$f.Size } else { $haveAll = $false } }
+    foreach ($f in $candidates) { if ($f.Size -ge 0) { $bytes += [long]$f.Size } else { $haveAll = $false } }
     $szStr = if ($haveAll) { Format-Size $bytes } else { "$(Format-Size $bytes)+ (some sizes unknown)" }
-    $lines = @("${BD}Download $total file$(if ($total -ne 1){'s'})?${R}")
-    if ($deduped -gt 0) { $lines += "${DM}$deduped duplicate filename$(if ($deduped -ne 1){'s'}) deduped (same name).${R}" }
-    $lines += "Total size: ${CY}$szStr${R}"
-    $lines += "Into: ${CY}$OutDir${R}"
-    $lines += "${DM}Each file and its download URL is logged to download-log.csv there.${R}"
-    $ok = Confirm-Prompt $lines
-    if (-not $ok) { return }
-    $done = 0; $fail = 0; $i = 0
-    foreach ($f in $inc) {
-        $i++
-        Show-Popup @("Downloading $i / $total", $f.Name)
-        $res = Save-AuditFinding $f
-        if ($res -like '*Download failed*') { $fail++ } else { $done++ }
-    }
-    $sum = "Done.  Saved $done, failed $fail$(if ($deduped -gt 0) { ", deduped $deduped" })."
-    Show-Popup @($sum, "Into $OutDir", '', 'press any key')
+    $lines = @("${BD}Download $($candidates.Count) finding$(if ($candidates.Count -ne 1){'s'})?${R}",
+               "${DM}Identical files are saved once on disk; each finding is still logged.${R}",
+               "Total size: ${CY}$szStr${R}", "Into: ${CY}$OutDir${R}",
+               "${DM}Each finding and its download URL is logged to download-log.csv there.${R}")
+    if (-not (Confirm-Prompt $lines)) { return }
+    # Pass along any storage checksum already cached (no network call) as the known hash;
+    # the engine only needs a hash to resolve same-name collisions, and computes one from
+    # the bytes when required. Archive entries have no checksum, so KnownHash stays ''.
+    $entries = @($candidates | ForEach-Object {
+        $kh = ''
+        if (-not $_.InArchive -and $_.Uri -and $script:MetaCache.ContainsKey($_.Uri)) {
+            $m = $script:MetaCache[$_.Uri]; if ($m.PSObject.Properties['Hash']) { $kh = [string]$m.Hash }
+        }
+        [PSCustomObject]@{
+            Ref = $_; Name = [string]$_.Name; Url = [string]$_.Url; KnownHash = $kh
+            Repo = [string]$_.Repo; Path = [string]$_.Path
+            Archive = $(if ($_.InArchive) { [string]$_.ArchiveName } else { '' })
+            Size = $(if ($_.Size -ge 0) { [long]$_.Size } else { [long]-1 })
+            Modified = [string]$_.Modified; Sev = [string]$_.Sev; Rule = [string]$_.AllRules; VisitKey = [string]$_.Key
+        }
+    })
+    $res = Invoke-DedupDownload $entries
+    # Re-sort so the now-downloaded rows drop to the back (Mark-Downloaded only touched the
+    # visited set, not the findings count).
+    $script:AuditSortDirty = $true
+    Show-Popup @((Get-DedupDoneLine $res), "Into $OutDir", '', 'press any key')
     [void](Read-Key)
 }
 
@@ -1642,6 +1652,7 @@ function Test-AuditPreviewLoadable([string]$state) { Test-PreviewLoadable $state
 # $null when there's nothing to load. Uses the finding's own Url so archive-internal
 # entries resolve correctly (unlike Get-ItemPreviewRequest, which recomputes it).
 function Get-AuditPreviewRequest($f) {
+    if ($null -eq $f) { return $null }
     $name  = [string]$f.Name
     $isArc = (Get-IsArchive $name) -and (-not $f.InArchive)
     if ($isArc) {
@@ -1675,6 +1686,10 @@ function Get-AuditPreviewPlan($pageFindings, [int]$selRow, [int]$radius = 4) {
     $allKeys  = [Collections.Generic.List[string]]::new()
     $items = @($pageFindings)
     if ($items.Count -gt 0) {
+        # Clamp the cursor into range first: a stale/out-of-range selRow (e.g. right after
+        # hiding rows shrinks the page) would otherwise index past the array or onto a $null.
+        if ($selRow -lt 0) { $selRow = 0 }
+        if ($selRow -ge $items.Count) { $selRow = $items.Count - 1 }
         $order = [Collections.Generic.List[int]]::new(); $order.Add($selRow)
         $max = [Math]::Max($selRow, $items.Count - 1 - $selRow)
         for ($d = 1; $d -le $max; $d++) {
@@ -1682,6 +1697,7 @@ function Get-AuditPreviewPlan($pageFindings, [int]$selRow, [int]$radius = 4) {
             if ($selRow - $d -ge 0)            { $order.Add($selRow - $d) }
         }
         foreach ($idx in $order) {
+            if ($idx -lt 0 -or $idx -ge $items.Count) { continue }
             $rq = Get-AuditPreviewRequest $items[$idx]
             if (-not $rq) { continue }
             $allKeys.Add($rq.Key)
@@ -1719,7 +1735,7 @@ function Show-AuditView {
     $hideDone = $false    # hide excluded + already-downloaded findings from the list
     $navFooterLines = 1   # wrapped footer height from last render (reserved in body sizing)
     $notice = if ($script:AuditState -eq 'paused') {
-        @{ Message = "${YL}Paused - set delay with ${LB}+/-${RB} (0-5000ms) and workers with ${LB}w${RB} (1-5), then ${LB}p${RB} to start.${R}"; At = [DateTime]::UtcNow }
+        @{ Message = "${YL}Paused - set delay with ${LB}+/-${RB} (0-5000ms) and workers with ${LB}w/W${RB} (1-10), then ${LB}p${RB} to start.${R}"; At = [DateTime]::UtcNow }
     } else { @{ Message = ''; At = [DateTime]::MinValue } }
     $pendingKey = $null
 
@@ -1750,8 +1766,12 @@ function Show-AuditView {
 
         $L = [Collections.Generic.List[string]]::new()
         $title = '  ARTCA  Audit Findings  '
-        $gap   = [Math]::Max(0, $w - $title.Length)
-        $L.Add("${HB}${BD}${MG}${title}${R}${HB}$(' ' * $gap)${R}")
+        $url   = $BaseUrl
+        $avail = $w - $title.Length - 4
+        if ($url.Length -gt $avail) { $url = Clip $url ([Math]::Max(1, $avail)) }
+        $rt    = "  $url  "
+        $gap   = [Math]::Max(0, $w - $title.Length - $rt.Length)
+        $L.Add("${HB}${BD}${MG}${title}${R}${HB}$(' ' * $gap)${DM}${rt}${R}")
         $L.Add("$DM$(HR $w)$R")
         foreach ($sl in (Get-AuditStatusLines $w)) { $L.Add($sl) }
         if ($notice.Message -and ([DateTime]::UtcNow - $notice.At).TotalSeconds -lt 8) {
@@ -1951,7 +1971,7 @@ function Show-AuditView {
             $nav.Add("${BD}${LB}p${RB}${R}${DM} $(if ($script:AuditState -eq 'paused') { 'resume' } else { 'pause' })${R}")
             $nav.Add("${BD}${LB}c${RB}${R}${DM} cancel${R}")
             $nav.Add("${BD}${LB}+/-${RB}${R}${DM} delay $($script:AuditThrottle.MinIntervalMs)ms${R}")
-            $nav.Add("${BD}${LB}w${RB}${R}${DM} workers $($script:AuditThrottle.MaxConcurrent)${R}")
+            $nav.Add("${BD}${LB}w/W${RB}${R}${DM} workers $($script:AuditThrottle.MaxConcurrent)${R}")
         }
         $nav.Add("${BD}${LB}q${RB}${R}${DM} back${R}")
         $navWrapped = @(Wrap-Hints $nav.ToArray() $w)
@@ -1965,13 +1985,22 @@ function Show-AuditView {
         $busy = $active -or ($script:PfQueued.Count -gt 0) -or ($script:PvQueued.Count -gt 0)
         if ($pendingKey) { $key = $pendingKey; $pendingKey = $null }
         elseif ($busy -and $script:CanRawKey) {
-            $key = Read-KeyTimeout 150
+            # Cased read so the worker control can tell 'w' (fewer) from 'W' (more).
+            $key = Read-KeyTimeoutCased 150
             if ($null -eq $key) {
                 if ($active) { Invoke-AuditPump }
                 Receive-Prefetch; Receive-PreviewPrefetch; Receive-PreviewLookahead
                 $script:AuditDirty = $false; continue
             }
-        } else { $key = Read-Key }
+        } else { $key = Read-KeyCased }
+
+        # Worker count: 'w' fewer, 'W' more (1..AuditMaxWorkers). Handled before the
+        # case-insensitive switch, which can't distinguish the two cases.
+        if ($key -ceq 'w' -or $key -ceq 'W') {
+            $delta = if ($key -ceq 'W') { 1 } else { -1 }
+            $script:AuditThrottle.MaxConcurrent =
+                [Math]::Max(1, [Math]::Min($script:AuditMaxWorkers, [int]$script:AuditThrottle.MaxConcurrent + $delta))
+        }
 
         switch -regex ($key) {
             '^(up|k|down|j)$' {
@@ -2072,7 +2101,6 @@ function Show-AuditView {
             }
             '^(\+|=)$' { Step-AuditDelay 1 }    # slower (more delay)
             '^(\-|_)$' { Step-AuditDelay -1 }   # faster (less delay)
-            '^w$'      { $script:AuditThrottle.MaxConcurrent = ($script:AuditThrottle.MaxConcurrent % $script:AuditMaxWorkers) + 1 }
             '^(q|b)$' {
                 if ($active) { Stop-AuditWork; $script:AuditState = if ($script:AuditFindings.Count -gt 0) { 'done' } else { 'cancelled' } }
                 Stop-AuditPreviewWarm
