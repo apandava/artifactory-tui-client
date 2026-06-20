@@ -54,7 +54,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # Allow many concurrent connections and ensure TLS 1.2 (matches StartTui.ps1).
-[Net.ServicePointManager]::DefaultConnectionLimit = 64
+[Net.ServicePointManager]::DefaultConnectionLimit = 256
 [Net.ServicePointManager]::SecurityProtocol =
     [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 

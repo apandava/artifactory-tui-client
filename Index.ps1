@@ -107,7 +107,7 @@ $script:ArcJobs    = [Collections.Generic.List[object]]::new()
 $script:ArcFetch   = [hashtable]::Synchronized(@{})
 $script:ArcThrottle   = @{ MaxConcurrent = 3; MinIntervalMs = 150 }
 $script:ArcLastLaunch = [DateTime]::MinValue
-$script:ArcMaxWorkers = 10
+$script:ArcMaxWorkers = 20   # raised from 10: the tree now flattens in the worker, not the main thread
 
 # Set when results/state change, so the TUI knows to redraw.
 $script:ArcSearchDirty = $false
@@ -151,21 +151,74 @@ $script:ArcWalkScript = {
     }
 }
 
-# Archive-expansion worker: POST the treebrowser request and return the node tree. One
-# POST returns the entire archive contents nested under each folder's 'children'.
-# Get-WkError (from $PvErrFn) is injected ahead of this body by the dispatcher.
+# Archive-expansion worker (C): POST the treebrowser request (one POST returns the entire archive
+# contents nested under each folder's 'children'), then FLATTEN the tree to its file entries RIGHT
+# HERE - projecting each to the three persisted primitives (internalPath/size/modified) and DROPPING
+# the bulky nested tree. Only the compact entry list crosses back, so the main thread neither holds
+# the deep tree nor walks it; that removes the per-archive main-thread stall that forced low arc
+# concurrency, and lowers peak memory. RETRY/BACKOFF (B): a 429/503/timeout is retried up to 3x with
+# jittered backoff before giving up. The node helpers + Get-WkError are injected ahead of this body
+# by the dispatcher (Get-ArcNodeFns / $PvErrFn).
 $script:ArcExpandScript = {
     param($key, $uri, $body, $headers, $ua, $cache, $alert)
-    try {
-        $resp = Invoke-RestMethod -Uri $uri -Method Post -Body $body `
-                    -ContentType 'application/json' -Headers $headers -UserAgent $ua -ErrorAction Stop
-        $data = if ($resp.PSObject.Properties['data'] -and $resp.data) { @(@($resp.data) | Where-Object { $null -ne $_ }) } else { @() }
-        $cache[$key] = [PSCustomObject]@{ Ok=$true; Nodes=$data; Error='' }
-    } catch {
-        $we = Get-WkError $_
-        if ($we.Code -eq 429 -or $we.Code -eq 503) { $alert.Message = "Server rate-limited an archive-search request (HTTP $($we.Code))."; $alert.At = [DateTime]::UtcNow }
-        $cache[$key] = [PSCustomObject]@{ Ok=$false; Nodes=@(); Error=$we.Message }
+    $attempt = 0
+    while ($true) {
+        try {
+            $resp = Invoke-RestMethod -Uri $uri -Method Post -Body $body `
+                        -ContentType 'application/json' -Headers $headers -UserAgent $ua -ErrorAction Stop
+            $data = if ($resp.PSObject.Properties['data'] -and $resp.data) { @(@($resp.data) | Where-Object { $null -ne $_ }) } else { @() }
+            # Iterative DFS (no recursion - archives can nest deeply): folders are expanded, non-folder
+            # nodes (incl. unlistable sub-archives) become file entries. Children pushed in reverse so
+            # they pop in document order (matches the recursive Add-ArcEntriesFromNodes order).
+            $entries = [Collections.Generic.List[object]]::new()
+            $stack = New-Object 'System.Collections.Generic.Stack[object]'
+            for ($i = $data.Count - 1; $i -ge 0; $i--) { $stack.Push($data[$i]) }
+            while ($stack.Count -gt 0) {
+                $n = $stack.Pop()
+                if ($null -eq $n) { continue }
+                if (Get-NodeIsFolder $n) {
+                    $kids = @(Get-NodeChildren $n)
+                    for ($i = $kids.Count - 1; $i -ge 0; $i--) { $stack.Push($kids[$i]) }
+                    continue
+                }
+                $ip = Get-NodeInternalPath $n
+                if (-not $ip) { continue }
+                $info = Get-NodeInfo $n
+                $sz = -1; $mod = ''
+                if ($info -and $info.PSObject.Properties['size']) { try { $sz = [long]$info.size } catch { $sz = -1 } }
+                if ($info -and $info.PSObject.Properties['modificationTime'] -and "$($info.modificationTime)" -ne '') { $mod = Format-Epoch $info.modificationTime }
+                $entries.Add([PSCustomObject]@{ InternalPath = "$ip"; Size = $sz; Modified = "$mod" })
+            }
+            $cache[$key] = [PSCustomObject]@{ Ok=$true; Entries=$entries; Error='' }
+            break
+        } catch {
+            $we = Get-WkError $_
+            if ($we.Code -eq 429 -or $we.Code -eq 503) { $alert.Message = "Server rate-limited an archive-search request (HTTP $($we.Code))."; $alert.At = [DateTime]::UtcNow }
+            $transient = ($we.Code -eq 429 -or $we.Code -eq 503 -or $we.Code -eq 0 -or $we.Code -eq 502 -or $we.Code -eq 504)
+            if ($transient -and $attempt -lt 3) {
+                $attempt++
+                Start-Sleep -Milliseconds ([int]([Math]::Pow(2, $attempt) * 200) + (Get-Random -Minimum 0 -Maximum 300))
+                continue
+            }
+            $cache[$key] = [PSCustomObject]@{ Ok=$false; Entries=$null; Error=$we.Message }
+            break
+        }
     }
+}
+
+# Lazily build (once, then cache) an injectable scriptblock that re-declares the node helpers the
+# expansion worker needs, sourced from the live Core.ps1 definitions so they never drift. Built at
+# first dispatch (not load) to keep the "load order doesn't matter" invariant.
+$script:ArcNodeFns = $null
+function Get-ArcNodeFns {
+    if ($null -eq $script:ArcNodeFns) {
+        $defs = foreach ($fn in 'Get-NodeIsFolder','Get-NodeChildren','Get-NodeInfo','Get-NodeInternalPath','Format-Epoch') {
+            $c = Get-Command $fn -CommandType Function -ErrorAction SilentlyContinue
+            if ($c) { "function $fn {`n$($c.Definition)`n}" }
+        }
+        $script:ArcNodeFns = [scriptblock]::Create(($defs -join "`n"))
+    }
+    return $script:ArcNodeFns
 }
 
 # == REPO ENUMERATION ==========================================================
@@ -536,17 +589,51 @@ function Ensure-ArcIndexedLoaded {
 
 # Append one top-level artifact row to its repo shard (path,name,size,modified). Size
 # normalized to a number ('' when unknown). Low-level; callers handle the dedupe guard.
+# WRITES (D): in buffered mode ($IndexWriteBuffered, set by the headless build) rows accumulate in a
+# per-shard StringBuilder and are flushed in batches (threshold or lifecycle) - one file-open per
+# ~hundreds of rows instead of per row, which matters once the parallel pipeline writes 100s/sec.
+# The low-volume TUI write-through leaves the flag off and writes immediately (no loss on a crash).
 function Write-IndexArtifactRow([string]$repo, [string]$path, [string]$name, $size, [string]$modified) {
     if (-not (Confirm-IndexDir)) { return $false }
     $sz = ''
     if ("$size" -ne '' -and "$size" -ne '?') { try { $sz = [long]$size } catch { $sz = "$size" } }
     $line = Format-CsvRow @($path, $name, $sz, $modified)
+    $sp = Get-ArtifactShardPath $repo
+    if ($script:IndexWriteBuffered) {
+        $sb = $script:ShardWriteBuf[$sp]
+        if ($null -eq $sb) { $sb = [Text.StringBuilder]::new(); $script:ShardWriteBuf[$sp] = $sb; $script:ShardWriteBufRows[$sp] = 0 }
+        [void]$sb.Append($line).Append("`n")
+        $script:ShardWriteBufRows[$sp]++
+        $script:IndexCount++
+        if ([int]$script:ShardWriteBufRows[$sp] -ge $script:ShardWriteFlushRows) { Flush-IndexShardBuf $sp }
+        return $true
+    }
     try {
-        [System.IO.File]::AppendAllText((Get-ArtifactShardPath $repo),
-            ($line + "`n"), [Text.UTF8Encoding]::new($false))
+        [System.IO.File]::AppendAllText($sp, ($line + "`n"), [Text.UTF8Encoding]::new($false))
         $script:IndexCount++
         return $true
     } catch { return $false }
+}
+
+# Per-shard write buffers (D): path -> StringBuilder, path -> row count. Flushed by threshold (in
+# Write-IndexArtifactRow), periodically (the build loop), and fully on Stop-IndexBuild.
+$script:IndexWriteBuffered  = $false
+$script:ShardWriteBuf       = @{}
+$script:ShardWriteBufRows   = @{}
+$script:ShardWriteFlushRows = 256
+
+# Flush one shard's buffer to disk (append, no-BOM UTF-8/LF) and reset its row count.
+function Flush-IndexShardBuf([string]$sp) {
+    $sb = $script:ShardWriteBuf[$sp]
+    if ($null -eq $sb -or $sb.Length -eq 0) { return }
+    try { [System.IO.File]::AppendAllText($sp, $sb.ToString(), [Text.UTF8Encoding]::new($false)) } catch { }
+    [void]$sb.Clear()
+    $script:ShardWriteBufRows[$sp] = 0
+}
+
+# Flush every shard buffer (lifecycle/periodic).
+function Flush-IndexWrites {
+    foreach ($sp in @($script:ShardWriteBuf.Keys)) { Flush-IndexShardBuf $sp }
 }
 
 # Append one archive's entries to its repo arc bucket (one CSV row per entry) and record the
@@ -883,12 +970,13 @@ function Dispatch-ArcExpand {
         if ($iv -gt 0 -and ([DateTime]::UtcNow - $script:ArcLastLaunch).TotalMilliseconds -lt $iv) { break }
         $rec = $script:ArcQueue.Dequeue()
         if ($null -eq $script:ArcPool) {
-            $script:ArcPool = [RunspaceFactory]::CreateRunspacePool(1, 10)
+            $script:ArcPool = [RunspaceFactory]::CreateRunspacePool(1, $script:ArcMaxWorkers)
             $script:ArcPool.Open()
         }
         $ps = [PowerShell]::Create()
         $ps.RunspacePool = $script:ArcPool
-        [void]$ps.AddScript($script:PvErrFn)   # define Get-WkError in the worker scope
+        [void]$ps.AddScript($script:PvErrFn)        # define Get-WkError in the worker scope
+        [void]$ps.AddScript((Get-ArcNodeFns))       # define the node helpers the worker flattens with
         [void]$ps.AddScript($script:ArcExpandScript).
             AddArgument($rec.Key).AddArgument($rec.Uri).AddArgument($rec.Body).
             AddArgument($rec.Headers).AddArgument($rec.Ua).AddArgument($script:ArcFetch).AddArgument($script:Alert)
@@ -911,50 +999,51 @@ function Receive-ArcExpand {
     $script:ArcJobs = $still
 }
 
-# Flatten a (possibly nested) treebrowser node list to its file entries: folders are
-# recursed; sub-archives can't be listed so they're emitted as plain file entries.
-function Get-ArcFlatEntries($nodes, $acc) {
+# Single recursive pass over a (possibly nested) treebrowser node list -> this archive's index
+# entry records: folders are recursed; non-folder nodes (incl. unlistable sub-archives) become file
+# entries. One pass, no intermediate flat-node list. At 3M scale it deliberately does NOT accumulate
+# into a session-wide list or warm $MetaCache per entry - a full walk would make both unbounded.
+# Used by manual browsing (Save-BrowsedArchive), which holds the whole tree on the main thread; the
+# BACKGROUND expansion now flattens inside its worker (ArcExpandScript) and Complete-ArcExpand just
+# persists those compact records.
+function Build-ArcIndexEntries([string]$repo, [string]$archDir, [string]$archName, $nodes) {
+    $entries = [Collections.Generic.List[object]]::new()
+    Add-ArcEntriesFromNodes $repo $archDir $archName $nodes $entries
+    return ,$entries   # comma-wrap so an EMPTY list isn't unrolled to $null on return
+}
+function Add-ArcEntriesFromNodes([string]$repo, [string]$archDir, [string]$archName, $nodes, $acc) {
     foreach ($n in @($nodes)) {
         if ($null -eq $n) { continue }
-        if (Get-NodeIsFolder $n) { Get-ArcFlatEntries (Get-NodeChildren $n) $acc }
-        else { $acc.Add($n) }
-    }
-}
-
-# Build a per-archive in-memory record list from the flattened archive nodes (deriving
-# EntryUrl via the helper so it matches the reload form). Returns just THIS archive's entries
-# (for matching + persisting). At 3M scale it deliberately does NOT accumulate into a
-# session-wide list or warm $MetaCache for every entry - a full walk would make both
-# unbounded. Match rows carry their own size/modified (New-ArcResultItem) and the tree view
-# reads back from the shard, so neither is needed. Shared by the background walk
-# (Complete-ArcExpand) and manual browsing (Save-BrowsedArchive).
-function Build-ArcIndexEntries([string]$repo, [string]$archDir, [string]$archName, $flatNodes) {
-    $entries = [Collections.Generic.List[object]]::new()
-    foreach ($n in @($flatNodes)) {
+        if (Get-NodeIsFolder $n) { Add-ArcEntriesFromNodes $repo $archDir $archName (Get-NodeChildren $n) $acc; continue }
         $internalPath = Get-NodeInternalPath $n
         if (-not $internalPath) { continue }
         $info = Get-NodeInfo $n
         $sz   = -1; $mod = ''
         if ($info -and $info.PSObject.Properties['size']) { try { $sz = [long]$info.size } catch { $sz = -1 } }
         if ($info -and $info.PSObject.Properties['modificationTime'] -and "$($info.modificationTime)" -ne '') { $mod = Format-Epoch $info.modificationTime }
-        $entries.Add((New-ArcIndexEntry $repo $archDir $archName $internalPath $sz $mod))
+        $acc.Add((New-ArcIndexEntry $repo $archDir $archName $internalPath $sz $mod))
     }
-    return ,$entries   # comma-wrap so an EMPTY list isn't unrolled to $null on return
 }
 
-# Process a finished expansion: flatten its tree, build/warm an index record per entry, add
-# matches for the live query, persist the archive group, and mark it indexed. A failed
-# expansion is left attempted-but-unindexed (not persisted).
+# Process a finished expansion (C). The worker already flattened the tree to compact
+# {InternalPath;Size;Modified} entries, so the bulky tree never reaches the main thread. Persist the
+# archive group and mark it indexed. ONLY when a live query is set (interactive arc-search) do we
+# build full result records to test name matches; the headless index build has no query, so it skips
+# straight to persisting. A failed expansion is left attempted-but-unindexed (not persisted).
 function Complete-ArcExpand($rec) {
     $key = [string]$rec.Key
     $res = $null
     if ($script:ArcFetch.ContainsKey($key)) { $res = $script:ArcFetch[$key]; [void]$script:ArcFetch.Remove($key) }
     if ($null -eq $res -or -not $res.Ok) { $script:ArcSearchDirty = $true; return }
 
-    $flat = [Collections.Generic.List[object]]::new()
-    Get-ArcFlatEntries $res.Nodes $flat
-    $entries = Build-ArcIndexEntries $rec.ArcRepo $rec.ArcPath $rec.ArcName $flat
-    foreach ($e in $entries) { if (Test-ArcNameMatches ([string]$e.Name)) { [void](Add-ArcSearchMatch $e) } }
+    $entries = @($res.Entries)
+    if ($script:ArcSearchQuery) {
+        foreach ($t in $entries) {
+            if ($null -eq $t) { continue }
+            $e = New-ArcIndexEntry $rec.ArcRepo $rec.ArcPath $rec.ArcName ([string]$t.InternalPath) $t.Size ([string]$t.Modified)
+            if (Test-ArcNameMatches ([string]$e.Name)) { [void](Add-ArcSearchMatch $e) }
+        }
+    }
     [void]$script:ArcIndexedArchives.Add($key)
     Save-IndexArchive $rec.ArcRepo $rec.ArcPath $rec.ArcName $entries
     $script:ArcSearchDirty = $true
@@ -971,9 +1060,7 @@ function Save-BrowsedArchive([object]$item, $nodes) {
     $archPath = Get-ArcArchivePath $archDir $archName
     $canon = Get-ArcArchiveUri $repo $archPath
     if ($script:ArcIndexedArchives.Contains($canon) -or -not $script:ArcAttempted.Add($canon)) { return }
-    $flat = [Collections.Generic.List[object]]::new()
-    Get-ArcFlatEntries $nodes $flat
-    $entries = Build-ArcIndexEntries $repo $archDir $archName $flat
+    $entries = Build-ArcIndexEntries $repo $archDir $archName $nodes
     [void]$script:ArcIndexedArchives.Add($canon)
     Save-IndexArchive $repo $archDir $archName $entries
 }
@@ -1149,46 +1236,101 @@ function Reset-ArcSearch {
 # both. Location mode skips the walk and seeds jobs straight from a search's result items.
 # Mirrors the arc-search engine's runspace/throttle patterns; reuses Get-ArcSearchWalkRepos.
 
-# DFS over /api/storage/<repo>/<path> emitting the storage uri of every FILE (folders are
-# pushed; leaves emitted). Mirrors the audit/arc walkers but filters nothing. Back-pressure:
-# pause while the output buffer is full so a huge instance can't balloon memory.
+# PARALLEL DEPTH-FIRST walk over /api/storage/<repo>/<path> emitting the storage uri of every FILE
+# (A). Multiple of these run concurrently, sharing one ConcurrentStack of folders + a single-element
+# int[] active-counter, so discovery is no longer the serial bottleneck that starves the metadata
+# workers. A STACK (LIFO = depth-first, like the original serial walk) is deliberate: it dives to
+# file-rich leaves fast and keeps the in-memory frontier small - a FIFO queue would enumerate an
+# entire wide top layer (e.g. a Maven group root's 1000+ dirs) before surfacing any file AND let the
+# frontier balloon. Each walker: claim a slot (Increment active BEFORE pop), GET the folder, push
+# child folders + emit child files, release the slot. Termination is collective: a walker that finds
+# the stack empty AND active==0 (nobody else holds a folder that could push children) exits.
+# Increment-before-pop makes that test race-free - a walker about to take work is always counted, so
+# active==0 truly means no more folders can appear. Back-pressure: pause while the output buffer is
+# full so a huge instance can't balloon memory.
 $script:IndexWalkScript = {
-    param($artBase, $headers, $repos, $out, $cancel, $paceMs, $maxPending)
-    $stack = New-Object 'System.Collections.Generic.Stack[object]'
-    foreach ($r in $repos) { $stack.Push([PSCustomObject]@{ Repo = $r; Rel = '' }) }
-    while ($stack.Count -gt 0) {
+    param($artBase, $headers, $folderStack, $out, $cancel, $active, $paceMs, $maxPending)
+    # $active is a synchronized hashtable { n } used as a shared atomic counter via Monitor on its
+    # SyncRoot. NOTE: do NOT use [Interlocked]::Increment([ref]$arr[0]) here - PowerShell boxes a COPY
+    # of an array element for [ref], so Interlocked silently updates the copy and the real counter
+    # never moves (which made every walker but one exit instantly - a near-serial walk). Monitor on a
+    # synchronized hashtable is the working cross-runspace primitive used elsewhere in this file.
+    $lock = $active.SyncRoot
+    while ($true) {
         if ($cancel.stop) { break }
-        $node = $stack.Pop()
-        $uri  = "$artBase/api/storage/$($node.Repo)$($node.Rel)"
+        [System.Threading.Monitor]::Enter($lock); $active.n++; [System.Threading.Monitor]::Exit($lock)   # claim a slot before pop (race-free)
+        $node = $null
+        if (-not $folderStack.TryPop([ref]$node)) {
+            [System.Threading.Monitor]::Enter($lock); $active.n--; $a = $active.n; [System.Threading.Monitor]::Exit($lock)
+            # Stack empty right now: if no walker holds a slot, no more children can appear -> done.
+            if ($a -eq 0 -and $folderStack.IsEmpty) { break }
+            Start-Sleep -Milliseconds 10
+            continue
+        }
         try {
-            $info = Invoke-RestMethod -Uri $uri -Headers $headers -ErrorAction Stop
-            if ($info.PSObject.Properties['children'] -and $info.children) {
-                foreach ($c in @($info.children)) {
-                    if ($null -eq $c) { continue }
-                    $childRel = "$($node.Rel)$($c.uri)"
-                    if ([bool]$c.folder) { $stack.Push([PSCustomObject]@{ Repo = $node.Repo; Rel = $childRel }) }
-                    else {
-                        while (-not $cancel.stop -and $out.Count -ge $maxPending) { Start-Sleep -Milliseconds 100 }
-                        $out.Add("$artBase/api/storage/$($node.Repo)$childRel")
+            $uri = "$artBase/api/storage/$($node.Repo)$($node.Rel)"
+            try {
+                $info = Invoke-RestMethod -Uri $uri -Headers $headers -ErrorAction Stop
+                if ($info.PSObject.Properties['children'] -and $info.children) {
+                    foreach ($c in @($info.children)) {
+                        if ($null -eq $c) { continue }
+                        $childRel = "$($node.Rel)$($c.uri)"
+                        if ([bool]$c.folder) { $folderStack.Push([PSCustomObject]@{ Repo = $node.Repo; Rel = $childRel }) }
+                        else {
+                            while (-not $cancel.stop -and $out.Count -ge $maxPending) { Start-Sleep -Milliseconds 100 }
+                            [void]$out.Add("$artBase/api/storage/$($node.Repo)$childRel")
+                        }
                     }
                 }
-            }
-        } catch { }   # denied/unreadable folders are skipped silently
+            } catch { }   # denied/unreadable folders are skipped silently
+        } finally { [System.Threading.Monitor]::Enter($lock); $active.n--; [System.Threading.Monitor]::Exit($lock) }
         if ($paceMs -gt 0) { Start-Sleep -Milliseconds $paceMs }
     }
 }
 
-# Per-file metadata worker: GET the storage record, return size + lastModified (no checksums -
-# the index stores no hash). Result lands in the synchronized $cache keyed by uri.
-$script:IdxMetaScript = {
-    param($uri, $headers, $cache)
-    try {
-        $info = Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 60 -ErrorAction Stop
-        $sz = ''; $mod = ''
-        if ($info.PSObject.Properties['size'])         { $sz  = $info.size }
-        if ($info.PSObject.Properties['lastModified']) { $mod = "$($info.lastModified)" }
-        $cache[$uri] = [PSCustomObject]@{ Ok = $true; Size = $sz; Modified = $mod }
-    } catch { $cache[$uri] = [PSCustomObject]@{ Ok = $false; Size = ''; Modified = '' } }
+# Metadata worker LOOP (E): runs for the whole build in its own runspace. Pulls a uri from the
+# input queue, GETs its /api/storage record (size + lastModified; no checksums - the index stores
+# no hash), pushes a {Uri;Ok;Size;Modified} record to the output queue, repeats until Cancel. It
+# idle-parks while its ordinal is >= the live Target (the AIMD throttle, B). No per-file PowerShell
+# object is created/disposed - one loop replaces that churn.
+# RETRY/BACKOFF (B): a transient failure (429/503/timeout/502/504) is retried up to 3x with jittered
+# exponential backoff instead of dropping the file - the old single-try path silently lost a file on
+# any blip, which got worse the harder we push concurrency. A 429/503 also stamps $ctl.LastThrottle
+# so the main-thread AIMD controller (Step-IdxAimd) can back the Target down. Non-transient errors
+# (404/403/...) fail fast - retrying them is pointless.
+$script:IdxMetaWorkerScript = {
+    param($inQ, $outQ, $ctl, $headers, $ordinal)
+    while (-not $ctl.Cancel) {
+        if ($ordinal -ge [int]$ctl.Target) { Start-Sleep -Milliseconds 25; continue }   # parked above target
+        $uri = $null
+        if (-not $inQ.TryDequeue([ref]$uri)) { Start-Sleep -Milliseconds 15; continue }  # input empty: wait
+        $attempt = 0
+        while ($true) {
+            try {
+                $info = Invoke-RestMethod -Uri ([string]$uri) -Headers $headers -TimeoutSec 60 -ErrorAction Stop
+                $sz = ''; $mod = ''
+                if ($info.PSObject.Properties['size'])         { $sz  = $info.size }
+                if ($info.PSObject.Properties['lastModified']) { $mod = "$($info.lastModified)" }
+                $outQ.Enqueue([PSCustomObject]@{ Uri = [string]$uri; Ok = $true; Size = $sz; Modified = $mod })
+                break
+            } catch {
+                $code = 0
+                try { if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } } catch { }
+                $throttle  = ($code -eq 429 -or $code -eq 503)
+                $transient = ($throttle -or $code -eq 0 -or $code -eq 502 -or $code -eq 504)   # 0 = timeout / conn reset
+                if ($throttle) { $ctl.LastThrottle = [DateTime]::UtcNow }   # signal the AIMD controller
+                if ($transient -and $attempt -lt 3) {
+                    $attempt++
+                    Start-Sleep -Milliseconds ([int]([Math]::Pow(2, $attempt) * 150) + (Get-Random -Minimum 0 -Maximum 250))
+                    continue
+                }
+                $outQ.Enqueue([PSCustomObject]@{ Uri = [string]$uri; Ok = $false; Size = ''; Modified = '' })
+                break
+            }
+        }
+        $d = [int]$ctl.Delay
+        if ($d -gt 0) { Start-Sleep -Milliseconds $d }
+    }
 }
 
 # == INDEX-BUILD STATE =========================================================
@@ -1197,17 +1339,44 @@ $script:IdxBuildArchives = $false # also expand+index listable archives
 $script:IdxEnq  = 0               # files dispatched for metadata
 $script:IdxDone = 0               # files persisted (or failed)
 $script:IdxSeen = New-Object 'System.Collections.Generic.HashSet[string]'  # uris dispatched this run (intra-run dedupe)
+$script:IdxResume  = $false       # (F) --resume: skip the metadata GET for files already in the shards
+$script:IdxSkipped = 0            # files skipped this run because they were already indexed (resume)
 
-$script:IdxWalkPS = $null; $script:IdxWalkHandle = $null; $script:IdxWalkCancel = $null
+# Parallel discovery walk (A): a pool of $IdxWalkConcurrency walker runspaces share $IdxWalkFolderStack
+# (a ConcurrentStack of {Repo;Rel} folders, seeded with repo roots - LIFO for depth-first descent)
+# and $IdxWalkActive (a synchronized hashtable { n } used as a Monitor-guarded atomic active-walker
+# counter for collective termination). $IdxWalkers holds the {PS;Handle} of each. $IdxWalkOut is the
+# bounded output buffer the main thread drains (Step-IndexWalk).
+$script:IdxWalkConcurrency = 8    # aggressive default; overridden by --walkers
+$script:IdxWalkPool   = $null
+$script:IdxWalkers    = [Collections.Generic.List[object]]::new()
+$script:IdxWalkCancel = $null
+$script:IdxWalkFolderStack = $null
+$script:IdxWalkActive  = $null
 $script:IdxWalkOut = $null; $script:IdxWalkReap = [Collections.Generic.List[object]]::new()
 
-$script:IdxMetaQueue = [Collections.Generic.Queue[object]]::new()
+# Worker-loop metadata pool (E): a FIXED set of long-lived runspaces pull file uris from a shared
+# ConcurrentQueue (input) and push {Uri;Ok;Size;Modified} records to another (output). The main
+# thread feeds input (Add-IndexFile) and drains output (Drain-IdxMeta), writing the rows itself so
+# shard appends stay serialized. $IdxCtl is the shared control block every worker reads each loop:
+#   Cancel - stop the loops; Target - how many workers may be active (the AIMD throttle knob, B);
+#   Delay  - per-request politeness sleep (ms). This replaces the old per-file [PowerShell]::Create()
+#   /BeginInvoke/EndInvoke/Dispose churn (one object per file) with N loops that run for the build.
+$script:IdxMetaQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()   # input: file uris
+$script:IdxOutQueue  = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()   # output: result records
+$script:IdxCtl       = [hashtable]::Synchronized(@{ Cancel = $false; Target = 0; Delay = 0; LastThrottle = [DateTime]::MinValue })
 $script:IdxMetaPool  = $null
-$script:IdxMetaJobs  = [Collections.Generic.List[object]]::new()
-$script:IdxMetaFetch = [hashtable]::Synchronized(@{})
-$script:IdxThrottle  = @{ MaxConcurrent = 10; MinIntervalMs = 0 }   # default 10 metadata workers
-$script:IdxLastLaunch = [DateTime]::MinValue
+$script:IdxWorkers   = [Collections.Generic.List[object]]::new()   # the long-lived worker {PS;Handle}
+$script:IdxThrottle  = @{ MaxConcurrent = 32; MinIntervalMs = 0 }   # aggressive default: 32 metadata workers
 $script:IdxMaxWorkers = 100   # ceiling for --workers / the metadata runspace pool
+# AIMD adaptive throttle (B): the main thread nudges $IdxCtl.Target (active worker count) - halving
+# it when a worker reports a 429/503 (multiplicative decrease) and creeping it back toward the full
+# pool after a quiet spell (additive increase). Lets the aggressive defaults run hot but yield fast
+# if the server pushes back, instead of hammering it. Workers above Target idle-park (they aren't
+# destroyed), so this is just moving a number.
+$script:IdxAimdMaxTarget  = 0                   # pool size = Target ceiling; set in Start-IdxMetaPool
+$script:IdxAimdReactedTo  = [DateTime]::MinValue # the LastThrottle stamp we've already reacted to
+$script:IdxAimdLastChange = [DateTime]::MinValue # rate-limits how often AIMD adjusts
 # Back-pressure cap: when the metadata queue OR the archive-expansion queue reaches this, the
 # walk drain pauses so the walk's own bounded buffer fills and the walker sleeps. Without this
 # the storage walk (fast: folder GETs) outruns the per-file metadata + archive-tree workers
@@ -1215,21 +1384,32 @@ $script:IdxMaxWorkers = 100   # ceiling for --workers / the metadata runspace po
 # bound, ballooning memory on a large instance.
 $script:IdxQueueCap  = 8000
 
-# Launch the file walk over the in-scope repos (an explicit -Repos list, else non-virtual
-# repo keys - same selection as the arc walk). Returns $false when there's nothing to walk.
+# Launch the PARALLEL file walk over the in-scope repos (an explicit -Repos list, else non-virtual
+# repo keys - same selection as the arc walk). A pool of $IdxWalkConcurrency walker runspaces share
+# one folder queue (seeded with repo roots) + the atomic active-counter. Returns $false when there's
+# nothing to walk.
 function Start-IndexWalk {
     Stop-IndexWalk
     $repos = Get-ArcSearchWalkRepos
     if (@($repos).Count -eq 0) { return $false }
-    $script:IdxWalkOut = [Collections.ArrayList]::Synchronized([Collections.ArrayList]::new())
-    $cancel = [hashtable]::Synchronized(@{ stop = $false })
-    $ps = [PowerShell]::Create()
-    [void]$ps.AddScript($script:IndexWalkScript).
-        AddArgument((Get-ArtBase)).AddArgument((Get-AuthHeaders)).AddArgument(@($repos)).
-        AddArgument($script:IdxWalkOut).AddArgument($cancel).AddArgument(0).AddArgument(5000)
-    $script:IdxWalkCancel = $cancel
-    $script:IdxWalkPS     = $ps
-    $script:IdxWalkHandle = $ps.BeginInvoke()
+    $k = [Math]::Max(1, [int]$script:IdxWalkConcurrency)
+    $script:IdxWalkOut    = [Collections.ArrayList]::Synchronized([Collections.ArrayList]::new())
+    $script:IdxWalkCancel = [hashtable]::Synchronized(@{ stop = $false })
+    $script:IdxWalkFolderStack = [System.Collections.Concurrent.ConcurrentStack[object]]::new()
+    foreach ($r in @($repos)) { $script:IdxWalkFolderStack.Push([PSCustomObject]@{ Repo = $r; Rel = '' }) }
+    $script:IdxWalkActive = [hashtable]::Synchronized(@{ n = 0 })   # atomic active-walker counter (Monitor-guarded)
+    $script:IdxWalkPool = [RunspaceFactory]::CreateRunspacePool($k, $k)
+    $script:IdxWalkPool.Open()
+    $artBase = Get-ArtBase; $headers = Get-AuthHeaders
+    for ($i = 0; $i -lt $k; $i++) {
+        $ps = [PowerShell]::Create()
+        $ps.RunspacePool = $script:IdxWalkPool
+        [void]$ps.AddScript($script:IndexWalkScript).
+            AddArgument($artBase).AddArgument($headers).AddArgument($script:IdxWalkFolderStack).
+            AddArgument($script:IdxWalkOut).AddArgument($script:IdxWalkCancel).
+            AddArgument($script:IdxWalkActive).AddArgument(0).AddArgument(5000)
+        $script:IdxWalkers.Add([PSCustomObject]@{ PS = $ps; Handle = $ps.BeginInvoke() })
+    }
     return $true
 }
 
@@ -1237,7 +1417,19 @@ function Start-IndexWalk {
 # archive-indexing is on, ALSO enqueue an arc expansion (the reused engine indexes its entries).
 function Add-IndexFile([string]$uri) {
     if (-not $uri -or -not $script:IdxSeen.Add($uri)) { return }
-    $script:IdxMetaQueue.Enqueue($uri)
+    # Resume (F): if this file's row is already in its repo shard (from a prior run), skip the
+    # metadata GET - the expensive part. We still fall through to archive routing below, because the
+    # archive's INTERNAL entries may not have been expanded yet (Add-ArcExpandJob has its own skip-set).
+    $skipMeta = $false
+    if ($script:IdxResume) {
+        $it = Convert-UriToItem $uri
+        $rk = Get-IndexRelKey ([string]$it.Path) ([string]$it.Name)
+        if ((Get-RepoIndexTable ([string]$it.Repo)).ContainsKey($rk)) { $skipMeta = $true; $script:IdxSkipped++ }
+    }
+    if (-not $skipMeta) {
+        $script:IdxMetaQueue.Enqueue($uri)
+        $script:IdxEnq++   # counted as it enters the input queue; completion is IdxEnq == IdxDone (all drained)
+    }
     if ($script:IdxBuildArchives) {
         $nm  = ($uri -split '/')[-1]
         $dot = $nm.LastIndexOf('.')
@@ -1289,73 +1481,103 @@ function Receive-IndexWalk {
 }
 
 function Test-IndexWalkActive {
-    $running = ($null -ne $script:IdxWalkHandle -and -not $script:IdxWalkHandle.IsCompleted)
+    $running = $false
+    foreach ($w in $script:IdxWalkers) { if (-not $w.Handle.IsCompleted) { $running = $true; break } }
     $pending = ($null -ne $script:IdxWalkOut -and $script:IdxWalkOut.Count -gt 0)
     return ($running -or $pending)
 }
 
 function Stop-IndexWalk {
     if ($script:IdxWalkCancel) { $script:IdxWalkCancel.stop = $true }
-    if ($script:IdxWalkPS) { $script:IdxWalkReap.Add([PSCustomObject]@{ PS=$script:IdxWalkPS; Handle=$script:IdxWalkHandle }) }
-    $script:IdxWalkPS = $null; $script:IdxWalkHandle = $null; $script:IdxWalkCancel = $null; $script:IdxWalkOut = $null
+    foreach ($w in $script:IdxWalkers) {
+        try { [void]$w.PS.Stop() } catch { }
+        try { $w.PS.Dispose() }    catch { }
+    }
+    $script:IdxWalkers.Clear()
+    if ($script:IdxWalkPool) {
+        try { $script:IdxWalkPool.Close() }   catch { }
+        try { $script:IdxWalkPool.Dispose() } catch { }
+        $script:IdxWalkPool = $null
+    }
+    $script:IdxWalkCancel = $null; $script:IdxWalkOut = $null
+    $script:IdxWalkFolderStack = $null; $script:IdxWalkActive = $null
     Receive-IndexWalk
 }
 
-# Throttled dispatch of metadata-fetch jobs onto a runspace pool (mirrors Dispatch-ArcExpand).
-function Dispatch-IdxMeta {
-    $maxc = [Math]::Max(1, [Math]::Min($script:IdxMaxWorkers, [int]$script:IdxThrottle.MaxConcurrent))
-    $iv   = [int]$script:IdxThrottle.MinIntervalMs
-    while ($script:IdxMetaJobs.Count -lt $maxc -and $script:IdxMetaQueue.Count -gt 0) {
-        if ($iv -gt 0 -and ([DateTime]::UtcNow - $script:IdxLastLaunch).TotalMilliseconds -lt $iv) { break }
-        $uri = $script:IdxMetaQueue.Dequeue()
-        if ($null -eq $script:IdxMetaPool) {
-            $script:IdxMetaPool = [RunspaceFactory]::CreateRunspacePool(1, $script:IdxMaxWorkers)
-            $script:IdxMetaPool.Open()
-        }
+# Launch the fixed worker-loop pool once at build start. N = the configured concurrency (--workers,
+# capped at $IdxMaxWorkers); Target starts at N (all active) and AIMD (B) lowers it under throttling.
+# The workers live until Stop-IndexBuild. Mirrors nothing per-tick - the pump just feeds + drains.
+function Start-IdxMetaPool {
+    $n = [Math]::Max(1, [Math]::Min($script:IdxMaxWorkers, [int]$script:IdxThrottle.MaxConcurrent))
+    $script:IdxCtl.Cancel = $false
+    $script:IdxCtl.Target = $n
+    $script:IdxCtl.Delay  = [Math]::Max(0, [int]$script:IdxThrottle.MinIntervalMs)
+    $script:IdxCtl.LastThrottle = [DateTime]::MinValue
+    $script:IdxAimdMaxTarget  = $n   # AIMD may lower Target to 1 and ramp it back up to here
+    $script:IdxAimdReactedTo  = [DateTime]::MinValue
+    $script:IdxAimdLastChange = [DateTime]::MinValue
+    if ($null -eq $script:IdxMetaPool) {
+        $script:IdxMetaPool = [RunspaceFactory]::CreateRunspacePool($n, $n)
+        $script:IdxMetaPool.Open()
+    }
+    $headers = Get-AuthHeaders
+    for ($i = 0; $i -lt $n; $i++) {
         $ps = [PowerShell]::Create()
         $ps.RunspacePool = $script:IdxMetaPool
-        [void]$ps.AddScript($script:IdxMetaScript).
-            AddArgument($uri).AddArgument((Get-AuthHeaders)).AddArgument($script:IdxMetaFetch)
-        $script:IdxMetaJobs.Add([PSCustomObject]@{ PS=$ps; Handle=$ps.BeginInvoke(); Uri=$uri })
-        $script:IdxEnq++
-        $script:IdxLastLaunch = [DateTime]::UtcNow
-        if ($iv -gt 0) { break }   # paced: one launch per tick
+        [void]$ps.AddScript($script:IdxMetaWorkerScript).
+            AddArgument($script:IdxMetaQueue).AddArgument($script:IdxOutQueue).
+            AddArgument($script:IdxCtl).AddArgument($headers).AddArgument($i)
+        $script:IdxWorkers.Add([PSCustomObject]@{ PS = $ps; Handle = $ps.BeginInvoke() })
     }
 }
 
-# Reap finished metadata fetches and persist each as a top-level shard row.
-function Receive-IdxMeta {
-    if ($script:IdxMetaJobs.Count -eq 0) { return }
-    $still = [Collections.Generic.List[object]]::new()
-    foreach ($j in $script:IdxMetaJobs) {
-        if ($j.Handle.IsCompleted) {
-            try { [void]$j.PS.EndInvoke($j.Handle) } catch { }
-            try { $j.PS.Dispose() } catch { }
-            $uri = [string]$j.Uri
-            $res = $null
-            if ($script:IdxMetaFetch.ContainsKey($uri)) { $res = $script:IdxMetaFetch[$uri]; [void]$script:IdxMetaFetch.Remove($uri) }
-            if ($res -and $res.Ok) {
-                $it = Convert-UriToItem $uri
-                [void](Write-IndexArtifactRow ([string]$it.Repo) ([string]$it.Path) ([string]$it.Name) $res.Size ([string]$res.Modified))
-            }
-            $script:IdxDone++
-        } else { $still.Add($j) }
+# Drain finished metadata results (bounded per tick so the pump stays responsive) and persist each
+# as a top-level shard row. Runs on the main thread, so shard appends stay serialized.
+function Drain-IdxMeta {
+    $res = $null
+    $n = 0
+    while ($n -lt 2000 -and $script:IdxOutQueue.TryDequeue([ref]$res)) {
+        if ($res -and $res.Ok) {
+            $it = Convert-UriToItem ([string]$res.Uri)
+            [void](Write-IndexArtifactRow ([string]$it.Repo) ([string]$it.Path) ([string]$it.Name) $res.Size ([string]$res.Modified))
+        }
+        $script:IdxDone++
+        $n++
     }
-    $script:IdxMetaJobs = $still
 }
 
 # One engine tick: reap + dispatch metadata fetches and (reused) archive expansions, extend
 # the walk, and detect completion. Safe to call in a tight loop; cheap when idle.
+# AIMD controller (B): runs on the main thread, ~once/0.75s. Halves Target on a fresh 429/503 signal
+# (multiplicative decrease); after ~8s with no throttle, creeps Target back up by 1 toward the full
+# pool (additive increase). Cheap and idempotent; safe to call every pump tick.
+function Step-IdxAimd {
+    $now = [DateTime]::UtcNow
+    if (($now - $script:IdxAimdLastChange).TotalMilliseconds -lt 750) { return }   # at most ~once/0.75s
+    $lt  = [DateTime]$script:IdxCtl.LastThrottle
+    $cur = [int]$script:IdxCtl.Target
+    if ($lt -gt $script:IdxAimdReactedTo) {
+        $script:IdxCtl.Target    = [Math]::Max(1, [int][Math]::Floor($cur / 2.0))
+        $script:IdxAimdReactedTo = $lt
+        $script:IdxAimdLastChange = $now
+    } elseif (($now - $lt).TotalSeconds -ge 8 -and $cur -lt $script:IdxAimdMaxTarget) {
+        $script:IdxCtl.Target     = [Math]::Min($script:IdxAimdMaxTarget, $cur + 1)
+        $script:IdxAimdLastChange = $now
+    }
+}
+
 function Invoke-IndexBuildPump {
     if ($script:IdxBuildState -ne 'building') { return }
-    Receive-IdxMeta
     if ($script:IdxBuildArchives) { Receive-ArcExpand }
-    Step-IndexWalk
-    Dispatch-IdxMeta
+    Step-IndexWalk        # feeds the input queue via Add-IndexFile (back-pressured)
+    Drain-IdxMeta         # drains worker results -> shard rows
+    Step-IdxAimd          # adjust worker concurrency to server pushback
     if ($script:IdxBuildArchives) { Dispatch-ArcExpand }
     $arcBusy = $script:IdxBuildArchives -and ($script:ArcQueue.Count -gt 0 -or $script:ArcJobs.Count -gt 0)
+    # Done when: no more discovery, input queue empty, every fed file has produced+drained a result
+    # (IdxEnq counted at enqueue, IdxDone at drain), and the archive tail is idle.
     if (-not (Test-IndexWalkActive) -and $script:IdxMetaQueue.Count -eq 0 -and
-        $script:IdxMetaJobs.Count -eq 0 -and -not $arcBusy) {
+        $script:IdxEnq -eq $script:IdxDone -and -not $arcBusy) {
         $script:IdxBuildState = 'done'
     }
 }
@@ -1364,12 +1586,16 @@ function Invoke-IndexBuildPump {
 function Start-IndexBuild([bool]$full, [bool]$archives, $items) {
     Stop-IndexBuild
     $script:IdxBuildArchives = $archives
-    $script:IdxEnq = 0; $script:IdxDone = 0
+    $script:IdxEnq = 0; $script:IdxDone = 0; $script:IdxSkipped = 0
     $script:IdxSeen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $script:IdxMetaQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+    $script:IdxOutQueue  = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+    $script:ShardWriteBuf = @{}; $script:ShardWriteBufRows = @{}; $script:IndexWriteBuffered = $true   # buffer writes (D)
     if ($archives) { Ensure-ArcIndexedLoaded }   # skip archives already indexed in a prior run
     $script:IdxBuildState = 'building'
+    Start-IdxMetaPool   # launch the fixed worker-loop pool (full + location both feed it)
     if ($full) {
-        if (-not (Start-IndexWalk)) { $script:IdxBuildState = 'done'; return $false }
+        if (-not (Start-IndexWalk)) { $script:IdxBuildState = 'done'; Stop-IndexBuild; return $false }
     } else {
         Add-IndexItems $items
     }
@@ -1380,18 +1606,22 @@ function Start-IndexBuild([bool]$full, [bool]$archives, $items) {
 # pool. Index caches (skip-set etc.) are left intact.
 function Stop-IndexBuild {
     Stop-IndexWalk
-    foreach ($j in $script:IdxMetaJobs) {
-        try { [void]$j.PS.Stop() } catch { }
-        try { $j.PS.Dispose() }    catch { }
+    $script:IdxCtl.Cancel = $true   # signal the worker loops to exit
+    foreach ($w in $script:IdxWorkers) {
+        try { [void]$w.PS.Stop() } catch { }   # Stop() (not EndInvoke) so a worker mid-GET can't wedge us
+        try { $w.PS.Dispose() }    catch { }
     }
-    $script:IdxMetaJobs.Clear()
-    $script:IdxMetaQueue.Clear()
-    $script:IdxMetaFetch.Clear()
+    $script:IdxWorkers.Clear()
     if ($script:IdxMetaPool) {
         try { $script:IdxMetaPool.Close() }   catch { }
         try { $script:IdxMetaPool.Dispose() } catch { }
         $script:IdxMetaPool = $null
     }
+    # Fresh queues for the next build (ConcurrentQueue has no Clear() on .NET Framework).
+    $script:IdxMetaQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+    $script:IdxOutQueue  = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+    Flush-IndexWrites                      # (D) persist any buffered top-level rows before we stop
+    $script:IndexWriteBuffered = $false    # the TUI write-through (if any) goes back to immediate writes
     if ($script:IdxBuildArchives) { Stop-ArcSearch }   # clean the reused arc-expansion pool
     if ($script:IdxBuildState -eq 'building') { $script:IdxBuildState = 'idle' }
 }

@@ -12,6 +12,14 @@
     /api/storage GET for size + lastModified. With -a/--archives it ALSO expands listable
     archives and indexes their internal entries (the same engine the [w] walk uses).
 
+    Throughput: the walk runs as a POOL of --walkers discovery runspaces (parallel depth-first
+    over a shared folder stack) feeding a POOL of --workers long-lived metadata-fetch loops; both
+    are governed by an AIMD adaptive throttle that backs off on HTTP 429/503 and retries transient
+    failures, so the aggressive defaults run hot but never hammer a server. --resume skips files
+    already in the shards to finish an interrupted build. (Request COUNT is fixed - one GET per
+    folder + one per file; the only batch alternative, ?list/AQL, needs a privileged Pro account
+    and is unavailable anonymously - so the speedup is from safe concurrency, not fewer requests.)
+
     Scope (one of):
       -F, --full              index the entire instance
       -q, --query <name>      index the results of this artifact-name quick-search
@@ -29,9 +37,10 @@
       -F/--full           -Full           -q/--query <name>    -Query
       -a/--archives       -Archives       -r/--repos <list>    -Repos
       --all-versions      -AllVersions    (default: skip duplicate archive versions)
+      --resume            -Resume         (skip files already in the shards; no stale refresh)
       --index <dir>       -IndexPath      --workers <1-100>    -Workers
-      --arc-workers <1-10> -ArcWorkers    --delay <ms>         -DelayMs
-      -v/--verbose <0-5>  -Verbosity
+      --walkers <1-32>    -Walkers        --arc-workers <1-20> -ArcWorkers
+      --delay <ms>        -DelayMs        -v/--verbose <0-5>   -Verbosity
       -u/--base-url <url> -BaseUrl        -t/--token <tok>     -Token
       -k/--api-key <key>  -ApiKey         -b/--basic <u:p>     -Basic
 
@@ -49,7 +58,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # Allow many concurrent connections and ensure TLS 1.2 (matches the other launchers).
-[Net.ServicePointManager]::DefaultConnectionLimit = 64
+[Net.ServicePointManager]::DefaultConnectionLimit = 256   # high enough for the aggressive worker + walker pools
 [Net.ServicePointManager]::SecurityProtocol =
     [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -103,9 +112,11 @@ function ConvertFrom-IndexArgv([string[]]$tokens) {
             '^(-a|--archives)$'  { $p.Archives  = $true }
             '^--all-versions$'   { $p.AllVersions = $true }
             '^--skip-versions$'  { $p.AllVersions = $false }   # affirms the default (no-op)
+            '^--resume$'         { $p.Resume    = $true }
             '^(-r|--repos)$'     { $p.Repos     = $tokens[++$i] }
             '^--index$'          { $p.IndexPath = $tokens[++$i] }
             '^--workers$'        { $p.Workers    = [int]$tokens[++$i] }
+            '^--walkers$'        { $p.Walkers    = [int]$tokens[++$i] }
             '^--arc-workers$'    { $p.ArcWorkers = [int]$tokens[++$i] }
             '^--delay$'          { $p.DelayMs    = [int]$tokens[++$i] }
             '^(-v|--verbose)$'   { $p.Verbosity = [int]$tokens[++$i] }
@@ -138,11 +149,16 @@ Options:
   -a, --archives          also expand listable archives and index their internal entries
       --all-versions      expand EVERY version of an archive (default: skip - index only the
                           first version of each artifact, by version-normalized filename)
+      --resume            skip files already present in the shards (finish/extend an interrupted
+                          build). NOTE: does NOT refresh stale rows - the index is a point-in-time
+                          snapshot; --resume only adds what's missing.
       --index <dir>       local index directory to write (default ./output/<host>/index)
-      --workers <1-100>   parallel metadata-fetch workers (default 10)
-      --arc-workers <1-10> parallel archive-expansion workers (default 3; kept low - each holds
-                          a whole archive tree in memory and is processed on the main thread)
-      --delay <ms>        delay between request launches (default 0)
+      --workers <1-100>   parallel metadata-fetch workers (default 32; long-lived worker loops)
+      --walkers <1-32>    parallel storage-walk discovery runspaces (default 8; feed the workers -
+                          raise alongside --workers so discovery doesn't starve them)
+      --arc-workers <1-20> parallel archive-expansion workers (default 6)
+      --delay <ms>        per-request politeness delay (default 0; the adaptive throttle backs off
+                          automatically on 429/503)
   -v, --verbose <0-5>     0 silent · 1 summary · 2 progress · 3 milestones · 4 detail · 5 debug (default 1)
 
 Auth:
@@ -155,8 +171,8 @@ Auth:
 # ── ENTRY ─────────────────────────────────────────────────────────────────────
 function Invoke-IndexBuild {
     param(
-        [switch]$Full, [string]$Query, [switch]$Archives, [switch]$AllVersions, [string]$Repos,
-        [string]$IndexPath, [int]$Workers, [int]$ArcWorkers, [int]$DelayMs, [int]$Verbosity,
+        [switch]$Full, [string]$Query, [switch]$Archives, [switch]$AllVersions, [switch]$Resume, [string]$Repos,
+        [string]$IndexPath, [int]$Workers, [int]$Walkers, [int]$ArcWorkers, [int]$DelayMs, [int]$Verbosity,
         [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic
     )
     $O = $PSBoundParameters
@@ -186,26 +202,34 @@ function Invoke-IndexBuild {
     $script:IndexEnabled = $true     # building the index is the whole point
     Import-Index $script:IndexPath   # migrations + archive skip-set
 
-    # Throttle. --workers scales the LIGHT metadata-fetch pool. Archive expansion is NOT scaled
-    # with it: each concurrent expansion holds a whole archive tree (heavy) and is processed
-    # synchronously on the main thread, so many at once is the memory/stall hotspot - it stays
-    # at a modest fixed concurrency (its default) unless --arc-workers is given. --delay applies
-    # to both pools.
+    # Throttle. --workers scales the metadata-fetch worker loops; --walkers scales the parallel
+    # storage-walk discovery runspaces that feed them (raise together so discovery doesn't starve
+    # the workers). --arc-workers scales archive expansion (each tree is now flattened in its
+    # worker, so it's no longer the main-thread stall it once was). --delay is a per-request
+    # politeness sleep; the adaptive throttle (B) also backs all pools off on 429/503.
     if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) {
         $script:IdxThrottle.MaxConcurrent = [Math]::Max(1, [Math]::Min(100, [int]$O['Workers']))
     }
-    if ($O.ContainsKey('ArcWorkers') -and [int]$O['ArcWorkers'] -gt 0) {
-        $script:ArcThrottle.MaxConcurrent = [Math]::Max(1, [Math]::Min(10, [int]$O['ArcWorkers']))
+    if ($O.ContainsKey('Walkers') -and [int]$O['Walkers'] -gt 0) {
+        $script:IdxWalkConcurrency = [Math]::Max(1, [Math]::Min(32, [int]$O['Walkers']))
     }
+    # Build-mode arc defaults: 6 workers, no pacing - safe now the per-archive tree is flattened in
+    # the worker (not the main thread). The interactive [w] walk keeps its gentler 3/150ms defaults.
+    $script:ArcThrottle.MaxConcurrent =
+        if ($O.ContainsKey('ArcWorkers') -and [int]$O['ArcWorkers'] -gt 0) { [Math]::Max(1, [Math]::Min(20, [int]$O['ArcWorkers'])) }
+        else { 6 }
     if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) {
         $script:IdxThrottle.MinIntervalMs = [int]$O['DelayMs']; $script:ArcThrottle.MinIntervalMs = [int]$O['DelayMs']
+    } else {
+        $script:ArcThrottle.MinIntervalMs = 0
     }
+    $script:IdxResume = ($O.ContainsKey('Resume') -and [bool]$O['Resume'])   # (F) skip already-indexed files
 
     $scopeLabel = if ($full) { 'entire instance' } else { "search: $query" }
     $arcLabel   = if ($archives) { ' (+ listable archives)' } else { '' }
     Write-V 1 "Building index for $scopeLabel$arcLabel"
     Write-V 2 "  index dir: $($script:IndexPath)"
-    Write-V 5 ("  settings: archives=$archives skip-versions=$($script:ArcSkipVersions) workers=$($script:IdxThrottle.MaxConcurrent) arc-workers=$($script:ArcThrottle.MaxConcurrent) delay=$($script:IdxThrottle.MinIntervalMs)ms queue-cap=$($script:IdxQueueCap) repos='$($script:Repos)'")
+    Write-V 5 ("  settings: archives=$archives skip-versions=$($script:ArcSkipVersions) resume=$($script:IdxResume) workers=$($script:IdxThrottle.MaxConcurrent) walkers=$($script:IdxWalkConcurrency) arc-workers=$($script:ArcThrottle.MaxConcurrent) delay=$($script:IdxThrottle.MinIntervalMs)ms queue-cap=$($script:IdxQueueCap) repos='$($script:Repos)'")
 
     if ($full) {
         $walkRepos = @(Get-ArcSearchWalkRepos)
@@ -233,6 +257,7 @@ function Invoke-IndexBuild {
     $start    = [DateTime]::UtcNow
     $lastTick = [DateTime]::MinValue
     $lastGc   = [DateTime]::UtcNow
+    $lastFlush = [DateTime]::UtcNow
     $arcBase  = $script:ArcIndexedArchives.Count   # prior-run archives (skip-set); subtract for this run's archive progress
     while ($script:IdxBuildState -ne 'done') {
         Invoke-IndexBuildPump
@@ -243,6 +268,12 @@ function Invoke-IndexBuild {
         if (([DateTime]::UtcNow - $lastGc).TotalSeconds -ge 20) {
             [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
             $lastGc = [DateTime]::UtcNow
+        }
+        # Periodically flush buffered shard writes (D) so rows reach disk incrementally - a long
+        # build then survives a kill with most progress persisted (and --resume can skip it).
+        if (([DateTime]::UtcNow - $lastFlush).TotalSeconds -ge 5) {
+            Flush-IndexWrites
+            $lastFlush = [DateTime]::UtcNow
         }
         if ($script:IndexVerbosity -ge 2 -and ([DateTime]::UtcNow - $lastTick).TotalSeconds -ge 1) {
             # The headline fraction is the PER-FILE METADATA pipeline: $done = files whose
@@ -257,7 +288,9 @@ function Invoke-IndexBuild {
             # that work is tracked by the "archives=" count, not this fraction; "rows" is the index
             # rows written (top-level + every archive entry), which is why it far exceeds the file
             # count.
-            $done    = $script:IdxDone
+            # Resolved = fetched (IdxDone) + skipped-as-already-indexed (IdxSkipped, resume mode); both
+            # are counted in $denom ($IdxSeen), so the fraction only reaches 100% when we add skips back.
+            $done    = $script:IdxDone + $script:IdxSkipped
             $denom   = $script:IdxSeen.Count
             $walking = Test-IndexWalkActive
             $arcBusy = $archives -and ($script:ArcQueue.Count -gt 0 -or $script:ArcJobs.Count -gt 0)
@@ -282,9 +315,10 @@ function Invoke-IndexBuild {
             $arc  = if ($archives -and $script:IndexVerbosity -ge 4) { " | archives expanded=$($script:ArcIndexedArchives.Count)" } else { '' }
             $dbg  = if ($script:IndexVerbosity -ge 5) {
                 $aq = if ($archives) { " | arc-expand queued=$($script:ArcQueue.Count) active=$($script:ArcJobs.Count)" } else { '' }
-                "  [meta-fetch queued=$($script:IdxMetaQueue.Count) active=$($script:IdxMetaJobs.Count)$aq]"
+                "  [meta-fetch queued=$($script:IdxMetaQueue.Count) workers=$($script:IdxCtl.Target)/$($script:IdxWorkers.Count)$aq]"
             } else { '' }
-            Write-Host ("  ...metadata fetched for $done/$denom discovered files ($pct%), $($script:IndexCount) index rows$rateStr $status$arc$dbg".TrimEnd())
+            $skip = if ($script:IdxSkipped -gt 0) { " | $($script:IdxSkipped) already-indexed skipped" } else { '' }
+            Write-Host ("  ...metadata fetched for $done/$denom discovered files ($pct%), $($script:IndexCount) index rows$rateStr$skip $status$arc$dbg".TrimEnd())
             $lastTick = [DateTime]::UtcNow
         }
         Start-Sleep -Milliseconds 100
@@ -292,8 +326,9 @@ function Invoke-IndexBuild {
     Stop-IndexBuild
 
     $secs = [int]([DateTime]::UtcNow - $start).TotalSeconds
+    $skipNote = if ($script:IdxSkipped -gt 0) { " ($($script:IdxSkipped) already-indexed file(s) skipped via --resume)" } else { '' }
     Write-V 1 ''
-    Write-V 1 ("Index build complete in ${secs}s: metadata fetched for $($script:IdxDone) file(s), $($script:IndexCount) index row(s) written this run (top-level + archive entries).")
+    Write-V 1 ("Index build complete in ${secs}s: metadata fetched for $($script:IdxDone) file(s)$skipNote, $($script:IndexCount) index row(s) written this run (top-level + archive entries).")
     if ($archives) { Write-V 1 ("  archives expanded (incl. prior runs): $($script:ArcIndexedArchives.Count)") }
     Write-V 2 "  index: $($script:IndexPath)"
 }

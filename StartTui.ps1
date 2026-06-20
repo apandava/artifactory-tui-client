@@ -57,7 +57,7 @@ $ErrorActionPreference = 'Stop'
 
 # Allow many concurrent connections (default is 2/host) so the parallel detail
 # fetch isn't throttled, and ensure TLS 1.2 is available for HTTPS.
-[Net.ServicePointManager]::DefaultConnectionLimit = 64
+[Net.ServicePointManager]::DefaultConnectionLimit = 256
 [Net.ServicePointManager]::SecurityProtocol =
     [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
