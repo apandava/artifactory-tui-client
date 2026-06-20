@@ -78,6 +78,7 @@ function Restrict-Prefetch([hashtable]$Keep) {
 }
 
 function Start-Prefetch([object[]]$Items) {
+    if (Test-NetworkBlocked) { return }   # offline 'all': metadata comes only from the index warm
     if ($null -eq $Items) { return }
     Receive-Prefetch
     $headers = Get-AuthHeaders
@@ -168,6 +169,7 @@ function Stop-Lookahead {
 
 function Start-Lookahead([object[]]$Items) {
     Stop-Lookahead   # supersede any in-flight trickle
+    if (Test-NetworkBlocked) { return }   # offline 'all': no background metadata fetches
     if ($null -eq $Items) { return }
     $uris = @($Items | Where-Object { $_ -and -not $script:MetaCache.ContainsKey($_.Uri) } |
               ForEach-Object { $_.Uri })
@@ -211,38 +213,44 @@ $script:PvOrderSet = New-Object 'System.Collections.Generic.HashSet[string]'
 function Get-FilePreviewKey([string]$url) { "F|$url" }
 function Get-ArcPreviewKey([string]$uri)  { "A|$uri" }
 
-# Shared error-extraction, injected into every background worker (runspaces can't
-# see our functions). Pulls a useful message off a failed web request: the HTTP
-# status plus the server's own error body — so a blacked-out-repo 404 surfaces as
-# "HTTP 404 - The repository '...' is blacked out..." rather than a generic line.
-$script:PvErrFn = @'
-function Get-WkError($e) {
-    $code = 0
-    try { if ($e.Exception.Response) { $code = [int]$e.Exception.Response.StatusCode } } catch { }
-    # The server's response body: $e.ErrorDetails.Message holds it for failed web
-    # cmdlets (reliable even after the cmdlet consumed the stream); fall back to
-    # reading the response stream directly.
-    $bd = ''
-    try { if ($e.ErrorDetails -and $e.ErrorDetails.Message) { $bd = "$($e.ErrorDetails.Message)" } } catch { }
-    if (-not $bd) {
-        try { if ($e.Exception.Response) { $bd = [System.IO.StreamReader]::new($e.Exception.Response.GetResponseStream()).ReadToEnd() } } catch { }
+# Offline 'all' preview seeding: with the background pools disabled, populate $PreviewCache for
+# this page's items from what's already on disk so the preview pane renders without any request.
+# Files -> bytes from the session cache or a previously-downloaded copy (Get-DownloadedBytes);
+# browsable archives -> the tree reconstructed from the local index (Build-ArchiveTreeFromIndex).
+# Anything not on disk / not indexed is cached as a clear "offline" miss so the pane stops saying
+# "Loading...". Cheap + idempotent (skips keys already cached); safe to call per render. No-op
+# unless network is blocked. Cache shape mirrors the pool workers' { Ok; Bytes; Nodes; Error }.
+function Warm-OfflinePreviews([object[]]$Items) {
+    if (-not (Test-NetworkBlocked) -or $null -eq $Items) { return }
+    foreach ($it in $Items) {
+        if (-not $it) { continue }
+        if (Test-ItemBrowsableArchive $it) {
+            $k = Get-ArcPreviewKey ([string]$it.Uri)
+            if ($script:PreviewCache.ContainsKey($k)) { continue }
+            $tree = $null
+            if (Get-Command Build-ArchiveTreeFromIndex -ErrorAction SilentlyContinue) {
+                $canon = Get-ArcArchiveUri ([string]$it.Repo) (Get-ArcArchivePath ([string]$it.Path) ([string]$it.Name))
+                if ($script:ArcIndexedArchives.Contains($canon)) { $tree = Build-ArchiveTreeFromIndex $it }
+            }
+            $script:PreviewCache[$k] = if ($tree -and $tree.Ok) {
+                [PSCustomObject]@{ Ok = $true; Bytes = $null; Nodes = $tree.Nodes; Error = '' }
+            } else {
+                [PSCustomObject]@{ Ok = $false; Bytes = $null; Nodes = $null; Error = 'Offline: archive listing not in the local index.' }
+            }
+        } else {
+            $u = Get-ItemUrl $it
+            $k = Get-FilePreviewKey $u
+            if ($script:PreviewCache.ContainsKey($k)) { continue }
+            $bytes = if ($script:MemFiles.ContainsKey($u)) { $script:MemFiles[$u] } else { Get-DownloadedBytes $u }
+            $script:PreviewCache[$k] = if ($null -ne $bytes) {
+                [PSCustomObject]@{ Ok = $true; Bytes = $bytes; Nodes = $null; Error = '' }
+            } else {
+                [PSCustomObject]@{ Ok = $false; Bytes = $null; Nodes = $null; Error = 'Offline: file content not on disk (download it while online to preview).' }
+            }
+        }
     }
-    $detail = ''
-    if ($bd) {
-        try {
-            $j = $bd | ConvertFrom-Json
-            if ($j.PSObject.Properties['errors'] -and $j.errors) { $detail = (@($j.errors | ForEach-Object { "$($_.message)" }) -join '; ') }
-            elseif ($j.PSObject.Properties['message']) { $detail = "$($j.message)" }
-        } catch { $detail = $bd.Trim() }
-    }
-    $msg = if ($detail -and $code -gt 0) { "HTTP $code - $detail" }
-           elseif ($detail)             { $detail }
-           elseif ($code -gt 0)         { "HTTP $code" }
-           else                         { '' }
-    return [PSCustomObject]@{ Code = $code; Message = $msg }
 }
 
-'@
 
 # File preview worker: fetch raw bytes; decoding/wrapping stays on the main thread.
 # Get-WkError is injected ahead of this body by Start-PreviewPrefetch (a separate
@@ -313,6 +321,7 @@ function Restrict-PreviewPrefetch([hashtable]$Keep) {
 # entries (nothing to preview) are ignored. Requests are queued in the order given,
 # so callers put the highlighted row first.
 function Start-PreviewPrefetch($Requests) {
+    if (Test-NetworkBlocked) { return }   # offline 'all': previews seeded from disk (Warm-OfflinePreviews)
     if ($null -eq $Requests) { return }
     Receive-PreviewPrefetch
     foreach ($rq in $Requests) {
@@ -494,6 +503,7 @@ function Test-PreviewLookaheadAlive {
 # worker too). Supersedes any running trickle.
 function Start-PreviewLookahead($Requests) {
     Stop-PreviewLookahead
+    if (Test-NetworkBlocked) { return }   # offline 'all': no background preview fetches
     if ($null -eq $Requests) { return }
     $pending = @($Requests | Where-Object { $_ -and -not $script:PreviewCache.ContainsKey($_.Key) })
     if ($pending.Count -eq 0) { return }

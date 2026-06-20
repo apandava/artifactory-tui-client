@@ -10,10 +10,6 @@
 # Items the user has opened/viewed/downloaded (keys: storage uri or download url),
 # rendered washed-out afterwards. Preview content is cached in memory by download
 # url so a later download reuses it instead of re-fetching.
-$script:Visited      = New-Object 'System.Collections.Generic.HashSet[string]'
-$script:MemFiles     = @{}                                              # url -> [byte[]]
-$script:MemOrder     = [Collections.Generic.List[string]]::new()        # insertion order, for eviction
-$script:MemFilesCap  = 32                                               # max files held for download reuse
 $script:PreviewOK    = New-Object 'System.Collections.Generic.HashSet[string]'  # large/non-text files user opted to preview
 $script:PreviewLimit = 512000                                           # 0.5 MB auto-preview cap
 $script:PreviewHardLimit = 5242880                                      # 5 MB hard ceiling for manual opt-in (large + force preview)
@@ -83,20 +79,6 @@ function Get-ScrolledLines([string[]]$lines, [int]$avail, [int]$scroll) {
     return $out.ToArray()
 }
 
-# Cache a file's raw bytes by url so a later download can reuse them instead of
-# re-fetching, bounded to $MemFilesCap entries (oldest evicted first). The bytes
-# are the SAME array the preview cache holds (shared by reference, not copied), so
-# this adds only a dictionary entry, never a second copy of the file. Eviction
-# only means a re-fetch on a later download, which is user-initiated and rare.
-function Add-MemFile([string]$url, [byte[]]$bytes) {
-    if (-not $url -or $null -eq $bytes -or $script:MemFiles.ContainsKey($url)) { return }
-    $script:MemFiles[$url] = $bytes
-    $script:MemOrder.Add($url)
-    while ($script:MemOrder.Count -gt $script:MemFilesCap) {
-        $old = $script:MemOrder[0]; $script:MemOrder.RemoveAt(0)
-        [void]$script:MemFiles.Remove($old)
-    }
-}
 
 # Sentinel emitted by Get-PreviewLines in place of the preview's horizontal rule.
 # Two-pane compositors recognise it and draw a rule that joins the vertical pane
@@ -109,72 +91,6 @@ $script:PaneRuleTag = "$([char]0)PANE_RULE$([char]0)"
 # $PaneRuleTag for the opposite pane; NUL-wrapped for the same reason.
 $script:HeaderRuleTag = "$([char]0)HDR_RULE$([char]0)"
 
-function Mark-Visited([string]$key) { if ($key) { [void]$script:Visited.Add($key) } }
-function Test-Visited([string]$key) { return ($key -and $script:Visited.Contains($key)) }
-
-# Files written to disk this session (keyed by both storage key and download url).
-# A downloaded file's preview is no longer fetched/shown and its cached bytes are
-# purged: re-download is the way to see it again. Keeps memory down and avoids
-# re-fetching content the user already has on disk.
-$script:Downloaded = New-Object 'System.Collections.Generic.HashSet[string]'
-function Test-Downloaded([string]$k) { return ($k -and $script:Downloaded.Contains($k)) }
-
-# Purge a url's cached preview bytes and resolved preview from memory so held content
-# is freed; a later preview re-fetches. Used both when a file is downloaded and when an
-# audit finding is excluded.
-function Clear-PreviewMem([string]$url) {
-    if (-not $url) { return }
-    if ($script:MemFiles.ContainsKey($url)) {
-        [void]$script:MemFiles.Remove($url)
-        $idx = $script:MemOrder.IndexOf($url); if ($idx -ge 0) { $script:MemOrder.RemoveAt($idx) }
-    }
-    $pk = Get-FilePreviewKey $url
-    if ($script:PreviewCache.ContainsKey($pk)) { [void]$script:PreviewCache.Remove($pk) }
-}
-
-# Mark a file downloaded: record it (so it greys out + is skipped for preview),
-# drop any cached bytes, and evict its resolved preview so it isn't redrawn.
-function Mark-Downloaded([string]$key, [string]$url) {
-    Mark-Visited $key
-    if ($key) { [void]$script:Downloaded.Add($key) }
-    if ($url) {
-        [void]$script:Downloaded.Add($url)
-        Clear-PreviewMem $url
-    }
-}
-
-# Reverse Mark-Downloaded: forget a file was downloaded so it returns to its normal
-# (un-downloaded) state — no longer dimmed, and re-sorted out of the downloaded group.
-# Purged preview bytes are not restored; a later preview just re-fetches them.
-function Unmark-Downloaded([string]$key, [string]$url) {
-    if ($key) { [void]$script:Visited.Remove($key); [void]$script:Downloaded.Remove($key) }
-    if ($url) { [void]$script:Downloaded.Remove($url) }
-}
-
-# Append one row to download-log.csv in the folder the file was saved to (created
-# with a header on first write). Every download — audit or not — is logged here;
-# non-audit downloads pass 'N/A' for severity/rule. Quoting is RFC-4180; the file
-# is UTF-8. Failures are swallowed so logging never blocks a download.
-function Write-DownloadLog([string]$dir, [string]$name, [string]$repo, [string]$path, [string]$archive,
-                           [long]$sizeBytes, [string]$modified, [string]$url,
-                           [string]$severity, [string]$rule, [string]$hash = '') {
-    try {
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $csv  = Join-Path $dir 'download-log.csv'
-        $q    = { param($v) '"' + ("$v" -replace '"','""') + '"' }
-        # FileName is always the original Artifactory filename; Hash (its sha256) follows
-        # so a bulk download saved under a disambiguated name can still be traced back.
-        $cols = @('Timestamp','FileName','Hash','Repository','Path','Archive','SizeBytes','Modified','DownloadUrl','Severity','MatchedRule')
-        $sz   = if ($sizeBytes -ge 0) { "$sizeBytes" } else { '' }
-        $row  = @((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $name, $hash, $repo, $path, $archive, $sz, $modified, $url,
-                  $(if ($severity) { $severity } else { 'N/A' }), $(if ($rule) { $rule } else { 'N/A' }))
-        $new = -not (Test-Path -LiteralPath $csv)
-        $sb  = [Text.StringBuilder]::new()
-        if ($new) { [void]$sb.AppendLine((@($cols | ForEach-Object { & $q $_ }) -join ',')) }
-        [void]$sb.AppendLine((@($row | ForEach-Object { & $q $_ }) -join ','))
-        [System.IO.File]::AppendAllText($csv, $sb.ToString(), [Text.UTF8Encoding]::new($false))
-    } catch { }
-}
 
 # Apply a background to a whole row so the highlight survives the per-cell resets:
 # re-assert the background after every reset, then pad to width under it. No-op on
@@ -187,23 +103,6 @@ function Highlight-Row([string]$s, [int]$width) {
     return "$SB$t$R"
 }
 
-# Constructed download URL for a search item (repo/path/name under the REST base).
-function Get-ItemUrl($item) {
-    $repo = if ($item.Repo) { $item.Repo } else { '' }
-    $seg  = if ($item.Path) { "$($item.Path)/" } else { '' }
-    return "$(Get-ArtBase)/$repo/$seg$($item.Name)"
-}
-
-# Name of the archive an item/finding came from (its content lives inside this archive
-# file), or '' for a normal top-level artifact. Audit findings carry InArchive/ArchiveName;
-# plain search items have neither, so they always return '' (never archive entries). The
-# property guards keep this safe under Set-StrictMode.
-function Get-ItemArchiveName($item) {
-    if ($null -eq $item) { return '' }
-    if ($item.PSObject.Properties['InArchive'] -and $item.InArchive -and
-        $item.PSObject.Properties['ArchiveName']) { return [string]$item.ArchiveName }
-    return ''
-}
 
 # Render a fixed-width ($w columns) Path-column cell in colour $dim. When $isArc — the
 # file came from an archive listing — an 'A' marker (colour $markCol, default the plain
@@ -217,52 +116,6 @@ function Format-PathCell([string]$path, [int]$w, [bool]$isArc, [string]$dim, [st
     return "${dim}${txt}${R} ${markCol}A${R}$(' ' * $pad)"
 }
 
-# Extensions we treat as human-readable text (previewable).
-$script:TextExts = @(
-    'txt','text','log','md','markdown','rst','adoc','asciidoc','me','readme','nfo',
-    'html','htm','xhtml','xml','xsl','xslt','svg','rss','atom','wsdl','plist',
-    'json','json5','jsonl','ndjson','yaml','yml','toml','ini','cfg','conf','config',
-    'properties','props','env','editorconfig','gitignore','gitattributes','dockerignore',
-    'csv','tsv','tab',
-    'cmd','bat','ps1','psm1','psd1','sh','bash','zsh','fish','ksh','command',
-    'py','pyw','rb','pl','pm','php','phtml','tcl','lua','r','jl','groovy','gradle',
-    'js','mjs','cjs','jsx','ts','tsx','vue','svelte','coffee',
-    'css','scss','sass','less','styl',
-    'java','kt','kts','scala','clj','cljs','cljc','edn','go','rs','swift','m','mm',
-    'c','h','cc','cpp','cxx','hpp','hh','hxx','cs','fs','fsx','vb','d','dart','nim','zig',
-    'ex','exs','erl','hrl','hs','lhs','ml','mli','elm','rkt','scm','lisp','el',
-    'sql','graphql','gql','proto','thrift','avsc',
-    'tf','tfvars','hcl','bicep','tpl','jinja','j2','mustache','hbs','ejs','erb','haml','slim',
-    'make','mk','mak','cmake','am','in','spec','rake','gemspec','podspec','cabal',
-    'asm','s','vhd','vhdl','v','sv','verilog',
-    'tex','bib','sty','cls','rtf','org','textile','wiki','pod',
-    'srt','vtt','sub','ass','ssa','lrc','cue','m3u','m3u8','pls',
-    'diff','patch','reg','desktop','service','manifest','mf','sf','classpath','project',
-    'pom','sbt','lock','sum','mod','gradle','npmrc','yarnrc','babelrc','eslintrc',
-    'prettierrc','dockerfile','procfile','makefile','jenkinsfile','vagrantfile','gemfile'
-)
-
-function Get-IsPreviewable([string]$name) {
-    $ext = (Get-Ext $name).ToLower()
-    if ($ext -and ($script:TextExts -contains $ext)) { return $true }
-    # Extensionless but well-known text filenames.
-    $bare = $name.ToLower()
-    return @('dockerfile','makefile','jenkinsfile','vagrantfile','procfile','gemfile',
-             'license','readme','changelog','authors','notice','copying','install',
-             'manifest','rakefile','gemfile.lock') -contains $bare
-}
-
-# Fetch raw bytes for a url (no caching). $null on failure.
-function Get-FileBytes([string]$url) {
-    $old = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-    try {
-        $resp = Invoke-WebRequest -Uri $url -Headers (Get-AuthHeaders) -UseBasicParsing -ErrorAction Stop
-        if ($resp.RawContentStream) { return $resp.RawContentStream.ToArray() }
-        if ($resp.Content -is [byte[]]) { return [byte[]]$resp.Content }
-        return [Text.Encoding]::UTF8.GetBytes([string]$resp.Content)
-    } catch { return $null }
-    finally { $ProgressPreference = $old }
-}
 
 
 # Decode bytes to text (UTF-8, BOM-aware).
@@ -592,7 +445,7 @@ function Format-NameCell([object]$item, [int]$nameW, [bool]$vis, [bool]$preview 
     # A preview/fetch error (e.g. blacked-out repo) flags the whole cell red.
     $errored = Test-ItemPreviewError $item
     $col  = if ($errored) { $RD } elseif ($vis) { $DM } else { $CY }
-    if     (Get-IsArchive $name) { $glyph = $script:ArcGlyph }
+    if     (Test-ItemBrowsableArchive $item) { $glyph = $script:ArcGlyph }
     elseif ((Get-IsPreviewable $name) -or $script:PreviewOK.Contains((Get-ItemUrl $item))) { $glyph = $script:PreviewGlyph }
     else   { return "${col}$(Clip $name $nameW)${R}" }
 
@@ -716,6 +569,10 @@ function Test-NameMatchesAny([string]$name, $rxList) {
     return $false
 }
 
+# Upper-bound total result count the launcher sets per render: when > the loaded/shown count it's
+# displayed as "N shown - ~T total" (local-index matches stream in chunks, so more exist than are
+# loaded). 0 = everything is loaded, so the header shows the plain "(N results)" form.
+$script:ResultGrandTotal = 0
 function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
                    [int]$TotalPages, [int]$TotalItems, [int]$Offset,
                    [string]$Mode = 'simple', [int]$SelRow = -1, [int]$PvScroll = 0,
@@ -740,7 +597,10 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
     $gap   = [Math]::Max(0, $w - $title.Length - $right.Length)
     $L.Add("${HB}${BD}${MG}${title}${R}${HB}$(' ' * $gap)${DM}${right}${R}")
     $L.Add("$DM$(HR $w)$R")
-    $pageStr = "Page $($Page + 1) of $TotalPages  ($TotalItems result$(if ($TotalItems -ne 1) {'s'}))"
+    $countStr = if ($script:ResultGrandTotal -gt $TotalItems) {
+        "$TotalItems shown $([char]0x00B7) ~$($script:ResultGrandTotal) total"
+    } else { "$TotalItems result$(if ($TotalItems -ne 1) {'s'})" }
+    $pageStr = "Page $($Page + 1) of $TotalPages  ($countStr)"
     $rPad    = [Math]::Max(0, $w - 9 - $Query.Length - $pageStr.Length)
     $L.Add("  Query: ${BD}${CY}${Query}${R}$(' ' * $rPad)${DM}${pageStr}${R}")
     if ($Filter) {
@@ -888,7 +748,7 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
                 if ($rule) { $rl.Add("${DM}$('Rule'.PadRight($labelW))${R}${YL}$(Trunc $rule $valMax)${R}") }
             }
             $pvMax  = [Math]::Max(1, $bodyH - $rl.Count - 2)
-            $pvLines = if (Get-IsArchive ([string]$sItem.Name)) {
+            $pvLines = if (Test-ItemBrowsableArchive $sItem) {
                 Get-ArchivePreviewLines $sItem $rightW $pvMax $PvScroll
             } else {
                 Get-PreviewLines ([string]$sItem.Name) $sUrl $sBytes $rightW $pvMax $PvScroll
@@ -920,7 +780,7 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
     if ($TotalPages -gt 1) { $nav.Add("${BD}${LB}g${RB}${R}${DM} page${R}") }
     if ($preview -and $SelRow -ge 0 -and $SelRow -lt $Items.Count) {
         $sIt = $Items[$SelRow]
-        if (-not (Get-IsArchive ([string]$sIt.Name))) {
+        if (-not (Test-ItemBrowsableArchive $sIt)) {
             $sUrl = Get-ItemUrl $sIt
             $sSz  = if ("$($sIt.Size)" -ne '' -and "$($sIt.Size)" -ne '?') { [long]$sIt.Size } else { -1 }
             switch (Get-PreviewState ([string]$sIt.Name) $sUrl $sSz) {
@@ -944,6 +804,30 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
     if ($script:AuditAvailable) {
         $aLbl = if ($script:AuditState -eq 'passive') { "${YL}audit: passive${R}${DM}" } else { 'audit' }
         $nav.Add("${BD}${LB}a${RB}${R}${DM} $aLbl${R}")
+    }
+    # Archive-search status: yellow "(walking)" while the background walk runs.
+    if ($script:IndexAvailable) {
+        if ($script:ArcSearchEnabled) {
+            $wLbl = if ($script:ArcSearchState -eq 'walking') { "${YL}archive search: on (walking)${R}${DM}" } else { "${YL}archive search: on${R}${DM}" }
+            $nav.Add("${BD}${LB}w${RB}${R}${DM} $wLbl${R}")
+            # Skip-versions toggle: only meaningful while the archive walk is active.
+            $vLbl = if ($script:ArcSkipVersions) { 'skip-versions: on' } else { 'skip-versions: off' }
+            $nav.Add("${BD}${LB}V${RB}${R}${DM} $vLbl${R}")
+        } else {
+            $nav.Add("${BD}${LB}w${RB}${R}${DM} archive search${R}")
+        }
+        # Local index status: record count, a yellow "(writing)" pulse on a write this frame.
+        $idxState = if ($script:IndexEnabled) {
+            $wr = if ($script:IndexWroteTick) { " ${YL}(writing)${R}${DM}" } else { '' }
+            "index: $($script:IndexCount)$wr"
+        } else { 'index: off' }
+        $nav.Add("${BD}${LB}W${RB}${R}${DM} $idxState${R}")
+        $script:IndexWroteTick = $false   # one-shot: consumed at render
+    }
+    # Offline indicator (read-only status, no key): shows the active --offline mode.
+    if (Get-Command Get-OfflineMode -ErrorAction SilentlyContinue) {
+        $om = Get-OfflineMode
+        if ($om) { $nav.Add("${YL}offline: $om${R}") }
     }
     $nav.Add("${BD}${LB}q${RB}${R}${DM} quit${R}")
     $navLines = @(Wrap-Hints $nav.ToArray() $w)
@@ -1005,6 +889,9 @@ function Save-Item([object]$item, [string]$url, [string]$DestName = '') {
             return "${BD}Saved${R} to ${CY}$dest${R}$sz ${DM}(from preview cache)${R}"
         } catch { }   # fall through to a normal download on any write error
     }
+    if (Test-NetworkBlocked) {
+        return "${YL}Offline:${R} content not cached this session - can't download without a connection. ${DM}(A previously-downloaded copy may already be in $OutDir.)${R}"
+    }
     $old  = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
     try {
@@ -1024,158 +911,6 @@ function Save-Item([object]$item, [string]$url, [string]$DestName = '') {
     }
 }
 
-# ── BULK-DOWNLOAD DEDUP ───────────────────────────────────────────────────────
-# Shared by the search results view (Save-ItemSet) and the audit view
-# (Save-AuditFindingSet). The two together: download a set without (a) fetching the
-# same bytes twice, and (b) clobbering one file with another that shares its name.
-
-# Insert a short content tag before a filename's final extension, so two different
-# files that share a name don't overwrite each other on disk. The tag goes at the FRONT
-# so collided copies sort together and the original name stays readable:
-#   credentials.xml -> 7F7C415.credentials.xml
-function Add-NameTag([string]$name, [string]$tag) {
-    return "$tag.$name"
-}
-
-# 7-char (uppercase) content tag for collision disambiguation: the first 7 hex of the
-# file's checksum when known, else a deterministic MD5 of its identity string (so a given
-# file always tags the same way regardless of what else is in the batch). $hash is
-# '<algo>:<hex>', so drop the algorithm prefix before keeping hex digits (otherwise 'sha1:'
-# would leak an 'a1').
-function Get-DedupTag([string]$hash, [string]$fallback) {
-    $hex = (("$hash" -split ':')[-1] -replace '[^0-9A-Fa-f]', '')
-    if ($hex.Length -ge 7) { return $hex.Substring(0, 7).ToUpper() }
-    $md5 = [Security.Cryptography.MD5]::Create()
-    try {
-        $h = $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes("$fallback"))
-        return ((($h | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 7)).ToUpper()
-    } finally { $md5.Dispose() }
-}
-
-# SHA-256 of a byte array as lowercase hex. Used to derive a content identity for items
-# that have no storage checksum (notably archive entries), by hashing the bytes directly.
-function Get-BytesSha256([byte[]]$bytes) {
-    $sha = [Security.Cryptography.SHA256]::Create()
-    try { return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '') }
-    finally { $sha.Dispose() }
-}
-
-# Content hash of a just-saved file as '<algo>:<hex>', for logging a download whose hash
-# wasn't known up front (archive entries have no storage checksum). Streams the file via
-# Get-FileHash so a large download isn't read wholly into memory. '' on any failure.
-function Get-FileSha256([string]$path) {
-    try { return 'sha256:' + ((Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()) }
-    catch { return '' }
-}
-
-# Fetch an entry's bytes for hashing/writing, reusing preview-cache bytes when held.
-function Get-DedupBytes($e) {
-    if ($script:MemFiles.ContainsKey([string]$e.Url)) { return $script:MemFiles[[string]$e.Url] }
-    return Get-FileBytes ([string]$e.Url)
-}
-
-# Write $bytes to $dest. Returns $true on success.
-function Save-DedupFile([string]$dest, [byte[]]$bytes) {
-    try { [System.IO.File]::WriteAllBytes($dest, $bytes); return $true } catch { return $false }
-}
-
-# Log a download-log.csv row for $e (its original name + the content $hash) and mark it
-# downloaded. Called once per entry even when several share one on-disk file.
-function Write-DedupEntry($e, [string]$hash) {
-    $sz = if ($e.Size -ge 0) { [long]$e.Size } else { -1 }
-    Write-DownloadLog $OutDir ([string]$e.Name) ([string]$e.Repo) ([string]$e.Path) ([string]$e.Archive) `
-                      $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) ([string]$e.Rule) ([string]$hash)
-    Mark-Downloaded ([string]$e.VisitKey) ([string]$e.Url)
-}
-
-# Shared bulk-download engine for the results view and the audit view. Identical CONTENT is
-# written to disk ONCE — the same bytes under different paths, repos or archives collapse to a
-# single file — but a download-log.csv row is written for EVERY entry, so each listed
-# occurrence stays individually recorded (mirroring the UI). Every entry is marked downloaded.
-#
-# Hashing is only done where it's needed to resolve a conflict: entries are grouped by
-# filename first, and only files that SHARE a name are hashed (to tell duplicates apart from
-# distinct content). A unique filename can't collide, so it's saved straight away — its hash
-# is still computed from the bytes we download to write it, so the log records it. Distinct
-# contents under one name each get a front hash tag (7F7C415.name) so neither clobbers the
-# other. $entries are objects with:
-#   .Ref .Name .Url .KnownHash .Repo .Path .Archive .Size(long,-1 ok) .Modified .Sev .Rule .VisitKey
-# Returns @{ Files; Entries; Renamed; Failed; Identical }.
-function Invoke-DedupDownload($entries) {
-    $entries = @($entries | Where-Object { $_ })
-    $total = $entries.Count
-    try { if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null } } catch { }
-
-    # Group by filename (case-insensitive), preserving first-seen order.
-    $nameGroups = [Collections.Generic.List[object]]::new()
-    $byName = @{}
-    foreach ($e in $entries) {
-        $nm = [string]$e.Name
-        if ($byName.ContainsKey($nm)) { [void]$byName[$nm].Add($e) }
-        else { $lst = [Collections.Generic.List[object]]::new(); [void]$lst.Add($e); $byName[$nm] = $lst; [void]$nameGroups.Add($lst) }
-    }
-
-    $files = 0; $renamed = 0; $logged = 0; $failed = 0; $gi = 0
-    foreach ($grp in $nameGroups) {
-        $gi++
-        $members = @($grp)
-        if ($members.Count -eq 1) {
-            # Unique filename — no collision possible; save under its own name. Hash comes
-            # from the storage checksum if known, else the bytes we just fetched (no extra
-            # download, no separate hashing pass).
-            $e = $members[0]
-            Show-Popup @("Saving $gi / $($nameGroups.Count)", [string]$e.Name)
-            $b = Get-DedupBytes $e
-            if ($null -eq $b) { $failed++; continue }
-            $h = if ("$($e.KnownHash)") { [string]$e.KnownHash } else { 'sha256:' + (Get-BytesSha256 $b) }
-            if (Save-DedupFile (Join-Path $OutDir ([string]$e.Name)) $b) { Write-DedupEntry $e $h; $files++; $logged++ } else { $failed++ }
-            continue
-        }
-        # Shared filename — hash each member (storage checksum if known, else the bytes) and
-        # split into distinct-content sub-groups. Bytes fetched for hashing are kept for the
-        # write so each copy is downloaded only once.
-        $contents = [Collections.Generic.List[object]]::new()
-        $byHash   = @{}
-        $mi = 0
-        foreach ($e in $members) {
-            $mi++
-            Show-Popup @("Hashing $gi / $($nameGroups.Count)", "$([string]$e.Name)  ($mi/$($members.Count))")
-            $h = [string]$e.KnownHash
-            $b = $null
-            if (-not $h) { $b = Get-DedupBytes $e; if ($b) { $h = 'sha256:' + (Get-BytesSha256 $b) } }
-            $key = if ($h) { 'h:' + $h.ToLower() } else { 'fb:' + [string]$e.Url }
-            if ($byHash.ContainsKey($key)) { [void]$byHash[$key].Members.Add($e) }
-            else {
-                $c = [PSCustomObject]@{ Hash = $h; Key = $key; Bytes = $b; Members = [Collections.Generic.List[object]]::new() }
-                [void]$c.Members.Add($e); $byHash[$key] = $c; [void]$contents.Add($c)
-            }
-        }
-        $tagged = ($contents.Count -gt 1)   # >1 distinct content under one name -> disambiguate
-        foreach ($c in $contents) {
-            $primary  = $c.Members[0]
-            $destName = if ($tagged) { Add-NameTag ([string]$primary.Name) (Get-DedupTag $c.Hash $c.Key) } else { [string]$primary.Name }
-            Show-Popup @("Saving $gi / $($nameGroups.Count)", $destName)
-            $b = if ($c.Bytes) { $c.Bytes } else { Get-DedupBytes $primary }
-            if ($null -eq $b) { $failed += $c.Members.Count; continue }
-            if (Save-DedupFile (Join-Path $OutDir $destName) $b) {
-                $files++; if ($tagged) { $renamed++ }
-                foreach ($e in $c.Members) { Write-DedupEntry $e $c.Hash; $logged++ }
-            } else { $failed += $c.Members.Count }
-        }
-    }
-    return [PSCustomObject]@{ Files = $files; Entries = $total; Renamed = $renamed; Failed = $failed; Identical = ($logged - $files) }
-}
-
-# Done-popup summary line for a bulk download: files written vs. entries, plus how many
-# entries collapsed onto a shared file and how many names were tagged.
-function Get-DedupDoneLine($res) {
-    $extra = @()
-    if ($res.Identical -gt 0) { $extra += "$($res.Identical) duplicate$(if ($res.Identical -ne 1){'s'}) merged" }
-    if ($res.Renamed -gt 0)   { $extra += "$($res.Renamed) name-tagged" }
-    if ($res.Failed -gt 0)    { $extra += "$($res.Failed) failed" }
-    $tail = if ($extra.Count -gt 0) { ' (' + ($extra -join ', ') + ')' } else { '' }
-    return "Done.  Saved $($res.Files) file$(if ($res.Files -ne 1){'s'}) from $($res.Entries) entr$(if ($res.Entries -ne 1){'ies'}else{'y'})$tail."
-}
 
 # Confirm + download a set of search-result items. Identical content is saved once; every
 # item is still logged. Shared by the results view's 'A' (download all) and numeric multi-download.

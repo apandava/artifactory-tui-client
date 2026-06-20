@@ -2,8 +2,15 @@
 CLAUDE.md
 .claude/
 
-# Downloads created at runtime (default -OutDir)
+# Per-instance output root: output/<host>/{index,downloads,audit}. All runtime-
+# generated and regenerable (the index is a point-in-time cache; downloads + audit
+# match logs are produced per run). Never source artifacts.
+output/
+# Legacy locations (pre-output-folder), kept so older working copies stay ignored:
 art-downloads/
+.artca-index/
+*.jsonl
+*.jsonl.migrated
 
 # Secrets / local config — never commit tokens or API keys
 *.secret

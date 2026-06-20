@@ -13,68 +13,6 @@
 #   GET /api/storage/{repo}/{path/archive.jar}!/com/pkg/  — subdirectory
 # The response has a 'children' array identical to normal folder listings.
 
-$script:ArchiveExts = @('zip','jar','war','ear','aar','tar','gz','tgz','rar','7z',
-                         'apk','ipa','nupkg','whl','egg')
-
-function Get-IsArchive([string]$name) {
-    $ext = (Get-Ext $name).ToLower()
-    return $script:ArchiveExts -contains $ext
-}
-
-# The /ui/ frontend endpoints reject callers that don't look like the web app,
-# returning 403 even for anonymous reads that the public REST API would allow.
-# So for the tree-browser call we add the same browser-style headers the web UI
-# sends: an XHR marker, a matching Origin/Referer, a normal Accept, and a UA.
-# We also force identity encoding: Windows PowerShell 5.1 does NOT auto-decompress
-# gzip/br responses, so advertising compression yields a garbled (binary) body.
-# Any configured auth header is preserved on top.
-function Get-UiHeaders {
-    $h = Get-AuthHeaders
-    $origin = $BaseUrl.TrimEnd('/')
-    $h['Accept']           = 'application/json, text/plain, */*'
-    $h['X-Requested-With'] = 'XMLHttpRequest'
-    $h['Origin']           = $origin
-    $h['Referer']          = "$origin/ui/"
-    $h['Accept-Encoding']  = 'identity'
-    return $h
-}
-
-# The treebrowser archive call returns the WHOLE archive tree, fully nested, in
-# a single response: each folder node carries a 'children' array of child nodes
-# all the way down (there is no per-folder fetch — the web UI navigates this tree
-# client-side, and so do we). These accessors read node fields defensively: the
-# display name lives under text (or name); a folder is flagged by folder/isFolder
-# or implied by type; children holds the nested entries for a folder.
-function Get-NodeName($n) {
-    if ($null -eq $n) { return '' }
-    if ($n.PSObject.Properties['text'] -and "$($n.text)") { return "$($n.text)" }
-    if ($n.PSObject.Properties['name'] -and "$($n.name)") { return "$($n.name)" }
-    return ''
-}
-
-function Get-NodeIsFolder($n) {
-    if ($null -eq $n) { return $false }
-    if ($n.PSObject.Properties['folder'])   { return [bool]$n.folder }
-    if ($n.PSObject.Properties['isFolder']) { return [bool]$n.isFolder }
-    if ($n.PSObject.Properties['type']) {
-        return @('folder','junction','paginatedjunction','archive','repository') -contains "$($n.type)".ToLower()
-    }
-    return $false
-}
-
-# A folder's children come as an array of node objects. Guard against a missing
-# property or a non-array placeholder (treated as an unexpanded / empty folder).
-# Null entries are stripped: a malformed/empty subtree (e.g. an unbrowsable nested
-# archive) can yield array slots that are $null, and every node accessor would
-# throw on them under StrictMode.
-function Get-NodeChildren($n) {
-    if ($null -eq $n) { return @() }
-    if ($n.PSObject.Properties['children']) {
-        $c = $n.children
-        if ($c -is [Array]) { return @($c | Where-Object { $null -ne $_ }) }
-    }
-    return @()
-}
 
 # Order a level for display: folders first, then files, each alphabetical. Null
 # entries are dropped up front so the accessors never see them.
@@ -177,50 +115,6 @@ function Get-MatchingFiles($nodes, $subCache, [string]$pattern, $acc) {
     }
 }
 
-function Get-RepoTypeForUI([string]$repo) {
-    switch ((Resolve-Repo $repo).Type.ToUpper()) {
-        'LOCAL'   { return 'local'   }
-        'REMOTE'  { return 'remote'  }
-        'VIRTUAL' { return 'virtual' }
-        'CACHE'   { return 'cached'  }
-        default   { return 'local'   }
-    }
-}
-
-# Fetch the full archive tree via the Artifactory UI tree-browser endpoint (the
-# same call the web UI makes). This works regardless of whether archive indexing
-# is configured on the repository, which is why it succeeds where the storage API
-# '!/' separator returns 404. A single POST returns the entire archive contents
-# nested under each folder's 'children' — so we make ONE call and navigate the
-# result client-side; there is no per-folder fetch.
-# Build the treebrowser POST request (uri / body / headers / user-agent) without
-# sending it. Shared by the synchronous Invoke-TreeBrowse and the background
-# preview worker (which can't call these helpers from its isolated runspace, so it
-# needs the request fully materialised on the main thread).
-function Get-TreeBrowseRequest([string]$repoKey, [string]$repoType, [string]$repoPkgType,
-                               [string]$path, [string]$text) {
-    $body = [ordered]@{
-        projectKey    = ''
-        type          = 'paginatedJunction'
-        repoType      = $repoType
-        repoKey       = $repoKey
-        path          = $path
-        text          = $text
-        trashcan      = $false
-        repoPkgType   = $repoPkgType
-        continueState = ''
-        limit         = $null
-        isFolder      = $false
-        isArchive     = $true
-        mustInclude   = $null
-    } | ConvertTo-Json -Compress
-    return [PSCustomObject]@{
-        Uri     = "$($BaseUrl.TrimEnd('/'))/ui/api/v1/ui/v2/treebrowser?compacted=false"
-        Body    = $body
-        Headers = (Get-UiHeaders)
-        Ua      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/151.0'
-    }
-}
 
 function Invoke-TreeBrowse([string]$repoKey, [string]$repoType, [string]$repoPkgType,
                            [string]$path, [string]$text) {
@@ -257,7 +151,7 @@ function Test-FileAutoPreviewable([string]$url, [long]$sizeBytes) {
 # to decide the badge's load-state colour.
 function Get-ItemPreviewKey($item) {
     $name = [string]$item.Name
-    if (Get-IsArchive $name) { return (Get-ArcPreviewKey ([string]$item.Uri)) }
+    if (Test-ItemBrowsableArchive $item) { return (Get-ArcPreviewKey ([string]$item.Uri)) }
     $url = Get-ItemUrl $item
     if (Test-Downloaded $url) { return '' }
     $sz  = if ("$($item.Size)" -ne '' -and "$($item.Size)" -ne '?') { [long]$item.Size } else { -1 }
@@ -270,7 +164,7 @@ function Get-ItemPreviewKey($item) {
 # only once force-previewed (their url opted into PreviewOK).
 function Get-ItemPreviewRequest($item) {
     $name = [string]$item.Name
-    if (Get-IsArchive $name) {
+    if (Test-ItemBrowsableArchive $item) {
         $repoKey     = [string]$item.Repo
         $repoType    = Get-RepoTypeForUI $repoKey
         $repoPkgType = [string](Resolve-Repo $repoKey).PackageType
@@ -315,7 +209,7 @@ function Get-NodePreviewRequest($n) {
 # into PreviewOK) count as previewable here too.
 function Get-ItemNaturalPreviewKey($item) {
     $name = [string]$item.Name
-    if (Get-IsArchive $name) { return (Get-ArcPreviewKey ([string]$item.Uri)) }
+    if (Test-ItemBrowsableArchive $item) { return (Get-ArcPreviewKey ([string]$item.Uri)) }
     $url = Get-ItemUrl $item
     if ((Get-IsPreviewable $name) -or $script:PreviewOK.Contains($url)) { return (Get-FilePreviewKey $url) }
     return ''
@@ -350,72 +244,6 @@ function Get-ArchiveSubtree([string]$repoKey, [string]$path, [string]$text) {
     return Invoke-TreeBrowse $repoKey $repoType $repoPkgType $path $text
 }
 
-# An archive *file* node (not a folder) whose name has an archive extension — i.e.
-# something we can expand inline by fetching its sub-tree.
-function Get-NodeIsArchive($n) {
-    if ($null -eq $n) { return $false }
-    if (Get-NodeIsFolder $n) { return $false }
-    return Get-IsArchive (Get-NodeName $n)
-}
-
-# The General-tab info object carried by a node (size/compressed/modificationTime
-# /crc), or $null. Sometimes it arrives stringified; we only use real objects.
-function Get-NodeInfo($n) {
-    if ($null -eq $n) { return $null }
-    if ($n.PSObject.Properties['tabs']) {
-        foreach ($t in @($n.tabs)) {
-            if ($t -and $t.PSObject.Properties['info'] -and $t.info -and ($t.info -isnot [string])) {
-                return $t.info
-            }
-        }
-    }
-    return $null
-}
-
-# Repo-relative download path for an internal entry (the repoKey/...zip!/entry
-# form Artifactory serves single archive entries from), or '' for folders.
-function Get-NodeDownloadPath($n) {
-    if ($null -eq $n) { return '' }
-    if ($n.PSObject.Properties['downloadPath'] -and "$($n.downloadPath)") { return "$($n.downloadPath)" }
-    return ''
-}
-
-# Epoch-millis (as Artifactory reports archive-entry times) to a local datetime.
-function Format-Epoch($ms) {
-    try { return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$ms).LocalDateTime.ToString('yyyy-MM-dd HH:mm') }
-    catch { return '' }
-}
-
-# Full download URL for an internal archive entry (repoKey + downloadPath, the
-# repo/...zip!/entry form Artifactory serves single entries from).
-function Get-EntryUrl($n) {
-    if ($null -eq $n) { return '' }
-    $dp = Get-NodeDownloadPath $n
-    if (-not $dp) { return '' }
-    $repo = if ($n.PSObject.Properties['repoKey']) { "$($n.repoKey)" } else { '' }
-    return "$(Get-ArtBase)/$repo/$dp"
-}
-
-# Filename of the archive an internal entry lives in. The entry's download path has the
-# form <...>/<archive>!/<internal-path>, so the segment just before the '!' separator is
-# the containing archive. Returns '' if the node has no such path (not an archive entry).
-function Get-EntryArchiveName($n) {
-    $url = Get-EntryUrl $n
-    if (-not $url) { return '' }
-    $i = $url.IndexOf('!')
-    if ($i -lt 0) { return '' }
-    $before = $url.Substring(0, $i)
-    return ($before -split '/')[-1]
-}
-
-# Internal (within-archive) path of a node, with the archive prefix stripped.
-function Get-NodeInternalPath($n) {
-    if ($null -eq $n) { return '' }
-    $np = if ($n.PSObject.Properties['path'])        { "$($n.path)" }        else { '' }
-    $ap = if ($n.PSObject.Properties['archivePath']) { "$($n.archivePath)" } else { '' }
-    if ($ap -and $np.StartsWith($ap)) { return $np.Substring($ap.Length).TrimStart('/') }
-    return $np
-}
 
 # Detail-pane lines for a tree node (an internal archive entry).
 function Get-NodeDetailLines($n, [int]$paneW) {
@@ -508,6 +336,7 @@ function Save-ArchiveEntry($node, [string]$subDir) {
             return "${BD}Saved${R} to ${CY}$dest${R} ${DM}(from preview cache)${R}"
         } catch { }
     }
+    if (Test-NetworkBlocked) { return "${YL}Offline:${R} archive-entry content isn't cached - can't download without a connection." }
     $old  = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
     try {
         Invoke-WebRequest -Uri $url -Headers (Get-AuthHeaders) -OutFile $dest -ErrorAction Stop
@@ -948,6 +777,24 @@ function Read-TreeQuery {
 # One call fetches the whole tree; we render it as a collapsible tree on the left
 # with a live detail pane on the right. The synthetic root is the archive file
 # itself (its detail pane shows storage metadata). Sub-archives expand inline.
+# Index any archive on the current page whose preview has resolved: the preview worker
+# fetched the WHOLE tree into the preview cache (it only renders a couple layers), so feed
+# that full tree into the index right away. Idempotent (Save-BrowsedArchive's canonical-key
+# guard), so it's cheap to call every render. Lives in the UI layer because it reads the
+# preview cache; the actual persistence is the headless Save-BrowsedArchive.
+function Save-PreviewedArchives($items) {
+    if (-not (Get-Command Save-BrowsedArchive -ErrorAction SilentlyContinue)) { return }
+    foreach ($it in @($items)) {
+        if (-not $it -or -not (Test-ItemBrowsableArchive $it)) { continue }
+        $k = Get-ArcPreviewKey ([string]$it.Uri)
+        if (-not $script:PreviewCache.ContainsKey($k)) { continue }
+        $c = $script:PreviewCache[$k]
+        if ($c -and $c.Ok -and $c.PSObject.Properties['Nodes'] -and $null -ne $c.Nodes) {
+            Save-BrowsedArchive $it $c.Nodes
+        }
+    }
+}
+
 function Show-ArchiveTree([object]$item) {
     Initialize-RepoMap
     Stop-PreviewLookahead   # halt the results-page preview trickle while browsing
@@ -964,7 +811,22 @@ function Show-ArchiveTree([object]$item) {
         $cached = $script:PreviewCache[$pvKey]
         if ($cached -and $cached.Ok) { $tree = $cached }
     }
+    # Next the local index: if this archive's contents are already indexed (this session or a
+    # prior one), reconstruct the tree from them - no treebrowser request. Guarded for paste-mode.
+    if ($null -eq $tree -and (Get-Command Build-ArchiveTreeFromIndex -ErrorAction SilentlyContinue)) {
+        $canon = Get-ArcArchiveUri ([string]$item.Repo) (Get-ArcArchivePath ([string]$item.Path) ([string]$item.Name))
+        if ($script:ArcIndexedArchives.Contains($canon)) { $tree = Build-ArchiveTreeFromIndex $item }
+    }
     if ($null -eq $tree) {
+        # Offline 'all': no treebrowser request - if the listing isn't already in the index/cache
+        # above, it can't be shown. (Offline 'index' still fetches it: network is allowed there.)
+        if (Test-NetworkBlocked) {
+            Show-Popup @("Archive listing not available offline.", $item.Name, '',
+                "This archive isn't in the local index. Build/open it while online,",
+                "or run with --offline index to fetch listings on demand.", '', "[b] back")
+            do { $k = Read-Key } until ($k -match '^(b|q|enter|left|backspace)$')
+            return
+        }
         Show-Popup @("Reading archive", $item.Name)
         $tree = Get-ArchiveTree $item
     }
@@ -977,9 +839,15 @@ function Show-ArchiveTree([object]$item) {
         return
     }
 
-    # Storage metadata for the archive file itself (for the root's detail pane).
+    # Feed this archive's entries into the local index (same as the [w] walk does), so a
+    # later search finds them without re-walking. Idempotent + guarded for paste-mode.
+    if (Get-Command Save-BrowsedArchive -ErrorAction SilentlyContinue) { Save-BrowsedArchive $item $tree.Nodes }
+
+    # Storage metadata for the archive file itself (for the root's detail pane). Skipped offline.
     $rootInfo = $null
-    try { $rootInfo = Invoke-RestMethod -Uri $item.Uri -Headers (Get-AuthHeaders) -ErrorAction Stop } catch { }
+    if (-not (Test-NetworkBlocked)) {
+        try { $rootInfo = Invoke-RestMethod -Uri $item.Uri -Headers (Get-AuthHeaders) -ErrorAction Stop } catch { }
+    }
 
     # Synthetic root node = the archive file, holding the real top-level entries.
     $archPath = if ($item.Path) { "$($item.Path)/$($item.Name)" } else { [string]$item.Name }
@@ -1433,9 +1301,12 @@ function View-Item([object]$item, [int]$Number) {
     $labelW = 14
     $valMax = [Math]::Max(10, $w - 2 - $labelW)
 
-    # Pull full storage info for rich detail + the real download URL.
+    # Pull full storage info for rich detail + the real download URL. Skipped when offline 'all';
+    # size/modified then fall back to whatever the index already populated on the item.
     $info = $null
-    try { $info = Invoke-RestMethod -Uri $item.Uri -Headers (Get-AuthHeaders) -ErrorAction Stop } catch { }
+    if (-not (Test-NetworkBlocked)) {
+        try { $info = Invoke-RestMethod -Uri $item.Uri -Headers (Get-AuthHeaders) -ErrorAction Stop } catch { }
+    }
 
     $repo  = if ($item.Repo) { $item.Repo } else { '?' }
     $rmeta = Resolve-Repo $repo
@@ -1445,6 +1316,9 @@ function View-Item([object]$item, [int]$Number) {
         if ($info.PSObject.Properties['lastModified']) { $modified = "$($info.lastModified)" }
         if ($info.PSObject.Properties['mimeType'])     { $mime     = "$($info.mimeType)" }
         if ($info.PSObject.Properties['downloadUri'])  { $dl       = "$($info.downloadUri)" }
+    } else {
+        if ("$($item.Size)" -ne '' -and "$($item.Size)" -ne '?') { try { $size = Format-Size ([long]$item.Size) } catch { } }
+        if ($item.Modified) { $modified = "$($item.Modified)" }
     }
     if (-not $dl) {
         $seg = if ($item.Path) { "$($item.Path)/" } else { '' }
@@ -1515,7 +1389,7 @@ function View-Item([object]$item, [int]$Number) {
 # Returns 'quit' to exit the app, otherwise ''.
 function Invoke-ItemAction([object]$chosen, [int]$Number, [string]$Mode) {
     Mark-Visited ([string]$chosen.Uri)
-    if (Get-IsArchive ([string]$chosen.Name)) {
+    if (Test-ItemBrowsableArchive $chosen) {
         Show-ArchiveTree $chosen
         return ''
     }

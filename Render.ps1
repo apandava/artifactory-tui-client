@@ -412,22 +412,6 @@ function Show-Popup([string[]]$Body) {
     Write-Frame $out.ToArray()   # write but keep BaseLines intact for the next popup
 }
 
-function Format-Size([object]$bytes) {
-    if ($null -eq $bytes -or "$bytes" -eq '') { return '' }
-    $b = [double]$bytes
-    if ($b -lt 0) { return '' }
-    $units = 'B','KB','MB','GB','TB','PB'
-    $i = 0
-    while ($b -ge 1024 -and $i -lt $units.Count - 1) { $b /= 1024; $i++ }
-    if ($i -eq 0) { return "$([int]$b) B" }
-    return ('{0:0.0} {1}' -f $b, $units[$i])
-}
-
-function Get-Ext([string]$name) {
-    $dot = $name.LastIndexOf('.')
-    if ($dot -gt 0 -and $dot -lt $name.Length - 1) { return $name.Substring($dot + 1) }
-    return ''
-}
 
 
 # ── INPUT ─────────────────────────────────────────────────────────────────────

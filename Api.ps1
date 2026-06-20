@@ -51,10 +51,14 @@ function Get-AuthHeaders {
     return $h
 }
 
-# Build the artifactory REST base, tolerating URLs that already include /artifactory.
+# Build the artifactory REST base, tolerating URLs that already include /artifactory and any
+# trailing slash. The trailing-slash trim is essential: in the headless launchers a local
+# $BaseUrl parameter (un-trimmed) shadows $script:BaseUrl in PowerShell's dynamic scope
+# lookup, so without normalizing here a "https://host/" base would yield "host//artifactory".
 function Get-ArtBase {
-    if ($BaseUrl -match '/artifactory/?$') { return $BaseUrl.TrimEnd('/') }
-    return "$BaseUrl/artifactory"
+    $b = "$BaseUrl".TrimEnd('/')
+    if ($b -match '/artifactory$') { return $b }
+    return "$b/artifactory"
 }
 
 # ── REPO METADATA ─────────────────────────────────────────────────────────────
@@ -81,6 +85,9 @@ $script:Flash = @{ Message = ''; At = [DateTime]::MinValue }
 
 function Initialize-RepoMap {
     if ($script:RepoMapLoaded) { return }
+    # Offline 'all' issues no requests; the repo map stays empty and type/package columns
+    # degrade to '?' (the same graceful fallback as an anonymous-denied /api/repositories).
+    if (Test-NetworkBlocked) { $script:RepoMapLoaded = $true; return }
     $script:RepoMapLoaded = $true   # only attempt once, even if it fails
     $script:RepoMap = @{}
     try {
@@ -180,6 +187,10 @@ function Convert-UriToItem([string]$uri) {
 }
 
 function Search-Artifacts([string]$Query) {
+    # Offline (index or all): never issue a search query - the catalogue comes solely from the
+    # local index (the caller merges Search-Index results). Returning empty here is the single
+    # gate that makes every search caller (TUI + headless) honour offline without further changes.
+    if (Test-SearchLocalOnly) { return [PSCustomObject]@{ Items = @(); Total = 0; Error = $null } }
     $uri = "$(Get-ArtBase)/api/search/artifact?name=$([Uri]::EscapeDataString($Query))"
     if ($Repos) { $uri += "&repos=$([Uri]::EscapeDataString($Repos))" }
 

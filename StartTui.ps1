@@ -30,7 +30,13 @@
     that are trickled in gently. Higher = smoother fast-flicking, more requests.
 .PARAMETER OutDir
     Folder downloads are saved into (created if missing). Defaults to
-    ./art-downloads under the current directory.
+    ./output/<host>/downloads under the current directory.
+.PARAMETER Offline
+    Run without contacting the server for search. 'index' uses the saved local index as the
+    ONLY catalogue (no search queries) but still fetches content/previews/archive listings on
+    demand; 'all' makes NO requests at all - search, previews, content and archive listings come
+    only from the local index and previously-downloaded files on disk (audit is disabled). Omit
+    (or '') for normal online operation.
 #>
 param(
     [string] $BaseUrl  = '',
@@ -40,7 +46,10 @@ param(
     [string] $Repos    = '',
     [int]    $PageSize = 0,
     [int]    $Prefetch = 5,
-    [string] $OutDir   = (Join-Path (Get-Location).Path 'art-downloads')
+    [string] $OutDir   = '',
+    [string] $IndexPath = '',
+    [ValidateSet('', 'index', 'all')]
+    [string] $Offline  = ''
 )
 
 Set-StrictMode -Version Latest
@@ -110,20 +119,34 @@ $script:Vt = ($host.UI.SupportsVirtualTerminal -and $script:CanRawKey)
 # the component files having been pasted beforehand; a second run in the same
 # session is likewise a no-op.
 if ($PSScriptRoot -and -not (Get-Command Show-Page -ErrorAction SilentlyContinue)) {
-    foreach ($component in 'Render','Api','Prefetch','Views','Archive') {
+    foreach ($component in 'Core','Api','Render','Prefetch','Views','Archive','Index') {
         . (Join-Path $PSScriptRoot "$component.ps1")
     }
-    # Audit.ps1 is OPTIONAL: load it only if present beside the others. Its absence
-    # leaves the tool working exactly as before.
-    $auditPath = Join-Path $PSScriptRoot 'Audit.ps1'
-    if (Test-Path -LiteralPath $auditPath) { . $auditPath }
+    # The audit module is OPTIONAL and split into a headless engine + an interactive
+    # view: load BOTH only if both are present beside the others. Their absence leaves
+    # the tool working exactly as before.
+    $auditEng  = Join-Path $PSScriptRoot 'AuditEngine.ps1'
+    $auditView = Join-Path $PSScriptRoot 'AuditView.ps1'
+    if ((Test-Path -LiteralPath $auditEng) -and (Test-Path -LiteralPath $auditView)) {
+        . $auditEng; . $auditView
+    }
 }
 
+# Route the shared bulk-download engine's progress through the popup overlay (Core
+# leaves the hook $null; the headless engine sets a verbosity writer instead).
+$script:DownloadProgress = { param($lines) Show-Popup $lines }
+
 # Capability flag the base files gate every audit reference on. Always defined
-# (default $false) so StrictMode is satisfied when Audit.ps1 is absent; flipped on
-# only once the audit component's sentinel (Invoke-Audit) is present — whether
-# dot-sourced above (file mode) or pasted beforehand (paste mode).
-$script:AuditAvailable = [bool](Get-Command Invoke-Audit -ErrorAction SilentlyContinue)
+# (default $false) so StrictMode is satisfied when the audit module is absent; flipped
+# on only once the audit VIEW is present (its menu entry point Show-AuditMenu) —
+# whether dot-sourced above (file mode) or pasted beforehand (paste mode).
+$script:AuditAvailable = [bool](Get-Command Show-AuditMenu -ErrorAction SilentlyContinue)
+
+# The local index + archive-search engine (Index.ps1) is a CORE component, always loaded
+# in file mode; gate its key handlers / pump / startup load on its presence so a paste-mode
+# session that pasted only the original component files still runs (the [w]/[W] keys and the
+# index simply do nothing).
+$script:IndexAvailable = [bool](Get-Command Import-Index -ErrorAction SilentlyContinue)
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
@@ -136,6 +159,28 @@ if (-not $BaseUrl) {
     $BaseUrl = (Read-Host).Trim()
 }
 $BaseUrl = $BaseUrl.TrimEnd('/')
+
+# Offline mode: 'index' uses the local index as the only catalogue (no search queries) but still
+# fetches content/previews/archive listings on demand; 'all' makes no requests whatsoever (those
+# come only from the index + previously-downloaded files on disk). In 'all', the audit feature is
+# disabled - it inherently requires fetching file content to scan.
+Set-OfflineMode $Offline
+if (Test-NetworkBlocked) { $script:AuditAvailable = $false }
+
+# Resolve the per-instance output layout (now that the base URL is known): downloads + audit
+# dirs under output/<host>/. An explicit -OutDir is kept verbatim.
+$script:OutDirExplicit = ($PSBoundParameters.ContainsKey('OutDir') -and $OutDir)
+Resolve-OutputPaths
+
+# Resolve the per-instance index directory (output/<host>/index) and run the lightweight load
+# (legacy-index migration + archive skip-set). Per-page metadata is warmed on demand from the
+# shards (Warm-IndexMeta), so an indexed page fires no metadata requests. Guarded so the tool
+# runs unchanged without the index component.
+if ($script:IndexAvailable) {
+    if ($PSBoundParameters.ContainsKey('IndexPath') -and $IndexPath) { Set-IndexPath $IndexPath }
+    Resolve-IndexPath
+    if ($script:IndexEnabled) { Import-Index $script:IndexPath }
+}
 
 $query    = Read-Query
 if (-not $query) { return }   # return (not exit): quitting a pasted session must not close the console
@@ -151,6 +196,31 @@ $lastPvId   = ''       # previewed item's id last frame; changing it resets the 
 $excludeText = ''      # results exclude-filter terms ('f' edits, 'i' clears)
 $excludeRx   = @()     # compiled glob regexes for $excludeText (empty = no filter)
 $hideDone    = $false  # 'h' hides excluded + already-downloaded results from the list
+# Archive-search ('w' toggles): also search inside listable archives, walking them in the
+# background and appending matching internal entries to the results live. The local index
+# ('W' toggles) persists artifact + archive metadata to disk so warm browsing makes no
+# server requests. Both read their default from the engine's persistent settings (off / on).
+# $arcItems accumulates the archive-walk matches for the current query; $localHits holds the
+# local index name-matches; both are merged into the browse set each render.
+$arcSearch   = ($script:IndexAvailable -and $script:ArcSearchEnabled)
+$arcIndex    = (-not $script:IndexAvailable) -or $script:IndexEnabled
+$arcItems    = @()
+$localHits   = @()
+# The merged/excluded/hidden browse set ($allItems) depends only on the result set + filters,
+# NOT on page/selRow - so it's rebuilt only when an input changes (new query, new arc matches,
+# exclude/hide toggle, a download). $rebuildView gates that O(totalItems) work; navigation
+# redraws reuse the cached list (O(pageSize)), which is what keeps a huge offline result set
+# from making every keystroke laggy.
+$rebuildView   = $true
+$allItems      = @()
+$hideableCount = 0
+# Local-index results stream in chunks of $chunk rather than all at once, so the whole match set is
+# reachable without building it in one go. $searchLoadedRaw = matches pulled from the index so far;
+# $searchTotal = total matches (counted once per query). The nav loop tops up the next chunk when
+# paging to the end or when excluding/hiding leaves fewer than a window of visible rows.
+$chunk          = [int]$script:IndexSearchMax
+$searchLoadedRaw = 0
+$searchTotal     = 0
 
 # Default to passive audit (Tier-1 only, no archive walk — set in Audit.ps1) so every
 # view is flagged for secrets out of the box. The user can turn it off or switch modes
@@ -189,33 +259,92 @@ if ($script:AuditAvailable) { Start-AuditPassive }
             }
             continue main
         }
+
+        # New result set: collect local index name-matches (top-level + already-indexed
+        # archive entries) for this query, and restart the archive-search walk when enabled
+        # (its background walk targets the current query; the prior query's matches clear).
+        $localHits = @()
+        $searchLoadedRaw = 0; $searchTotal = 0
+        if ($script:IndexAvailable) {
+            $arcItems  = @()
+            # First chunk only (with the full match count), so a broad query on a large index
+            # doesn't build everything at once; the nav loop tops up further chunks on demand.
+            $localHits       = @(Search-Index $query 0 $chunk -WantTotal)
+            $searchLoadedRaw = $localHits.Count
+            $searchTotal     = [int]$script:IndexSearchTotal
+            if ($arcSearch) {
+                Start-ArcSearch $query $result.Items
+                # Surface any instant matches from the on-disk index on this first render;
+                # the background walk streams the rest in via the nav-loop poll below.
+                $arcItems = @(Receive-ArcSearchResults)
+            } else { Stop-ArcSearch }
+        }
+        $rebuildView = $true   # new query/result set: rebuild the browse set below
     }
 
-    $allItems   = @($result.Items)
-    # Exclude filter: items whose name matches a glob are dimmed and sorted to the
-    # back (included items keep their original order), mirroring the audit view.
-    if ($excludeRx.Count -gt 0 -and $allItems.Count -gt 0) {
-        $inc = [Collections.Generic.List[object]]::new()
-        $exc = [Collections.Generic.List[object]]::new()
-        foreach ($it in $allItems) {
-            if (Test-NameMatchesAny ([string]$it.Name) $excludeRx) { $exc.Add($it) } else { $inc.Add($it) }
+    # Browse set = live REST results, then local index name-matches not already present, then
+    # archive-walk matches found so far. Deduped by .Uri; REST-first + append-only discovery order
+    # keeps paging stable as matches stream in. These passes are O(totalItems) - which is huge for a
+    # broad offline index query - so they run ONLY when an input changed ($rebuildView), not on every
+    # navigation redraw. Navigation reuses the cached $allItems/$hideableCount (recomputed: new query,
+    # arc matches, exclude/hide toggle, download).
+    if ($rebuildView) {
+        $allItems = @($result.Items)
+        if ($script:IndexAvailable) {
+            $seenUri = New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($it in $allItems) { [void]$seenUri.Add([string]$it.Uri) }
+            foreach ($it in (@($localHits) + @($arcItems))) {
+                if ($it -and $seenUri.Add([string]$it.Uri)) { $allItems += $it }
+            }
+            $allItems = @($allItems)
         }
-        $allItems = @($inc.ToArray()) + @($exc.ToArray())
-    }
-    # Hide toggle ('h'): drop excluded + already-downloaded results from the view. Count
-    # the hideable ones for the footer hint; the surviving set drives pagination/numbering.
-    $hideableCount = @($allItems | Where-Object {
-        (Test-Visited ([string]$_.Uri)) -or (Test-NameMatchesAny ([string]$_.Name) $excludeRx)
-    }).Count
-    if ($hideDone) {
-        $allItems = @($allItems | Where-Object {
-            -not ((Test-Visited ([string]$_.Uri)) -or (Test-NameMatchesAny ([string]$_.Name) $excludeRx))
-        })
+        # Exclude filter: items whose name matches a glob are dimmed and sorted to the
+        # back (included items keep their original order), mirroring the audit view.
+        if ($excludeRx.Count -gt 0 -and $allItems.Count -gt 0) {
+            $inc = [Collections.Generic.List[object]]::new()
+            $exc = [Collections.Generic.List[object]]::new()
+            foreach ($it in $allItems) {
+                if (Test-NameMatchesAny ([string]$it.Name) $excludeRx) { $exc.Add($it) } else { $inc.Add($it) }
+            }
+            $allItems = @($inc.ToArray()) + @($exc.ToArray())
+        }
+        # Hide toggle ('h'): drop excluded + already-downloaded results from the view. Count
+        # the hideable ones for the footer hint; the surviving set drives pagination/numbering.
+        $hideableCount = @($allItems | Where-Object {
+            (Test-Visited ([string]$_.Uri)) -or (Test-NameMatchesAny ([string]$_.Name) $excludeRx)
+        }).Count
+        if ($hideDone) {
+            $allItems = @($allItems | Where-Object {
+                -not ((Test-Visited ([string]$_.Uri)) -or (Test-NameMatchesAny ([string]$_.Name) $excludeRx))
+            })
+        }
+        $rebuildView = $false
     }
     $totalItems = $allItems.Count
     $totalPages = [Math]::Max(1, [Math]::Ceiling($totalItems / $PageSize))
     if ($page -ge $totalPages) { $page = $totalPages - 1 }
     $offset     = $page * $PageSize
+
+    # Top up the next chunk of local-index matches when more remain AND either the current view
+    # isn't a full window (excluding/hiding trimmed it below $chunk) or we've paged to the last
+    # page. Loads one chunk, then re-runs the merge/filter via `continue main`; cascades until the
+    # window is filled or everything is loaded. Bounded: $searchLoadedRaw advances each load and
+    # the outer guard stops at $searchTotal, so it always terminates.
+    if ($script:IndexAvailable -and $searchLoadedRaw -lt $searchTotal -and
+        (($totalItems -lt $chunk) -or ($page -ge $totalPages - 1))) {
+        Show-Popup @('Loading more results...', "$searchLoadedRaw of $searchTotal scanned")
+        $more = @(Search-Index $query $searchLoadedRaw $chunk)
+        if ($more.Count -gt 0) {
+            $localHits = @($localHits) + $more
+            $searchLoadedRaw += $more.Count
+            $rebuildView = $true
+            continue main
+        }
+        $searchLoadedRaw = $searchTotal   # nothing more returned; stop topping up
+    }
+    # Header total: when index matches remain unloaded, show the upper-bound count (REST results +
+    # all index matches) so the user knows more exist than the loaded window; else 0 = "(N results)".
+    $script:ResultGrandTotal = if ($searchLoadedRaw -lt $searchTotal) { @($result.Items).Count + $searchTotal } else { 0 }
     # Assign in two steps: an `if/else` returning @() collapses to $null in the
     # output stream, which then trips Set-StrictMode on .Count downstream.
     $pageItems = @()
@@ -243,7 +372,9 @@ if ($script:AuditAvailable) { Start-AuditPassive }
     if ($detailed) {
         Initialize-RepoMap
         Receive-Prefetch         # reap finished jobs, freeing pool slots
+        if ($script:IndexAvailable) { [void](Warm-IndexMeta $pageItems) }         # fill $MetaCache from the on-disk shards (no network)
         Apply-Meta $pageItems
+        if ($script:IndexAvailable) { [void](Update-IndexFromMeta $pageItems) }   # persist newly-known metadata
     }
 
     # Passive audit (if running): enqueue this page nearest-first and pump once so
@@ -310,12 +441,15 @@ if ($script:AuditAvailable) { Start-AuditPassive }
         Restrict-PreviewPrefetch $keepPv      # drop fast fetches for rows we left
         Start-PreviewPrefetch $plan.WindowReqs # highlighted first, then nearest, fast
         Start-PreviewLookahead $plan.RestReqs  # the rest, trickled nearest-first
+        Warm-OfflinePreviews $pageItems        # offline 'all': seed cache from disk/index (no-op online)
         $pvKeys     = $plan.WindowKeys
         $pvPageKeys = $plan.AllKeys
         # Trim the preview cache so a long skim doesn't pin every file ever viewed;
         # this page's keys are protected from eviction.
         $keepPvCache = @{}; foreach ($k in $pvPageKeys) { $keepPvCache[$k] = $true }
         Restrict-PreviewCache $keepPvCache
+        # Archive previews fetch the whole tree - feed any that have resolved into the index.
+        if ($script:IndexAvailable) { Save-PreviewedArchives $pageItems }
     } else {
         Restrict-PreviewPrefetch @{}          # left preview mode: drop pending work
         Stop-PreviewLookahead
@@ -360,12 +494,16 @@ if ($script:AuditAvailable) { Start-AuditPassive }
         # key off the caches, not the queues. Keeps a partially-loaded page (and the
         # preview pane / badges) filling in instead of sitting stale, without ever
         # blocking the keyboard.
+        # In offline 'all' no background fetch ever runs, so the metadata/preview clauses can
+        # never resolve - skip them (Test-NetworkBlocked) so navigation blocks cleanly instead of
+        # spinning the 120 ms poll. Metadata is warmed from the index and previews seeded from disk.
         elseif ($script:CanRawKey -and (
-                    ($detailed -and (Get-MissingMeta $pageItems) -gt 0 -and $idleTicks -lt 30) -or
-                    ($preview  -and ((Get-PreviewLoadingCount $pvKeys) -gt 0 -or
+                    ($detailed -and -not (Test-NetworkBlocked) -and (Get-MissingMeta $pageItems) -gt 0 -and $idleTicks -lt 30) -or
+                    ($preview  -and -not (Test-NetworkBlocked) -and ((Get-PreviewLoadingCount $pvKeys) -gt 0 -or
                                      ((Get-PreviewPendingCount $pvPageKeys) -gt 0 -and (Test-PreviewLookaheadAlive)))) -or
                     ($script:AuditAvailable -and $script:AuditState -eq 'passive' -and
-                        ($script:AuditQueue.Count -gt 0 -or $script:AuditJobs.Count -gt 0)))) {
+                        ($script:AuditQueue.Count -gt 0 -or $script:AuditJobs.Count -gt 0)) -or
+                    ($arcSearch -and $script:IndexAvailable -and $script:ArcSearchState -eq 'walking'))) {
             $key = Read-KeyTimeoutCased 120
             if ($null -eq $key) {
                 Receive-Prefetch
@@ -377,6 +515,7 @@ if ($script:AuditAvailable) { Start-AuditPassive }
                     $shownCached = $nowCached
                     $idleTicks   = 0
                     Apply-Meta $pageItems
+                    if ($script:IndexAvailable) { [void](Update-IndexFromMeta $pageItems) }   # persist newly-known metadata
                     $redraw = $true
                 } elseif ($detailed -and (Get-MissingMeta $pageItems) -gt 0 -and (Get-LoadingMeta $pageItems) -eq 0) {
                     # Nothing landed and nothing is in flight: re-queue the
@@ -400,6 +539,7 @@ if ($script:AuditAvailable) { Start-AuditPassive }
                     $pvPageKeys = $plan.AllKeys
                     $keepPvCache = @{}; foreach ($k in $pvPageKeys) { $keepPvCache[$k] = $true }
                     Restrict-PreviewCache $keepPvCache
+                    if ($script:IndexAvailable) { Save-PreviewedArchives $pageItems }   # index resolved archive previews
                     $pvNow      = Get-PreviewLoadedCount $pvPageKeys
                     if ($pvNow -ne $pvLoaded) { $pvLoaded = $pvNow; $redraw = $true }
                 }
@@ -407,6 +547,15 @@ if ($script:AuditAvailable) { Start-AuditPassive }
                 # Passive audit: enqueue/pump and redraw as matches land.
                 if ($script:AuditAvailable -and $script:AuditState -eq 'passive') {
                     if (Invoke-AuditPassiveTick $pageItems $selRow) { $redraw = $true }
+                }
+
+                # Archive-search: advance the background walk and pull in any new matches.
+                # New rows change the result set, so break out to the main loop to recompute
+                # pagination and redraw (the current page + selection are preserved).
+                if ($arcSearch -and $script:IndexAvailable -and $script:ArcSearchState -eq 'walking') {
+                    Invoke-ArcSearchPump
+                    $arcNew = @(Receive-ArcSearchResults)
+                    if ($arcNew.Count -gt 0) { $arcItems = @($arcItems) + $arcNew; $rebuildView = $true; break nav }
                 }
 
                 if ($redraw) {
@@ -440,6 +589,28 @@ if ($script:AuditAvailable) { Start-AuditPassive }
                     -not ((Test-Visited ([string]$_.Uri)) -or (Test-NameMatchesAny ([string]$_.Name) $excludeRx))
                 }))
             }
+            $rebuildView = $true   # items now downloaded: refresh hideable/hidden set
+            break nav
+        }
+        # [W] (Shift+W) toggles the local index on/off (startup load + all write-through).
+        # Case-sensitive BEFORE the switch so it doesn't collide with lowercase [w].
+        if ($key -ceq 'W' -and $script:IndexAvailable) {
+            $arcIndex = -not $arcIndex
+            $script:IndexEnabled = $arcIndex
+            # Turning it on mid-session: ensure the lightweight load ran (migration + skip-set);
+            # per-page Warm-IndexMeta resumes warming from the shards on the next render.
+            if ($arcIndex) { Import-Index $script:IndexPath }
+            $script:Flash.Message = "Local index $(if ($arcIndex) { 'on' } else { 'off' }) ($(Split-Path -Leaf $script:IndexPath))"
+            $script:Flash.At      = [DateTime]::UtcNow
+            break nav
+        }
+        # [V] (Shift+V) toggles skip-versions for the archive walk: when on (default), only the
+        # first version of each artifact is expanded/indexed. Affects archives discovered AFTER
+        # the toggle - already-seen ones are unchanged. Case-sensitive BEFORE the switch.
+        if ($key -ceq 'V' -and $script:IndexAvailable) {
+            $script:ArcSkipVersions = -not $script:ArcSkipVersions
+            $script:Flash.Message = "Skip archive versions $(if ($script:ArcSkipVersions) { 'on' } else { 'off' })"
+            $script:Flash.At      = [DateTime]::UtcNow
             break nav
         }
         switch -regex ($key) {
@@ -477,6 +648,7 @@ if ($script:AuditAvailable) { Start-AuditPassive }
                 if ($pageItems.Count -gt 0 -and $absIdx -ge 0 -and $absIdx -lt $totalItems) {
                     if ((Invoke-ItemAction $allItems[$absIdx] ($absIdx + 1) $mode) -eq 'quit') { break main }
                 }
+                $rebuildView = $true   # a download marks the item visited: refresh hideable/hidden set
                 break nav
             }
             '^g$' { $t = Read-PageNumber $totalPages; if ($null -ne $t) { $page = $t; $selRow = 0 }; break nav }
@@ -490,7 +662,7 @@ if ($script:AuditAvailable) { Start-AuditPassive }
                 # ceiling can't be bypassed and archives are left alone.
                 if ($mode -eq 'preview' -and $pageItems.Count -gt 0) {
                     $it = $allItems[$offset + $selRow]
-                    if (-not (Get-IsArchive ([string]$it.Name))) {
+                    if (-not (Test-ItemBrowsableArchive $it)) {
                         $u  = Get-ItemUrl $it
                         $sz = if ("$($it.Size)" -ne '' -and "$($it.Size)" -ne '?') { [long]$it.Size } else { -1 }
                         $st = Get-PreviewState ([string]$it.Name) $u $sz
@@ -506,17 +678,39 @@ if ($script:AuditAvailable) { Start-AuditPassive }
                 # @() keeps a single-term result an array (a lone regex would otherwise
                 # unwrap to a scalar and break $excludeRx.Count downstream).
                 $excludeRx   = @(Get-GlobRegexes $excludeText)
-                $page = 0; $selRow = 0
+                $page = 0; $selRow = 0; $rebuildView = $true
                 break nav
             }
             '^i$' {
                 # Clear the exclude filter (show all results in their original order).
-                if ($excludeRx.Count -gt 0) { $excludeText = ''; $excludeRx = @(); $page = 0; $selRow = 0 }
+                if ($excludeRx.Count -gt 0) { $excludeText = ''; $excludeRx = @(); $page = 0; $selRow = 0; $rebuildView = $true }
                 break nav
             }
             '^h$' {
                 # Toggle hiding excluded + already-downloaded results from the list.
-                $hideDone = -not $hideDone; $page = 0; $selRow = 0; break nav
+                $hideDone = -not $hideDone; $page = 0; $selRow = 0; $rebuildView = $true; break nav
+            }
+            '^w$' {
+                # Toggle archive-search: also walk listable archives in the background and
+                # append matching internal entries to the results. Enabling kicks off the
+                # walk for the current query (seeding instant matches from the index);
+                # disabling aborts the walk and drops the archive matches from the view.
+                if ($script:IndexAvailable) {
+                    $arcSearch = -not $arcSearch
+                    $script:ArcSearchEnabled = $arcSearch
+                    if ($arcSearch) {
+                        Start-ArcSearch $query $result.Items
+                        $arcItems = @(Receive-ArcSearchResults)
+                        $script:Flash.Message = 'Archive-search on: walking listable archives in the background...'
+                    } else {
+                        Stop-ArcSearch
+                        $arcItems = @()
+                        $script:Flash.Message = 'Archive-search off.'
+                    }
+                    $script:Flash.At = [DateTime]::UtcNow
+                    $page = 0; $selRow = 0; $rebuildView = $true
+                }
+                break nav
             }
             '^a$' {
                 # Open the audit menu (only when the audit component is loaded).
@@ -528,6 +722,7 @@ if ($script:AuditAvailable) { Start-AuditPassive }
                         Items         = $allItems
                     }
                     [void](Show-AuditMenu $ctx)
+                    $rebuildView = $true   # audit view may have downloaded/excluded items
                     break nav   # redraw results (markers / returning from audit view)
                 }
             }
@@ -540,6 +735,7 @@ if ($script:AuditAvailable) { Start-AuditPassive }
                 $spec = if ($script:CanRawKey -and $key.Length -eq 1) { Read-NumberSpec $key } else { $key }
                 $idx  = @(Parse-NumberSpec $spec $totalItems)   # @() so an empty spec doesn't $null under StrictMode
                 if ($idx.Count -gt 0) { Save-ItemSet (@($idx | ForEach-Object { $allItems[$_ - 1] })) }
+                $rebuildView = $true   # downloaded items: refresh hideable/hidden set
                 break nav   # redraw the results page
             }
         }
@@ -550,5 +746,6 @@ Stop-Lookahead          # signal the background trickles to stop (process exit r
 Stop-PreviewLookahead
 Close-PrefetchPools     # release the pools' worker runspaces
 if ($script:AuditAvailable) { Stop-AuditWork }   # abort any audit workers/walker (matters in paste-mode sessions)
+if ($script:IndexAvailable) { Stop-ArcSearch }   # abort any archive-search walk/expansions
 
 Clear-Screen
