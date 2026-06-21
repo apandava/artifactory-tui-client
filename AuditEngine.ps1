@@ -457,6 +457,59 @@ $script:AuditWalkArchives = $false
 # with NO file content fetched. Default off (Tier-1 only).
 $script:AuditTier2 = $false
 
+# When on (default), Tier-1 surfaces synthetic "skipped" findings (SkippedTier2 for a relay-eligible
+# file with no Tier-1 match; SkippedOversizeText for a too-big readable file) so the TUI can show
+# what a Tier-2 pass would cover. These are default-EXCLUDED and never written to any CSV, so the
+# headless launcher turns this OFF (Initialize-AuditRunConfig): at multi-million scale holding one
+# finding object per relay-eligible file is pure memory waste. NOT reset by Reset-AuditEngine.
+$script:AuditEmitSkipped = $true
+
+# ── TIER-2 WORKLIST (Phase A writer) ──────────────────────────────────────────
+# The two-phase Tier-2 flow: a Tier-1 pass writes a worklist of every relay-eligible file (one Tier-2
+# would content-inspect) THROUGH to disk, and a later/continued pass (Phase B, Start-AuditTier2List)
+# streams it back, content-scans each, and checkpoints a resumable cursor. When $AuditTier2ListPath is
+# set, Add-AuditRecord's Tier-1 branch appends a row here. Buffered (StringBuilder flushed by row
+# threshold) so millions of appends don't open/close the file per row - mirrors the index's
+# ShardWriteBuf. Schema: repo,path,name,archive,size,modified,url (url = content download url; the
+# !/ form for archive entries; non-empty archive marks an archive-internal entry). NOT reset by
+# Reset-AuditEngine; cleared explicitly at phase transitions.
+$script:AuditTier2ListPath  = ''
+$script:AuditTier2ListBuf   = $null
+$script:AuditTier2ListRows  = 0
+$script:AuditTier2ListTotal = 0     # rows written this run (reported by the launcher)
+$script:AuditTier2ListFlush = 512
+
+function Open-AuditTier2List([string]$path) {
+    $script:AuditTier2ListPath  = $path
+    $script:AuditTier2ListBuf   = [Text.StringBuilder]::new()
+    $script:AuditTier2ListRows  = 0
+    $script:AuditTier2ListTotal = 0
+    $dir = Split-Path -Parent $path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { try { New-Item -ItemType Directory -Path $dir -Force | Out-Null } catch { } }
+    # Fresh worklist (truncate) + header, no-BOM UTF-8/LF. Drop any stale progress cursor so a later
+    # resume of THIS rebuilt list starts at row 0 (a leftover cursor would skip the wrong rows).
+    try { Remove-Item -LiteralPath (Get-AuditT2CursorPath $path) -Force -ErrorAction SilentlyContinue } catch { }
+    try { [System.IO.File]::WriteAllText($path, (Format-CsvRow @('repo','path','name','archive','size','modified','url')) + "`n", [Text.UTF8Encoding]::new($false)) } catch { }
+}
+function Write-AuditTier2ListRow($rec) {
+    if (-not $script:AuditTier2ListPath -or $null -eq $script:AuditTier2ListBuf) { return }
+    $arch = if ($rec.IsArchiveEntry) { [string]$rec.ArchiveName } else { '' }
+    $sz   = if ($rec.KnownSize -ge 0) { [long]$rec.KnownSize } else { -1 }
+    [void]$script:AuditTier2ListBuf.Append((Format-CsvRow @(
+        [string]$rec.Repo, [string]$rec.Path, [string]$rec.Name, $arch, $sz, [string]$rec.KnownModified, [string]$rec.Url))).Append("`n")
+    $script:AuditTier2ListRows++; $script:AuditTier2ListTotal++
+    if ($script:AuditTier2ListRows -ge $script:AuditTier2ListFlush) { Flush-AuditTier2List }
+}
+function Flush-AuditTier2List {
+    if ($null -eq $script:AuditTier2ListBuf -or $script:AuditTier2ListBuf.Length -eq 0) { return }
+    try { [System.IO.File]::AppendAllText($script:AuditTier2ListPath, $script:AuditTier2ListBuf.ToString(), [Text.UTF8Encoding]::new($false)) } catch { }
+    [void]$script:AuditTier2ListBuf.Clear(); $script:AuditTier2ListRows = 0
+}
+function Close-AuditTier2List {
+    Flush-AuditTier2List
+    $script:AuditTier2ListPath = ''; $script:AuditTier2ListBuf = $null; $script:AuditTier2ListRows = 0
+}
+
 # Marker map read by the base row renderers: key -> highest raw severity. Synchronized
 # only so a stale read during a write can't throw; written on the main thread.
 $script:AuditFlags   = [hashtable]::Synchronized(@{})
@@ -464,8 +517,15 @@ $script:AuditFlags   = [hashtable]::Synchronized(@{})
 # Findings (main-thread): the ordered list plus a key->object index for dedupe/merge.
 $script:AuditFindings    = [Collections.Generic.List[object]]::new()
 $script:AuditFindingIdx  = @{}
-$script:AuditSeen        = New-Object 'System.Collections.Generic.HashSet[string]'  # keys already enqueued
-$script:AuditDecided     = New-Object 'System.Collections.Generic.HashSet[string]'  # keys fully scanned (drives the passive * / ? glyph)
+# These per-item dedup sets grow with the CATALOGUE size (artifact count), not the match count, so
+# at multi-million scale they must be cheap: we store a 128-bit hash of each key/identity rather
+# than the full string (a full storage uri averages ~90 chars - ~1.3 GB of strings across the three
+# sets at 2M items). The hash is a ValueTuple of two independent 64-bit FNV-1a lanes (Get-AuditHash128);
+# collision probability at 2-3M is ~1e-26, so it never drops an artifact. ValueTuple has structural
+# equality, so the HashSet needs no comparer (the IgnoreCase semantics of the path set live in
+# Get-AuditPathHash, which lowercases before hashing).
+$script:AuditSeen        = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'  # key hashes already enqueued
+$script:AuditDecided     = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'  # key hashes fully scanned (drives the passive * / ? glyph)
 # Content-identity dedup. The same file in one repo can be reached under more than one
 # differently-formatted storage uri (the walker's constructed uri vs a search-result uri;
 # trailing-slash / encoding variants) — which the uri-keyed AuditSeen above can't collapse,
@@ -474,13 +534,32 @@ $script:AuditDecided     = New-Object 'System.Collections.Generic.HashSet[string
 # kept, as is a different path. Archive entries qualify the identity with their archive name
 # so same-named entries in different archives aren't merged. (The other pair source — a
 # virtual repo re-listing a backing repo's artifacts — is cut off in Get-AuditWalkRepos,
-# which skips virtual repos.)
-$script:AuditSeenPath    = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+# which skips virtual repos.) Stored as 128-bit hashes of the lowercased identity (was an
+# OrdinalIgnoreCase string set — see Get-AuditPathHash).
+$script:AuditSeenPath    = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'
 function Get-AuditPathIdentity($rec) {
     $base = "$($rec.Repo)|$($rec.Path)|$($rec.Name)"
     if ($rec.IsArchiveEntry) { return "$($rec.ArchiveName)!$base" }
     return $base
 }
+
+# 128-bit hash of a string, packed into a ValueTuple used as the element type of the per-item dedup
+# sets so they hold 16 bytes/entry instead of a whole string. It is a NON-cryptographic distribution
+# hash (MD5 here only as a fast, built-in 128-bit mixer for hashtable keys — not a security control),
+# split into two UInt64 lanes. MD5 sidesteps PS 5.1's lack of unchecked 64-bit integer arithmetic
+# (a manual FNV multiply overflows UInt64 -> promotes to Double and throws on the mask). The single
+# instance is reused on the MAIN THREAD only (all set Add/Contains/Remove are main-thread; the
+# worker runspaces key $AuditFetch by string and never call this). Ordinal (UTF-8 bytes).
+$script:AuditHasher = [System.Security.Cryptography.MD5]::Create()
+function Get-AuditHash128([string]$s) {
+    $b = $script:AuditHasher.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s))
+    return [System.ValueTuple[System.UInt64,System.UInt64]]::new(
+        [System.BitConverter]::ToUInt64($b, 0), [System.BitConverter]::ToUInt64($b, 8))
+}
+# Hash of a work record's uri key (ordinal).
+function Get-AuditKeyHash([string]$key) { return (Get-AuditHash128 $key) }
+# Hash of a work record's path-identity, lowercased to preserve the set's old IgnoreCase semantics.
+function Get-AuditPathHash($rec) { return (Get-AuditHash128 ((Get-AuditPathIdentity $rec).ToLower())) }
 
 # ── AUDIT-MATCH LOG (audit/<repo>-matches.csv) ─────────────────────────────────
 # Every rule match (passive / location / full) is recorded for logging, the way scrape mode
@@ -596,6 +675,10 @@ $script:AuditWalkPending = $false
 
 # Progress + rate metrics.
 $script:AuditEnq      = 0    # accepted for audit (not discarded/dup); grows during full walk
+# Known denominator for the progress display when the total IS known up front (the Tier-2 worklist
+# feeder sets it to the rows remaining this run). 0 = unknown (index/full walk discover incrementally),
+# in which case the display falls back to $AuditEnq. Reset by Reset-AuditEngine.
+$script:AuditEnqTotal = 0
 $script:AuditDone     = 0    # fully processed
 $script:AuditLaunched = 0    # content workers started (~requests)
 $script:AuditBytes    = 0L   # content bytes scanned
@@ -761,20 +844,40 @@ function New-AuditWorkNode($n, [string]$arcName) {
     }
 }
 
+# Build a normalized work record from an index archive-entry result item (the shape
+# New-ArcResultItem returns: Name/Repo/Path + InArchive/ArchiveName/EntryUrl + Size/Modified).
+# Used by the index-backed audit feeder: the archive's entries are already in the index, so we
+# audit them directly without a live treebrowser expansion. Size/Modified come from the index row,
+# so no metadata request is made; the content fetch (Tier 2) uses EntryUrl as the download url and
+# leaves Uri blank (no storage call). Mirrors New-AuditWorkNode but reads a flat result item.
+function New-AuditWorkArcItem($it) {
+    $known = -1
+    if ("$($it.Size)" -match '^-?\d+$') { try { $known = [long]$it.Size } catch { $known = -1 } }
+    return @{
+        Key=[string]$it.EntryUrl; Name=[string]$it.Name; Repo=[string]$it.Repo
+        Path=[string]$it.Path; Uri=''; Url=[string]$it.EntryUrl
+        KnownSize=$known; KnownModified=[string]$it.Modified
+        IsArchiveEntry=$true; ArchiveName=[string]$it.ArchiveName
+        IsArchive=$false
+    }
+}
+
 # ── ENQUEUE ───────────────────────────────────────────────────────────────────
 # Classify a work record's metadata immediately (no I/O); record any Tier-1 finding
 # now and, when content rules apply, queue it for a background content fetch. Returns
 # nothing; updates state/metrics. Deduped by key via $AuditSeen.
 function Add-AuditRecord($rec) {
-    if (-not $rec.Key -or $script:AuditSeen.Contains($rec.Key)) { return }
-    [void]$script:AuditSeen.Add($rec.Key)
+    if (-not $rec.Key) { return }
+    $kh = Get-AuditKeyHash $rec.Key
+    if ($script:AuditSeen.Contains($kh)) { return }
+    [void]$script:AuditSeen.Add($kh)
     $m = Test-AuditMeta $rec.Name $rec.Path
-    if ($m.Discard) { [void]$script:AuditDecided.Add($rec.Key); return }
+    if ($m.Discard) { [void]$script:AuditDecided.Add($kh); return }
     # Drop a re-encounter of the same file (same repo + path + name) reached under a
     # differently-formatted uri; the same path + name in a different repo is a distinct
     # file and kept, as is a different path. See $AuditSeenPath.
-    if (-not $script:AuditSeenPath.Add((Get-AuditPathIdentity $rec))) {
-        [void]$script:AuditDecided.Add($rec.Key); return
+    if (-not $script:AuditSeenPath.Add((Get-AuditPathHash $rec))) {
+        [void]$script:AuditDecided.Add($kh); return
     }
     $script:AuditEnq++
     if ($m.Findings.Count -gt 0) { Add-AuditFinding $rec (Resolve-AuditFindings $m.Findings) }
@@ -793,14 +896,20 @@ function Add-AuditRecord($rec) {
         $rec.Previewable    = (Get-IsPreviewable $rec.Name)
         $script:AuditQueue.Enqueue($rec)   # decided once its content fetch completes
     } elseif (-not $expand) {
-        # Tier-1-only: a file that would have been content-scanned (has relay content
-        # rules) but earned no Tier-1 finding is surfaced under the synthetic skipped
-        # rule — visible but default-excluded, like the oversize rule.
-        if ($m.ContentRules.Count -gt 0 -and $m.Findings.Count -eq 0) {
+        # Tier-1 pass over a relay-eligible file (has content rules) but Tier-2 is OFF: this is a
+        # file Tier-2 WOULD content-inspect. When a worklist is open (Phase A of the two-phase
+        # Tier-2 flow) write it through to disk for a later/continued Tier-2 pass - EVERY relay file,
+        # including ones that already earned a Tier-1 finding (so Phase B can still content-enrich
+        # them). Streamed, not retained.
+        if ($script:AuditTier2ListPath -and $m.ContentRules.Count -gt 0) { Write-AuditTier2ListRow $rec }
+        # Otherwise (no worklist), optionally surface the synthetic skipped finding so the TUI can
+        # show what Tier-2 would cover. Default-excluded, never written to a CSV; suppressed headless
+        # ($AuditEmitSkipped off) since at multi-million scale one per relay file is pure memory waste.
+        elseif ($script:AuditEmitSkipped -and $m.ContentRules.Count -gt 0 -and $m.Findings.Count -eq 0) {
             Add-AuditFinding $rec @{ Sev='Informational'; Rank=1; Rule=$script:AuditSkippedRule; AllRules=$script:AuditSkippedRule; Count=1 }
         }
         $script:AuditDone++
-        [void]$script:AuditDecided.Add($rec.Key)
+        [void]$script:AuditDecided.Add($kh)
     }
     if ($expand) { Add-AuditArchiveJob $rec }
 }
@@ -809,7 +918,7 @@ function Add-AuditRecord($rec) {
 # just sends it) whose result is flattened into per-entry work. Deduped by a
 # distinct "ARC|<uri>" key so it can't collide with the archive file's own record.
 function Add-AuditArchiveJob($rec) {
-    $akey = "ARC|$($rec.Uri)"
+    $akey = Get-AuditKeyHash "ARC|$($rec.Uri)"
     if ($script:AuditSeen.Contains($akey)) { return }
     [void]$script:AuditSeen.Add($akey)
     $archPath = if ($rec.Path) { "$($rec.Path)/$($rec.Name)" } else { [string]$rec.Name }
@@ -863,7 +972,7 @@ function Complete-ArchiveJob($rec) {
     $res = $null
     if ($script:AuditFetch.ContainsKey($key)) { $res = $script:AuditFetch[$key]; [void]$script:AuditFetch.Remove($key) }
     $script:AuditDone++
-    [void]$script:AuditDecided.Add($key)
+    [void]$script:AuditDecided.Add((Get-AuditKeyHash $key))
     if ($res -and $res.Ok) {
         $entries = [Collections.Generic.List[object]]::new()
         Get-AuditFlatEntries $res.Nodes $entries
@@ -893,7 +1002,7 @@ function Complete-AuditJob($rec) {
     $res = $null
     if ($script:AuditFetch.ContainsKey($key)) { $res = $script:AuditFetch[$key]; [void]$script:AuditFetch.Remove($key) }
     $script:AuditDone++
-    [void]$script:AuditDecided.Add($key)
+    [void]$script:AuditDecided.Add((Get-AuditKeyHash $key))
     if ($null -eq $res) { return }
     if ($res.Ok -and $res.Text) {
         $cf = Test-AuditContent $res.Text $rec.ContentRules
@@ -906,7 +1015,8 @@ function Complete-AuditJob($rec) {
     }
     # No content hit. If it's a readable text file skipped only for size, and it has
     # no other finding, surface it under the synthetic oversize rule (default-excluded).
-    if ($res.Ok -and $res.TooBig -and $rec.Previewable -and -not $script:AuditFindingIdx.ContainsKey($key)) {
+    # Suppressed when $AuditEmitSkipped is off (headless): never written to any CSV.
+    if ($script:AuditEmitSkipped -and $res.Ok -and $res.TooBig -and $rec.Previewable -and -not $script:AuditFindingIdx.ContainsKey($key)) {
         Add-AuditFinding $rec @{ Sev='Informational'; Rank=1; Rule=$script:AuditOversizeRule; AllRules=$script:AuditOversizeRule; Count=1 } $res.Size $res.Modified
     }
 }
@@ -968,13 +1078,15 @@ function Invoke-AuditPump {
     if ($script:AuditState -ne 'paused') {
         if ($script:AuditWalkPending) { $script:AuditWalkPending = $false; [void](Start-AuditWalk) }
         Step-AuditWalk
+        Step-AuditIndexWalk
+        Step-AuditTier2List
         Step-AuditEntries
         Dispatch-AuditWork
     }
     Update-AuditMetrics
     if ($script:AuditState -eq 'running' -and $script:AuditQueue.Count -eq 0 -and
         $script:AuditJobs.Count -eq 0 -and $script:AuditPendingNodes.Count -eq 0 -and
-        -not (Test-AuditWalkActive)) {
+        -not (Test-AuditWalkActive) -and -not (Test-AuditIndexWalkActive) -and -not (Test-AuditTier2ListActive)) {
         $script:AuditState = 'done'; $script:AuditDirty = $true
     }
 }
@@ -992,6 +1104,8 @@ function Resume-AuditEngine  { if ($script:AuditState -eq 'paused')  { $script:A
 function Stop-AuditWork {
     $script:AuditWalkPending = $false
     Stop-AuditWalk
+    Stop-AuditIndexWalk
+    Stop-AuditTier2List
     foreach ($j in $script:AuditJobs) {
         try { [void]$j.PS.Stop() } catch { }
         try { $j.PS.Dispose() }    catch { }
@@ -1014,14 +1128,14 @@ function Reset-AuditEngine {
     $script:AuditState = 'idle'; $script:AuditMode = ''; $script:AuditScope = ''
     $script:AuditFindings = [Collections.Generic.List[object]]::new()
     $script:AuditFindingIdx = @{}
-    $script:AuditSeen = New-Object 'System.Collections.Generic.HashSet[string]'
-    $script:AuditSeenPath = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $script:AuditDecided = New-Object 'System.Collections.Generic.HashSet[string]'
+    $script:AuditSeen = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'
+    $script:AuditSeenPath = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'
+    $script:AuditDecided = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'
     $script:AuditMetaTried = New-Object 'System.Collections.Generic.HashSet[string]'
     $script:AuditExcludes = @()
     $script:AuditFlags.Clear()
     $script:AuditSortCount = -1; $script:AuditSortDirty = $true
-    $script:AuditEnq = 0; $script:AuditDone = 0; $script:AuditLaunched = 0; $script:AuditBytes = 0L
+    $script:AuditEnq = 0; $script:AuditEnqTotal = 0; $script:AuditDone = 0; $script:AuditLaunched = 0; $script:AuditBytes = 0L
     $script:AuditRate = @{ QPS=0.0; FPS=0.0; BPS=0L }
     $script:AuditRateSnap = @{ At=[DateTime]::UtcNow; Done=0; Launched=0; Bytes=0L }
     $script:AuditDirty = $true
@@ -1145,6 +1259,261 @@ function Stop-AuditWalk {
     Receive-AuditWalk
 }
 
+# ── INDEX-BACKED FEEDER (no discovery) ────────────────────────────────────────
+# The headless 'index' mode sources its work ONLY from the local index (the per-repo CSV shards +
+# archive buckets Index.ps1 maintains) instead of a live /api/storage walk or REST search. The
+# index already carries size/modified, so Tier-1 classification fires ZERO requests; only Tier-2
+# content scanning hits the server. Mirrors the full-walk pattern (Step-/Test-AuditWalk) but reads
+# local files on the main thread, advancing a bounded number of rows per pump tick so a huge index
+# trickles into findings instead of arriving in one burst. Dependency direction is allowed: this
+# optional module CALLS INTO the core Index.ps1 (Get-IndexedRepos / Get-ArtifactShardPath /
+# Get-ArchiveBucketFiles / New-ArcIndexEntry / ...); Index.ps1 never depends back on audit.
+$script:AuditIdxActive    = $false   # feeder has rows left to stream
+$script:AuditIdxRepos     = $null    # [List] repo keys still to process
+$script:AuditIdxRepoPos   = 0        # index into AuditIdxRepos
+$script:AuditIdxRepo      = ''       # current repo key (for building records)
+$script:AuditIdxFiles     = $null    # [List] of @{ Path; IsArc } for the current repo (shard then buckets)
+$script:AuditIdxFilePos   = 0        # index into AuditIdxFiles
+$script:AuditIdxEnum      = $null    # live ReadLines enumerator for the current file
+$script:AuditIdxEnumIsArc = $false   # is the current file an archive bucket (vs the artifact shard)?
+# Back-pressure: stop feeding while the Tier-2 backlog (queued + in-flight content fetches) is
+# this deep, so memory stays bounded on a Tier-2 run. Tier-1-only never queues, so it streams freely.
+$script:AuditIdxQueueCap  = 2000
+
+# Open the next on-disk shard/bucket enumerator. Advances within the current repo's file list, then
+# to the next repo (building its file list: artifact shard first, then each arc bucket). Returns
+# $true when an enumerator was opened, $false when every repo is exhausted (and clears the active
+# flag). Missing/unreadable files are skipped.
+function Open-AuditIdxNextFile {
+    while ($true) {
+        if ($null -ne $script:AuditIdxFiles -and $script:AuditIdxFilePos -lt $script:AuditIdxFiles.Count) {
+            $entry = $script:AuditIdxFiles[$script:AuditIdxFilePos]; $script:AuditIdxFilePos++
+            if (Test-Path -LiteralPath $entry.Path) {
+                try {
+                    $script:AuditIdxEnum      = [System.IO.File]::ReadLines($entry.Path).GetEnumerator()
+                    $script:AuditIdxEnumIsArc = [bool]$entry.IsArc
+                    return $true
+                } catch { continue }
+            }
+            continue
+        }
+        if ($null -eq $script:AuditIdxRepos -or $script:AuditIdxRepoPos -ge $script:AuditIdxRepos.Count) {
+            $script:AuditIdxActive = $false
+            return $false
+        }
+        $repo = $script:AuditIdxRepos[$script:AuditIdxRepoPos]; $script:AuditIdxRepoPos++
+        $script:AuditIdxRepo = $repo
+        $files = [Collections.Generic.List[object]]::new()
+        $files.Add(@{ Path = (Get-ArtifactShardPath $repo); IsArc = $false })
+        foreach ($ap in (Get-ArchiveBucketFiles $repo)) { $files.Add(@{ Path = $ap; IsArc = $true }) }
+        $script:AuditIdxFiles   = $files
+        $script:AuditIdxFilePos = 0
+    }
+}
+
+# Drain a bounded batch of index rows per tick and enqueue each for auditing. Top-level shard rows
+# (path,name,size,modified) rebuild a storage item the way Search-Index does; arc-bucket rows
+# (archDir,archName,internalPath,size,modified) rebuild an archive-entry item. Honors the Tier-2
+# back-pressure cap. Uses an explicit enumerator disposed on advance (the ReadLines/break leak
+# caveat), so a read handle is never leaked between files.
+function Step-AuditIndexWalk {
+    if (-not $script:AuditIdxActive) { return }
+    if (($script:AuditQueue.Count + $script:AuditJobs.Count) -ge $script:AuditIdxQueueCap) { return }
+    $n = 0
+    while ($n -lt 300) {
+        if ($null -eq $script:AuditIdxEnum) {
+            if (-not (Open-AuditIdxNextFile)) { break }
+        }
+        $moved = $false
+        try { $moved = $script:AuditIdxEnum.MoveNext() } catch { $moved = $false }
+        if (-not $moved) {
+            try { $script:AuditIdxEnum.Dispose() } catch { }
+            $script:AuditIdxEnum = $null
+            continue
+        }
+        $line = $script:AuditIdxEnum.Current
+        $n++
+        if (-not "$line".Trim()) { continue }
+        $f = Read-CsvRow $line
+        if ($script:AuditIdxEnumIsArc) {
+            # archDir,archName,internalPath,size,modified (blank internalPath = empty-archive marker)
+            if ($f.Count -lt 3 -or -not $f[2]) { continue }
+            $sz = if ($f.Count -ge 4) { $f[3] } else { -1 }
+            $md = if ($f.Count -ge 5) { $f[4] } else { '' }
+            $e  = New-ArcIndexEntry $script:AuditIdxRepo $f[0] $f[1] $f[2] $sz $md
+            Add-AuditRecord (New-AuditWorkArcItem (New-ArcResultItem $e))
+        } else {
+            # path,name,size,modified
+            if ($f.Count -lt 2 -or -not $f[1]) { continue }
+            $it = Convert-UriToItem (Get-StorageUriFor $script:AuditIdxRepo $f[0] $f[1])
+            if ($f.Count -ge 3 -and "$($f[2])" -ne '') { $it.Size = $f[2] }
+            if ($f.Count -ge 4) { $it.Modified = $f[3] }
+            Add-AuditRecord (New-AuditWorkItem $it)
+        }
+    }
+    if ($n -gt 0) { $script:AuditDirty = $true }
+}
+
+# Active while the feeder still has shards/rows to stream.
+function Test-AuditIndexWalkActive { return [bool]$script:AuditIdxActive }
+
+# Tear down the feeder: dispose the live enumerator and clear state.
+function Stop-AuditIndexWalk {
+    if ($null -ne $script:AuditIdxEnum) {
+        try { $script:AuditIdxEnum.Dispose() } catch { }
+        $script:AuditIdxEnum = $null
+    }
+    $script:AuditIdxActive  = $false
+    $script:AuditIdxRepos   = $null
+    $script:AuditIdxFiles   = $null
+    $script:AuditIdxRepoPos = 0
+    $script:AuditIdxFilePos = 0
+    $script:AuditIdxRepo    = ''
+}
+
+# ── TIER-2 WORKLIST FEEDER (Phase B, resumable) ───────────────────────────────
+# Stream a Phase-A worklist (repo,path,name,archive,size,modified,url) back in, building a work record
+# per row and feeding it to Add-AuditRecord with Tier-2 ON so the existing fetch pool content-scans it.
+# Resumable via a progress cursor: a sidecar (<worklist>.progress) holds the count of fully-committed
+# rows. Batch-drain keeps the cursor correct despite out-of-order worker completion - a batch is only
+# committed once the queue + in-flight jobs have fully drained, then the next batch is read. On EOF the
+# worklist + sidecar are deleted. Memory: one batch of records + in-flight fetch content (dropped by
+# Complete-AuditJob) + findings (matches only).
+$script:AuditT2Active    = $false
+$script:AuditT2Enum      = $null     # ReadLines enumerator over the worklist (positioned past header + cursor)
+$script:AuditT2Path      = ''        # worklist path
+$script:AuditT2Cursor    = 0         # rows committed (persisted to the sidecar)
+$script:AuditT2Batch     = 0         # rows read into the current in-flight batch (not yet committed)
+$script:AuditT2BatchSize = 1000
+
+function Get-AuditT2CursorPath([string]$path) { return "$path.progress" }
+function Read-AuditT2Cursor([string]$path) {
+    $cp = Get-AuditT2CursorPath $path
+    if (Test-Path -LiteralPath $cp) {
+        try { $t = (Get-Content -LiteralPath $cp -Raw).Trim(); if ($t -match '^\d+$') { return [int]$t } } catch { }
+    }
+    return 0
+}
+function Save-AuditT2Cursor {
+    if (-not $script:AuditT2Path) { return }
+    $cp  = Get-AuditT2CursorPath $script:AuditT2Path
+    $tmp = "$cp.tmp"
+    try {
+        [System.IO.File]::WriteAllText($tmp, [string]$script:AuditT2Cursor, [Text.UTF8Encoding]::new($false))
+        [System.IO.File]::Copy($tmp, $cp, $true); Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    } catch { }
+}
+
+# Build a work record from a worklist row (array from Read-CsvRow: repo,path,name,archive,size,modified,url).
+# Archive entries get the New-AuditWorkArcItem shape; top-level rows key off the storage uri (so a Tier-2
+# finding merges with Phase A's same-keyed Tier-1 finding) but leave Uri blank so the worker skips the
+# storage call (size/modified are known) and fetches only content from url.
+function New-AuditWorkFromListRow($f) {
+    if ($f.Count -lt 3) { return $null }
+    $repo = [string]$f[0]; $path = [string]$f[1]; $name = [string]$f[2]
+    $arch = if ($f.Count -ge 4) { [string]$f[3] } else { '' }
+    $known = -1; if ($f.Count -ge 5 -and "$($f[4])" -match '^-?\d+$') { $known = [long]$f[4] }
+    $mod  = if ($f.Count -ge 6) { [string]$f[5] } else { '' }
+    $url  = if ($f.Count -ge 7) { [string]$f[6] } else { '' }
+    if ($arch) {
+        return @{
+            Key=$url; Name=$name; Repo=$repo; Path=$path; Uri=''; Url=$url
+            KnownSize=$known; KnownModified=$mod; IsArchiveEntry=$true; ArchiveName=$arch; IsArchive=$false
+        }
+    }
+    return @{
+        Key=(Get-StorageUriFor $repo $path $name); Name=$name; Repo=$repo; Path=$path; Uri=''; Url=$url
+        KnownSize=$known; KnownModified=$mod; IsArchiveEntry=$false; ArchiveName=''
+        IsArchive=(Get-IsArchive $name)
+    }
+}
+
+# Start consuming a worklist. -KeepFindings (inline -2 continuation) clears ONLY the dedup seen-sets and
+# resets the progress counters, keeping findings/idx/flags/matches so Tier-2 merges into Phase A's
+# findings; without it (standalone --tier2-resume) the engine is fully reset. Returns $false if the
+# worklist is missing/empty.
+function Start-AuditTier2List([string]$path, [switch]$KeepFindings) {
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $false }
+    if ($KeepFindings) {
+        Stop-AuditWork   # abort any in-flight Phase-A work, keep findings
+        $script:AuditSeen     = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'
+        $script:AuditSeenPath = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'
+        $script:AuditEnq = 0; $script:AuditDone = 0; $script:AuditLaunched = 0; $script:AuditBytes = 0L
+        $script:AuditRateSnap = @{ At=[DateTime]::UtcNow; Done=0; Launched=0; Bytes=0L }
+    } else {
+        Reset-AuditEngine
+    }
+    $script:AuditTier2 = $true
+    $script:AuditMode = 'tier2-list'; $script:AuditScope = "worklist: $path"
+    $script:AuditCapActive = $script:AuditCap
+    $script:AuditStartedAt = [DateTime]::UtcNow
+    $script:AuditT2Path   = $path
+    $script:AuditT2Cursor = Read-AuditT2Cursor $path
+    $script:AuditT2Batch  = 0
+    # Known progress total: the worklist row count is known up front (unlike the streaming index
+    # walk), so count it once (cheap sequential pass, no parse) and expose the rows still to do this
+    # run as the progress denominator instead of letting it grow a batch at a time.
+    $rows = 0
+    try { foreach ($ln in [System.IO.File]::ReadLines($path)) { $rows++ } } catch { }
+    $script:AuditEnqTotal = [Math]::Max(0, ($rows - 1) - $script:AuditT2Cursor)   # minus the header, minus committed
+    # Open the reader, skip the header + already-committed rows.
+    $script:AuditT2Enum = [System.IO.File]::ReadLines($path).GetEnumerator()
+    $skip = 1 + $script:AuditT2Cursor   # header + committed data rows
+    $n = 0
+    while ($n -lt $skip) { if (-not $script:AuditT2Enum.MoveNext()) { break }; $n++ }
+    $script:AuditT2Active = $true
+    $script:AuditState = 'paused'
+    return $true
+}
+
+# One feeder tick: commit the drained batch (advance + persist the cursor), then read + enqueue the next.
+function Step-AuditTier2List {
+    if (-not $script:AuditT2Active) { return }
+    # Wait until the current batch has fully drained so the cursor only advances past completed rows.
+    if (($script:AuditQueue.Count + $script:AuditJobs.Count) -gt 0) { return }
+    if ($script:AuditT2Batch -gt 0) {
+        $script:AuditT2Cursor += $script:AuditT2Batch
+        $script:AuditT2Batch = 0
+        Save-AuditT2Cursor
+    }
+    $read = 0
+    while ($read -lt $script:AuditT2BatchSize) {
+        if (-not $script:AuditT2Enum.MoveNext()) { break }
+        $line = $script:AuditT2Enum.Current
+        $read++
+        if (-not "$line".Trim()) { continue }
+        $rec = New-AuditWorkFromListRow (Read-CsvRow $line)
+        if ($rec) { Add-AuditRecord $rec }
+    }
+    if ($read -eq 0) {
+        # EOF: nothing left and the last batch already committed above -> done. Drop the files.
+        $script:AuditT2Active = $false
+        $p = $script:AuditT2Path
+        Stop-AuditTier2List
+        if ($p) {
+            try { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } catch { }
+            try { Remove-Item -LiteralPath (Get-AuditT2CursorPath $p) -Force -ErrorAction SilentlyContinue } catch { }
+        }
+        return
+    }
+    $script:AuditT2Batch = $read
+    $script:AuditDirty = $true
+}
+
+function Test-AuditTier2ListActive { return [bool]$script:AuditT2Active }
+
+# Tear down the feeder (dispose the reader). Does NOT delete the worklist/cursor - only full completion
+# (the EOF path in Step-AuditTier2List) does, so an interrupted run stays resumable.
+function Stop-AuditTier2List {
+    if ($null -ne $script:AuditT2Enum) {
+        try { $script:AuditT2Enum.Dispose() } catch { }
+        $script:AuditT2Enum = $null
+    }
+    $script:AuditT2Active = $false
+    $script:AuditT2Path   = ''
+    $script:AuditT2Batch  = 0
+}
+
 # ── MODE LAUNCHERS ────────────────────────────────────────────────────────────
 function Start-AuditPassive {
     if ($script:AuditState -ne 'passive') { Reset-AuditEngine }
@@ -1188,6 +1557,37 @@ function Start-AuditFull {
     }
     $script:AuditWalkPending = $true  # walker launches on first resume
     $script:AuditState = 'paused'
+}
+
+# Index-backed audit: source work ONLY from the local index (no discovery). Scope is the indexed
+# repos narrowed to the active repo-type scope (default LOCAL only), or an explicit -Repos list.
+# Starts paused like the other automatic modes (the headless pump resumes immediately); the feeder
+# (Step-AuditIndexWalk) streams the shards on each tick. Returns $false when there's nothing to
+# audit (no in-scope indexed repos) so the launcher can report it.
+function Start-AuditIndex {
+    Reset-AuditEngine
+    Initialize-RepoMap   # populate the repo map so Test-RepoTypeInScope can filter to local (graceful if denied)
+    $script:AuditMode = 'index'; $script:AuditScope = 'local index'
+    $script:AuditCapActive = $script:AuditCap
+    $script:AuditStartedAt = [DateTime]::UtcNow
+    $repos = if ($Repos) { @($Repos -split '[,\s]+' | Where-Object { $_ }) }
+             else        { @(Get-IndexedRepos | Where-Object { Test-RepoTypeInScope $_ }) }
+    if (@($repos).Count -eq 0) {
+        $script:AuditState = 'done'
+        return $false
+    }
+    $list = [Collections.Generic.List[object]]::new()
+    foreach ($rk in $repos) { $list.Add($rk) }
+    $script:AuditIdxRepos     = $list
+    $script:AuditIdxRepoPos   = 0
+    $script:AuditIdxRepo      = ''
+    $script:AuditIdxFiles     = $null
+    $script:AuditIdxFilePos   = 0
+    $script:AuditIdxEnum      = $null
+    $script:AuditIdxEnumIsArc = $false
+    $script:AuditIdxActive    = $true
+    $script:AuditState = 'paused'
+    return $true
 }
 # ── FINDINGS SORTING ──────────────────────────────────────────────────────────
 # Sorted view of the findings: downloaded last of all, then excluded, then highest

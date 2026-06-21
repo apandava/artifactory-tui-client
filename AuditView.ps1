@@ -44,8 +44,8 @@ function Restrict-AuditPassive([string[]]$orderedKeys) {
         if ($kind -ne 'file') { $kept.Enqueue($rec); continue }
         if ($rank.ContainsKey($rec.Key)) { $onPage[$rec.Key] = $rec }
         else {
-            [void]$script:AuditSeen.Remove($rec.Key)
-            [void]$script:AuditSeenPath.Remove((Get-AuditPathIdentity $rec))
+            [void]$script:AuditSeen.Remove((Get-AuditKeyHash $rec.Key))
+            [void]$script:AuditSeenPath.Remove((Get-AuditPathHash $rec))
             if ($script:AuditEnq -gt 0) { $script:AuditEnq-- }
         }
     }
@@ -73,7 +73,7 @@ function Invoke-AuditPassiveBig($item) {
     $rec = New-AuditWorkItem $item
     $m = Test-AuditMeta $rec.Name $rec.Path
     if ($m.Discard -or $m.ContentRules.Count -eq 0) { return }
-    [void]$script:AuditSeen.Add($rec.Key)
+    [void]$script:AuditSeen.Add((Get-AuditKeyHash $rec.Key))
     $rec.ContentRules   = $m.ContentRules
     $rec.HasMetaFinding = ($m.Findings.Count -gt 0)
     $rec.Previewable    = $true
@@ -131,7 +131,7 @@ function Get-AuditMarker([string]$key) {
         return "${col}!${R}"   # $col/$R empty on a non-VT host -> plain '!'
     }
     # Passive: '?' while a row is still pending; blank once scanned with no match.
-    if ($script:AuditState -eq 'passive' -and -not $script:AuditDecided.Contains($key)) {
+    if ($script:AuditState -eq 'passive' -and -not $script:AuditDecided.Contains((Get-AuditKeyHash $key))) {
         return "${DM}?${R}"
     }
     return ''

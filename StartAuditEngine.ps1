@@ -6,43 +6,60 @@
 
 .DESCRIPTION
     Drives the same audit engine the TUI uses (AuditEngine.ps1), but from the command
-    line, producing the same CSV logs. Two verbs:
+    line. The audit sources its work ONLY from the local index (the per-repo CSV shards +
+    archive buckets under output/<host>/index that StartIndex.ps1 builds) — it does NO
+    searching or discovery of its own, so an index must already exist (a partial one is
+    fine; it audits whatever rows are present). The index carries size/modified, so a
+    Tier-1 audit fires ZERO requests; only Tier-2 content scanning (and downloading) hit
+    the server. Two verbs:
 
-      scrape    Audit a scope and write scrape-log.csv (the would-be download set),
-                WITHOUT downloading anything. The Hash and Timestamp columns are left
-                blank (nothing was fetched).
-      download  Audit a scope and DOWNLOAD the matching findings (dedup/rename/hash
-                like the TUI's "download all"), writing download-log.csv. With
-                -s/--scrape <file> it skips auditing entirely and just downloads every
-                file listed in a scrape-log.csv, filling in the blank Hash/Timestamp.
+      audit     Classify every indexed artifact (and indexed archive-internal entry) with
+                the ruleset. By default it CATALOGUES matches to audit-log.csv (rule +
+                severity, blank Hash/Timestamp) without downloading. With --download [all]
+                it also DOWNLOADS the matching findings (dedup/rename/hash like the TUI's
+                "download all") -> download-log.csv; --download <sev,...> (e.g. high,medium)
+                downloads only those severities; --download count catalogues and prints the
+                per-severity count + total size of the would-be download set (no download).
+                With -s/--from-log <file> it
+                skips auditing entirely and just downloads every file listed in a prior
+                audit-log.csv. Per-repo matches are also written through to
+                audit/<repo>-matches.csv as they are found.
+                Tier-2 (content scanning) is a two-phase, resumable, worklist-driven flow:
+                a Tier-1 pass writes tier2-pending.csv listing every file Tier-2 would
+                content-inspect, then a pass content-scans it (resumable via a .progress
+                cursor: pause/crash/cancel and re-run to continue). -2/--tier2 does both in
+                one run; --defer-tier2 writes the worklist and stops; --tier2-resume <file>
+                content-scans an existing worklist later.
       search    Run the public quick-search and, with -w/--walk-archives, also walk the
                 instance's listable archives and add internal entries whose name matches
                 the query, writing a results CSV. Reuses + grows the persistent local index
                 (a per-instance directory of per-repo CSV shards) unless --no-index.
 
     Run as a script with unix-style flags:
-      .\StartAuditEngine.ps1 scrape   -u https://art.example.com -q secrets -2 -v 3
-      .\StartAuditEngine.ps1 download -u https://art.example.com -F -o out -v 2
-      .\StartAuditEngine.ps1 download -u https://art.example.com -s scrape-log.csv
+      .\StartAuditEngine.ps1 audit -u https://art.example.com -2 -v 3
+      .\StartAuditEngine.ps1 audit -u https://art.example.com --defer-tier2 -v 2
+      .\StartAuditEngine.ps1 audit -u https://art.example.com --tier2-resume tier2-pending.csv -v 2
+      .\StartAuditEngine.ps1 audit -u https://art.example.com -s audit-log.csv
 
-    Or paste Core.ps1, Api.ps1, AuditEngine.ps1 then this file into a console and call
-    the entry functions with native parameters:
-      Invoke-AuditScrape   -BaseUrl https://art.example.com -Query secrets -Tier2 -Verbosity 3
-      Invoke-AuditDownload -BaseUrl https://art.example.com -Full -OutDir out
-      Invoke-AuditDownload -BaseUrl https://art.example.com -FromScrape scrape-log.csv
+    Or paste Core.ps1, Api.ps1, AuditEngine.ps1, Index.ps1 then this file into a console
+    and call the entry functions with native parameters:
+      Invoke-Audit -BaseUrl https://art.example.com -Tier2 -Verbosity 3
+      Invoke-Audit -BaseUrl https://art.example.com -DeferTier2 -OutDir out
+      Invoke-Audit -BaseUrl https://art.example.com -Tier2Resume tier2-pending.csv
 
     Flag <-> parameter map:
-      -q/--query <name>   -Query          -F/--full            -Full
       -r/--repos <list>   -Repos          --repo-types <list>  -RepoTypes
       --all-repos         -RepoTypes all  -2/--tier2           -Tier2
-      -w/--walk-archives  -WalkArchives   -x/--exclude <globs> -Exclude
-      --all-versions      -AllVersions    (search verb; default: skip duplicate archive versions)
-      --offline <mode>    -Offline        (search verb only; 'index' or 'all')
-      -s/--scrape <file>  -FromScrape     -o/--out <dir>       -OutDir
-      -v/--verbose <0-5>  -Verbosity      --cap <bytes>        -Cap
-      --workers <1-10>    -Workers        --delay <ms>         -DelayMs
+      --defer-tier2       -DeferTier2     --tier2-resume <f>   -Tier2Resume
+      --download [all|count|<sev,...>]    -Download  (default 'all'; omitted = catalogue only)
+      -x/--exclude <globs>                -Exclude
+      -s/--from-log <f>   -FromLog        --index <dir>        -IndexPath
+      -o/--out <dir>      -OutDir         -v/--verbose <0-5>   -Verbosity
+      --cap <bytes>       -Cap            --workers <1-10>     -Workers
+      --delay <ms>        -DelayMs
       -u/--base-url <url> -BaseUrl        -t/--token <tok>     -Token
       -k/--api-key <key>  -ApiKey         -b/--basic <u:p>     -Basic
+    (search verb also: -q/--query, -w/--walk-archives, --all-versions, --offline, --no-index.)
 
     Verbosity: 0 silent · 1 summary · 2 +milestones · 3 +per-finding · 4 +per-download
     · 5 +debug. Passive mode is TUI-only and not available here.
@@ -92,6 +109,15 @@ function Write-V([int]$level, [string]$msg) {
     if ($script:AuditVerbosity -ge $level) { Write-Host $msg }
 }
 
+# Compact human duration for the ETA, coarsening as it grows: 45s / 3m 12s / 2h 14m / 1d 6h.
+function Format-Duration([int]$secs) {
+    if ($secs -lt 0) { $secs = 0 }
+    if ($secs -lt 60)    { return "${secs}s" }
+    if ($secs -lt 3600)  { return ('{0}m {1}s' -f [int][Math]::Floor($secs / 60), ($secs % 60)) }
+    if ($secs -lt 86400) { return ('{0}h {1}m' -f [int][Math]::Floor($secs / 3600), [int][Math]::Floor(($secs % 3600) / 60)) }
+    return ('{0}d {1}h' -f [int][Math]::Floor($secs / 86400), [int][Math]::Floor(($secs % 86400) / 3600))
+}
+
 # Route the shared bulk-download engine's progress lines to level-4 output (the TUI
 # routes the same hook to Show-Popup instead).
 $script:DownloadProgress = {
@@ -113,16 +139,23 @@ function ConvertFrom-AuditArgv([string[]]$tokens) {
         $t = $tokens[$i]
         switch -regex ($t) {
             '^(-q|--query)$'         { $p.Query        = $tokens[++$i] }
-            '^(-F|--full)$'          { $p.Full         = $true }
             '^(-r|--repos)$'         { $p.Repos        = $tokens[++$i] }
             '^--repo-types$'         { $p.RepoTypes    = $tokens[++$i] }
             '^--all-repos$'          { $p.RepoTypes    = 'all' }
             '^(-2|--tier2)$'         { $p.Tier2        = $true }
+            '^--defer-tier2$'        { $p.DeferTier2   = $true }
+            '^--tier2-resume$'       { $p.Tier2Resume  = $tokens[++$i] }
+            '^--download$'           {
+                # Optional value: 'all' (default), 'count', or a severity list (e.g. high,medium).
+                # Consume the next token only when it isn't another flag.
+                $nxt = if (($i + 1) -lt $tokens.Count) { $tokens[$i + 1] } else { $null }
+                if ($nxt -and ($nxt -notmatch '^-')) { $p.Download = $tokens[++$i] } else { $p.Download = 'all' }
+            }
             '^(-w|--walk-archives)$' { $p.WalkArchives = $true }
             '^--all-versions$'       { $p.AllVersions  = $true }
             '^--skip-versions$'      { $p.AllVersions  = $false }   # affirms the default (no-op)
             '^(-x|--exclude)$'       { $p.Exclude      = $tokens[++$i] }
-            '^(-s|--scrape)$'        { $p.FromScrape   = $tokens[++$i] }
+            '^(-s|--from-log)$'      { $p.FromLog      = $tokens[++$i] }
             '^--index$'              { $p.IndexPath    = $tokens[++$i] }
             '^--no-index$'           { $p.NoIndex      = $true }
             '^--offline$'            { $p.Offline      = $tokens[++$i] }
@@ -147,36 +180,51 @@ function Show-AuditEngineUsage {
 ARTCA headless audit
 
 Usage:
-  StartAuditEngine.ps1 scrape   <options>            audit + write scrape-log.csv (no download)
-  StartAuditEngine.ps1 download <options>            audit + download + write download-log.csv
-  StartAuditEngine.ps1 download -s scrape-log.csv    download a previous scrape (no audit)
-  StartAuditEngine.ps1 search   <options>            quick-search (+ optional archive walk) to a CSV
+  StartAuditEngine.ps1 audit  <options>             Tier-1 audit of the index -> audit-log.csv
+  StartAuditEngine.ps1 audit  -2 <options>          Tier-1 + Tier-2 content scan (one run)
+  StartAuditEngine.ps1 audit  --defer-tier2 <opts>  Tier-1 + write a Tier-2 worklist, then stop
+  StartAuditEngine.ps1 audit  --tier2-resume <file> content-scan a worklist (resumable)
+  StartAuditEngine.ps1 audit  --download <options>  audit + download all matches -> download-log.csv
+  StartAuditEngine.ps1 audit  --download count      audit + show the per-severity download breakdown
+  StartAuditEngine.ps1 audit  --download high,medium   download only those severities
+  StartAuditEngine.ps1 audit  -s audit-log.csv      download a previous audit-log (no audit)
+  StartAuditEngine.ps1 search <options>             quick-search (+ optional archive walk) to a CSV
 
-Scope (one of):
-  -q, --query <name>      audit/search the results of this artifact name search
-  -F, --full              audit the entire instance (audit verbs only)
-  -r, --repos <a,b>       restrict the scope to these repositories (bypasses the type filter)
-      --repo-types <list> repo rclasses to auto-enumerate (default: local). e.g. local,remote
-                          or 'all' (every non-virtual repo). --all-repos is shorthand for 'all'.
+The audit reads ONLY the local index (no searching/discovery) - build one first with
+StartIndex.ps1. It audits every indexed artifact AND indexed archive-internal entry. Tier-2 is a
+two-phase flow: a Tier-1 pass writes a worklist of every file Tier-2 would content-inspect
+(tier2-pending.csv), then a resumable pass content-scans it. `-2` does both in one run; split them
+with --defer-tier2 (write the list) and --tier2-resume (scan it later, survives pause/crash/cancel).
+
+Audit options (audit verb):
+  -2, --tier2             Tier-2: also fetch file content and scan it (Tier-1 -> worklist -> scan)
+      --defer-tier2       Tier-1 only, but write the Tier-2 worklist (tier2-pending.csv) and stop
+      --tier2-resume <f>  content-scan an existing worklist; resumable via its .progress cursor
+      --download [spec]   download matched findings (no flag = catalogue only). spec: 'all' (default),
+                          a severity list e.g. 'high,medium' (critical/high/medium/low/informational,
+                          short forms c/h/m/l/i ok), or 'count' = catalogue + print the per-severity
+                          count and total size of the would-be download set without downloading
+  -s, --from-log <file>   skip auditing; download every row of a prior audit-log.csv (fills hashes)
+  -r, --repos <a,b>       restrict to these indexed repositories (bypasses the type filter)
+      --repo-types <list> indexed repo rclasses to audit (default: local). e.g. local,remote or
+                          'all' (every non-virtual repo). --all-repos is shorthand for 'all'.
+  -x, --exclude <globs>   comma/space globs to exclude from the set (e.g. "*.xml,*test*")
+      --index <dir>       local index directory to read (default ./output/<host>/index)
+      --cap <bytes>       max file size to content-scan (default 2 MB)
+      --workers <1-10>    parallel fetch workers (default 3)
+      --delay <ms>        delay between request launches (default 150)
 
 Search options (search verb):
+  -q, --query <name>      the artifact name to search for
   -w, --walk-archives     also walk listable archives and add matching internal entries
       --all-versions      walk EVERY version of an archive (default: skip - walk only the
                           first version of each artifact, by version-normalized filename)
       --offline <mode>    don't query the server for search; use the local index as the catalogue.
                           'index' still fetches archive listings on demand; 'all' makes no
-                          requests at all (matches come only from the index). search verb only.
-      --index <path>      local index directory to use/update (default ./.artca-index/<host>/)
+                          requests at all (matches come only from the index).
+      --index <path>      local index directory to use/update (default ./output/<host>/index)
       --no-index          don't read or write the index
   -o, --out <file|dir>    results CSV (default search-results.csv under the out dir)
-
-Audit options:
-  -2, --tier2             also fetch file content and scan it (Tier 2; default Tier 1)
-  -w, --walk-archives     expand listable archives and audit their entries
-  -x, --exclude <globs>   comma/space globs to exclude from the set (e.g. "*.xml,*test*")
-      --cap <bytes>       max file size to content-scan (default 2 MB)
-      --workers <1-10>    parallel fetch workers (default 3)
-      --delay <ms>        delay between request launches (default 150)
 
 Output / auth:
   -o, --out <dir>         output folder (default ./output/<host>/downloads)
@@ -215,10 +263,24 @@ function Initialize-AuditRunConfig([hashtable]$O) {
     $script:BaseUrl = $script:BaseUrl.TrimEnd('/')
     Resolve-RunOutput $O
 
-    # Engine settings (Tier 1/2 + walk-archives persist across Reset-AuditEngine; cap
-    # and throttle are read live by the dispatcher).
-    $script:AuditTier2        = [bool]($O.ContainsKey('Tier2')        -and $O['Tier2'])
-    $script:AuditWalkArchives = [bool]($O.ContainsKey('WalkArchives') -and $O['WalkArchives'])
+    # Local index to read (the audit's only work source). An explicit --index wins; otherwise
+    # the per-instance default (output/<host>/index). The index is read-only here (we don't grow
+    # it), but $IndexEnabled gates a couple of read helpers, so leave it on.
+    $script:IndexEnabled = $true
+    if ($O.ContainsKey('IndexPath') -and $O['IndexPath']) { Set-IndexPath ([string]$O['IndexPath']) }
+    Resolve-IndexPath
+
+    # Engine settings (Tier 1/2 persists across Reset-AuditEngine; cap and throttle are read live
+    # by the dispatcher). The index pass (Phase A) is ALWAYS Tier-1: inline `-2` runs Tier-2 as a
+    # second phase over the emitted worklist (Start-AuditTier2List), so the index pass itself never
+    # content-fetches. Archive WALKING is forced OFF: the index already contains expanded archive
+    # entries, so a top-level archive must NOT trigger a live treebrowser expansion (discovery).
+    $script:AuditTier2        = $false
+    $script:AuditWalkArchives = $false
+    # Headless never outputs the synthetic skipped/oversize findings (they're default-excluded and
+    # never written to a CSV), so don't build them - at multi-million scale that's the difference
+    # between holding one finding object per relay-eligible file and holding none.
+    $script:AuditEmitSkipped  = $false
     if ($O.ContainsKey('Cap') -and [long]$O['Cap'] -gt 0)        { $script:AuditCap = [long]$O['Cap'] }
     if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { $script:AuditThrottle.MaxConcurrent = [Math]::Max(1, [Math]::Min(10, [int]$O['Workers'])) }
     if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { $script:AuditThrottle.MinIntervalMs = [int]$O['DelayMs'] }
@@ -239,8 +301,12 @@ function Invoke-AuditPumpToDone {
     if ($script:AuditState -eq 'paused') { $script:AuditState = 'running' }
     $printed  = 0
     $lastTick = [DateTime]::MinValue
+    $lastGc   = [DateTime]::UtcNow
     while ($script:AuditState -ne 'done' -and $script:AuditState -ne 'cancelled' -and $script:AuditState -ne 'idle') {
         Invoke-AuditPump
+        # Reclaim the transient per-row churn (Convert-UriToItem strings, parsed rows) promptly so
+        # the working set tracks the bounded live set, not what .NET is slow to return on a long run.
+        if (([DateTime]::UtcNow - $lastGc).TotalSeconds -ge 10) { [GC]::Collect(); $lastGc = [DateTime]::UtcNow }
         if ($script:AuditVerbosity -ge 3) {
             while ($printed -lt $script:AuditFindings.Count) {
                 $f = $script:AuditFindings[$printed]; $printed++
@@ -249,8 +315,20 @@ function Invoke-AuditPumpToDone {
             }
         }
         if ($script:AuditVerbosity -ge 2 -and ([DateTime]::UtcNow - $lastTick).TotalSeconds -ge 1) {
-            $walk = if (Test-AuditWalkActive) { ' (walking)' } else { '' }
-            Write-Host ("  ...audited $($script:AuditDone)/$($script:AuditEnq), found $($script:AuditFindings.Count)$walk")
+            $walk = if ((Test-AuditWalkActive) -or (Test-AuditIndexWalkActive)) { ' (reading index)' } else { '' }
+            # Use the known total (Tier-2 worklist) as the denominator when set; otherwise $AuditEnq,
+            # which grows as the index walk discovers items.
+            $den = if ($script:AuditEnqTotal -gt 0) { $script:AuditEnqTotal } else { $script:AuditEnq }
+            # ETA only when the total is known (Tier-2 worklist). Use the AVERAGE rate this run
+            # (done/elapsed) - far steadier than the rolling FPS that drives the displayed rate.
+            $eta = ''
+            $rem = $den - $script:AuditDone
+            $elapsed = ([DateTime]::UtcNow - $script:AuditStartedAt).TotalSeconds
+            if ($script:AuditEnqTotal -gt 0 -and $rem -gt 0 -and $script:AuditDone -gt 0 -and $elapsed -ge 1) {
+                $avg = $script:AuditDone / $elapsed
+                if ($avg -gt 0) { $eta = "  ETA $(Format-Duration ([int][Math]::Ceiling($rem / $avg)))" }
+            }
+            Write-Host ("  ...audited $($script:AuditDone)/$den at $($script:AuditRate.FPS)/s, found $($script:AuditFindings.Count)$eta$walk")
             if ($script:AuditVerbosity -ge 5) {
                 Write-Host ("    queue=$($script:AuditQueue.Count) jobs=$($script:AuditJobs.Count) pending=$($script:AuditPendingNodes.Count) launched=$($script:AuditLaunched)")
             }
@@ -284,25 +362,32 @@ function Write-AuditSummary {
     Write-Host ("Audit complete: $($script:AuditFindings.Count) finding(s)$brk")
 }
 
-# Launch the chosen scope, run to completion, apply excludes.
-function Invoke-HeadlessAudit([hashtable]$O) {
+# Phase A: a Tier-1 audit of the local index to completion, applying excludes. Sources work ONLY from
+# the index shards (no searching/discovery); requires an index to be present (a partial one is fine).
+# When $emitList is set (inline -2 or --defer-tier2), every relay-eligible file is written through to
+# the worklist for a Tier-2 pass. Returns the worklist path (or '').
+function Invoke-HeadlessAudit([hashtable]$O, [bool]$emitList = $false) {
     Initialize-AuditRunConfig $O
-    $full  = [bool]($O.ContainsKey('Full') -and $O['Full'])
-    $query = if ($O.ContainsKey('Query')) { [string]$O['Query'] } else { '' }
-    Write-V 5 ("Settings: tier=$(if ($script:AuditTier2) { '2' } else { '1' }) walkArchives=$script:AuditWalkArchives cap=$script:AuditCap workers=$($script:AuditThrottle.MaxConcurrent) delay=$($script:AuditThrottle.MinIntervalMs)ms out=$script:OutDir")
+    Write-V 5 ("Settings: tier=1$(if ($emitList) { '+worklist' } else { '' }) cap=$script:AuditCap workers=$($script:AuditThrottle.MaxConcurrent) delay=$($script:AuditThrottle.MinIntervalMs)ms index=$script:IndexPath out=$script:OutDir")
 
-    if ($full) {
-        Write-V 1 'Starting full-instance audit...'
-        Start-AuditFull
-    } elseif ($query) {
-        Write-V 1 "Searching for '$query'..."
-        $res = Search-Artifacts $query
-        if ($res.Error) { throw "Search failed: $($res.Error)" }
-        Write-V 2 "  $($res.Total) result(s) for '$query'"
-        Start-AuditLocation "search: $query" $res.Items
-    } else {
-        throw 'Specify a scope: -q/--query <name> or -F/--full.'
+    # Load the index (lightweight: migrations + the small re-walk skip-set; nothing bulk-loaded).
+    if (-not (Test-Path -LiteralPath $script:IndexPath)) {
+        throw "No local index found at $($script:IndexPath). Build one first with StartIndex.ps1 (e.g. .\StartIndex.ps1 -F -u $($script:BaseUrl))."
     }
+    Import-Index $script:IndexPath
+    if (-not $Repos -and @(Get-IndexedRepos).Count -eq 0) {
+        throw "The local index at $($script:IndexPath) is empty (no repos). Build it first with StartIndex.ps1."
+    }
+
+    Write-V 1 'Auditing the local index...'
+    if (-not (Start-AuditIndex)) {
+        Write-V 1 'No in-scope indexed repos to audit.'
+    }
+
+    # Open the Tier-2 worklist AFTER Start-AuditIndex's reset (which doesn't touch the worklist), so
+    # rows are written through during the pump below. Reset-AuditEngine cleared the path either way.
+    $wl = ''
+    if ($emitList) { $wl = Join-Path $script:OutDir 'tier2-pending.csv'; Open-AuditTier2List $wl }
 
     # Excludes must be set AFTER the launch (Reset-AuditEngine clears them); the run
     # honours them for new findings and Update-AuditExcludedHeadless catches the rest.
@@ -310,12 +395,99 @@ function Invoke-HeadlessAudit([hashtable]$O) {
 
     Invoke-AuditPumpToDone
     Update-AuditExcludedHeadless
+    if ($emitList) { Close-AuditTier2List }
+    return $wl
 }
 
-# Download every file listed in a scrape-log.csv, no auditing. Recomputes hashes (the
-# scrape left them blank) and writes download-log.csv with Hash + Timestamp filled.
-function Invoke-DownloadFromScrape([string]$file) {
-    if (-not (Test-Path -LiteralPath $file)) { throw "Scrape file not found: $file" }
+# Map a user severity token (case-insensitive; full name or short form) to its canonical name, or
+# $null if unrecognized.
+function Resolve-AuditSev([string]$tok) {
+    switch ("$tok".Trim().ToLower()) {
+        'critical'      { 'Critical' }      'crit' { 'Critical' }      'c' { 'Critical' }
+        'high'          { 'High' }          'h'    { 'High' }
+        'medium'        { 'Medium' }        'med'  { 'Medium' }        'm' { 'Medium' }
+        'low'           { 'Low' }           'l'    { 'Low' }
+        'informational' { 'Informational' } 'info' { 'Informational' } 'inf' { 'Informational' } 'i' { 'Informational' }
+        default         { $null }
+    }
+}
+# Parse a comma/space severity list into a canonical-name set; throws on an unknown token.
+function Resolve-AuditSevSet([string]$spec) {
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($t in @("$spec" -split '[,\s]+')) {
+        if (-not $t) { continue }
+        $s = Resolve-AuditSev $t
+        if (-not $s) { throw "Unknown --download severity '$t'. Valid: all, count, or any of critical,high,medium,low,informational." }
+        [void]$set.Add($s)
+    }
+    return $set
+}
+# Print a per-severity count + total size breakdown of a candidate set (the would-be download).
+function Write-AuditDownloadBreakdown($cands) {
+    $order = 'Critical','High','Medium','Low','Informational'
+    $cnt = @{}; $bytes = @{}; $unk = @{}
+    foreach ($s in $order) { $cnt[$s] = 0; $bytes[$s] = 0L; $unk[$s] = 0 }
+    foreach ($f in @($cands)) {
+        $s = [string]$f.Sev; if (-not $cnt.ContainsKey($s)) { $cnt[$s] = 0; $bytes[$s] = 0L; $unk[$s] = 0 }
+        $cnt[$s]++
+        if ($f.Size -ge 0) { $bytes[$s] += [long]$f.Size } else { $unk[$s]++ }
+    }
+    Write-Host ''
+    Write-Host 'Download set (included, not yet downloaded):'
+    $tc = 0; $tb = 0L; $tu = 0
+    foreach ($s in $order) {
+        if (-not $cnt.ContainsKey($s) -or $cnt[$s] -eq 0) { continue }
+        $u = if ($unk[$s] -gt 0) { " (+$($unk[$s]) unknown size)" } else { '' }
+        Write-Host ("  {0,-14} {1,7}   {2}{3}" -f $s, $cnt[$s], (Format-Size $bytes[$s]), $u)
+        $tc += $cnt[$s]; $tb += $bytes[$s]; $tu += $unk[$s]
+    }
+    $u = if ($tu -gt 0) { " (+$tu unknown size)" } else { '' }
+    Write-Host ("  {0,-14} {1,7}   {2}{3}" -f 'Total', $tc, (Format-Size $tb), $u)
+}
+# Write the consolidated audit-log.csv (scrape-style: blank Hash/Timestamp) from a candidate set.
+function Write-AuditCatalogue($cands) {
+    foreach ($f in @($cands)) {
+        $arch = if ($f.InArchive) { [string]$f.ArchiveName } else { '' }
+        $sz   = if ($f.Size -ge 0) { [long]$f.Size } else { -1 }
+        Write-DownloadLog $script:OutDir ([string]$f.Name) ([string]$f.Repo) ([string]$f.Path) $arch `
+            $sz ([string]$f.Modified) ([string]$f.Url) ([string]$f.Sev) ([string]$f.AllRules) '' 'audit-log.csv' -Scrape
+    }
+    Write-V 1 ("Wrote $(@($cands).Count) finding(s) to " + (Join-Path $script:OutDir 'audit-log.csv'))
+}
+
+# Write the included findings out per the $downloadSpec:
+#   ''        (no --download)         -> CATALOGUE to audit-log.csv only.
+#   'count'                           -> catalogue + print the per-severity download breakdown (no download).
+#   'all'                             -> DOWNLOAD every included finding (download-log.csv).
+#   '<sev,...>' (e.g. high,medium)    -> download only findings of those severities.
+# Per-repo audit/<repo>-matches.csv are written through during the run regardless.
+function Complete-AuditOutput([string]$downloadSpec) {
+    $cands = @(Get-AuditIncludedCandidates)
+    Write-AuditSummary
+    $spec = "$downloadSpec".Trim().ToLower()
+
+    if (-not $spec -or $spec -eq 'count') {
+        Write-AuditCatalogue $cands
+        if ($spec -eq 'count') { Write-AuditDownloadBreakdown $cands }
+        return
+    }
+
+    $sel = $cands
+    if ($spec -ne 'all') {
+        $set = Resolve-AuditSevSet $spec
+        $sel = @($cands | Where-Object { $set.Contains([string]$_.Sev) })
+    }
+    Write-AuditDownloadBreakdown $sel
+    if ($sel.Count -eq 0) { Write-V 1 'No findings to download.'; return }
+    $res = Invoke-AuditDownloadSet $sel
+    Write-V 1 (Get-DedupDoneLine $res)
+    Write-V 1 ('Logged to ' + (Join-Path $script:OutDir 'download-log.csv'))
+}
+
+# Download every file listed in a prior audit-log.csv, no auditing. The catalogue left Hash and
+# Timestamp blank; this recomputes them and writes download-log.csv with both filled.
+function Invoke-DownloadFromLog([string]$file) {
+    if (-not (Test-Path -LiteralPath $file)) { throw "Audit-log file not found: $file" }
     $rows = @(Import-Csv -LiteralPath $file)
     $entries = @($rows | ForEach-Object {
         $sz = -1; if ("$($_.SizeBytes)" -match '^\d+$') { $sz = [long]$_.SizeBytes }
@@ -333,60 +505,105 @@ function Invoke-DownloadFromScrape([string]$file) {
     Write-V 1 ('Logged to ' + (Join-Path $script:OutDir 'download-log.csv'))
 }
 
-# ── ENTRY FUNCTIONS ───────────────────────────────────────────────────────────
-function Invoke-AuditScrape {
-    param(
-        [string]$Query, [switch]$Full, [string]$Repos, [string]$RepoTypes,
-        [switch]$Tier2, [switch]$WalkArchives, [string]$Exclude,
-        [long]$Cap, [int]$Workers, [int]$DelayMs,
-        [string]$OutDir, [int]$Verbosity,
-        [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic, [string]$Offline
-    )
-    if ("$Offline".Trim()) { throw '--offline is not supported for the scrape verb (auditing must fetch file content). Use it with the search verb, or the TUI.' }
-    Invoke-HeadlessAudit $PSBoundParameters
-    $cands = @(Get-AuditIncludedCandidates)
-    foreach ($f in $cands) {
-        $arch = if ($f.InArchive) { [string]$f.ArchiveName } else { '' }
-        $sz   = if ($f.Size -ge 0) { [long]$f.Size } else { -1 }
-        Write-DownloadLog $script:OutDir ([string]$f.Name) ([string]$f.Repo) ([string]$f.Path) $arch `
-            $sz ([string]$f.Modified) ([string]$f.Url) ([string]$f.Sev) ([string]$f.AllRules) '' 'scrape-log.csv' -Scrape
-    }
-    Write-AuditSummary
-    Write-V 1 ("Wrote $($cands.Count) finding(s) to " + (Join-Path $script:OutDir 'scrape-log.csv'))
-}
-
-function Invoke-AuditDownload {
-    param(
-        [string]$Query, [switch]$Full, [string]$Repos, [string]$RepoTypes,
-        [switch]$Tier2, [switch]$WalkArchives, [string]$Exclude,
-        [long]$Cap, [int]$Workers, [int]$DelayMs,
-        [string]$OutDir, [int]$Verbosity,
-        [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic,
-        [string]$FromScrape, [string]$Offline
-    )
-    if ("$Offline".Trim()) { throw '--offline is not supported for the download verb (downloading requires the server). Use it with the search verb, or the TUI.' }
-    $O = $PSBoundParameters
-    # Apply base config (base url, auth, out dir, verbosity) for both paths.
+# Apply just the base config (verbosity, auth, repos, out dir) for the paths that don't run the index
+# audit (-FromLog, --tier2-resume). $BaseUrl is required only when downloading/fetching is involved.
+function Initialize-AuditBaseConfig([hashtable]$O, [bool]$requireBaseUrl = $true) {
     if ($O.ContainsKey('Verbosity')) { $script:AuditVerbosity = [int]$O['Verbosity'] }
     if ($O.ContainsKey('BaseUrl'))   { $script:BaseUrl = ([string]$O['BaseUrl']).TrimEnd('/') }
     if ($O.ContainsKey('ApiKey'))    { $script:ApiKey  = [string]$O['ApiKey'] }
     if ($O.ContainsKey('Token'))     { $script:Token   = [string]$O['Token'] }
     if ($O.ContainsKey('Basic'))     { $script:Basic   = [string]$O['Basic'] }
     if ($O.ContainsKey('Repos'))     { $script:Repos   = [string]$O['Repos'] }
+    if ($requireBaseUrl -and -not $script:BaseUrl) { throw 'A base URL is required (-u/--base-url).' }
     if ($script:BaseUrl) { $script:BaseUrl = $script:BaseUrl.TrimEnd('/') }
     Resolve-RunOutput $O
+    if ($O.ContainsKey('Cap') -and [long]$O['Cap'] -gt 0)        { $script:AuditCap = [long]$O['Cap'] }
+    if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { $script:AuditThrottle.MaxConcurrent = [Math]::Max(1, [Math]::Min(10, [int]$O['Workers'])) }
+    if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { $script:AuditThrottle.MinIntervalMs = [int]$O['DelayMs'] }
+}
 
-    if ($O.ContainsKey('FromScrape') -and $O['FromScrape']) {
-        Invoke-DownloadFromScrape ([string]$O['FromScrape'])
+# ── ENTRY FUNCTION ────────────────────────────────────────────────────────────
+# The single audit entry. Tier-2 is a two-phase, resumable, worklist-driven flow:
+#   (default Tier-1)   classify the index, catalogue matches to audit-log.csv (or --download).
+#   -Tier2 / -2        Phase A (Tier-1 + worklist) then Phase B (content-scan the worklist) in one run.
+#   -DeferTier2        Phase A only: Tier-1 + write the worklist (tier2-pending.csv), then stop.
+#   -Tier2Resume <f>   Phase B only: content-scan an existing worklist, resumable via its .progress cursor.
+#   -FromLog <f>       skip auditing; just download the rows of a prior audit-log.csv.
+function Invoke-Audit {
+    param(
+        [string]$Repos, [string]$RepoTypes,
+        [switch]$Tier2, [string]$Download, [string]$Exclude,
+        [string]$IndexPath, [long]$Cap, [int]$Workers, [int]$DelayMs,
+        [string]$OutDir, [int]$Verbosity,
+        [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic,
+        [string]$FromLog, [switch]$DeferTier2, [string]$Tier2Resume
+    )
+    $O = $PSBoundParameters
+
+    # -FromLog: skip auditing, just download a prior audit-log.csv.
+    if ($O.ContainsKey('FromLog') -and $O['FromLog']) {
+        Initialize-AuditBaseConfig $O $true
+        Invoke-DownloadFromLog ([string]$O['FromLog'])
         return
     }
-    Invoke-HeadlessAudit $O
-    $cands = @(Get-AuditIncludedCandidates)
-    Write-AuditSummary
-    if ($cands.Count -eq 0) { Write-V 1 'No findings to download.'; return }
-    $res = Invoke-AuditDownloadSet $cands
-    Write-V 1 (Get-DedupDoneLine $res)
-    Write-V 1 ('Logged to ' + (Join-Path $script:OutDir 'download-log.csv'))
+
+    # -Tier2Resume: Phase B over an existing worklist (no index needed). Resumable via its cursor.
+    if ($O.ContainsKey('Tier2Resume') -and $O['Tier2Resume']) {
+        Initialize-AuditBaseConfig $O $true
+        $script:AuditEmitSkipped = $false
+        Write-V 1 "Resuming Tier-2 over worklist $($O['Tier2Resume'])..."
+        if (-not (Start-AuditTier2List ([string]$O['Tier2Resume']))) {
+            throw "Worklist not found or empty: $($O['Tier2Resume'])"
+        }
+        if ($O.ContainsKey('Exclude')) { Set-AuditExcludes ([string]$O['Exclude']) }
+        Invoke-AuditPumpToDone
+        Update-AuditExcludedHeadless
+        Complete-AuditOutput $Download
+        return
+    }
+
+    if ($DeferTier2 -and $Tier2) { throw 'Use either -2/--tier2 (scan now) or --defer-tier2 (write the worklist and stop), not both.' }
+
+    if ($Tier2) {
+        # If a worklist from a prior interrupted -2 (or a --defer-tier2) is already on disk, RESUME it
+        # from its .progress cursor instead of rebuilding it with a fresh Tier-1 pass. Resolve the
+        # output layout first so we know where the default worklist would live.
+        Initialize-AuditBaseConfig $O $true
+        $wlPath = Join-Path $script:OutDir 'tier2-pending.csv'
+        if (Test-Path -LiteralPath $wlPath) {
+            $cur = Read-AuditT2Cursor $wlPath
+            Write-V 1 "Found an existing Tier-2 worklist ($wlPath; $cur row(s) already done) - resuming. Delete it to force a fresh scan."
+            $script:AuditEmitSkipped = $false
+            if (Start-AuditTier2List $wlPath) {   # fresh (no -KeepFindings); cursor honoured
+                if ($O.ContainsKey('Exclude')) { Set-AuditExcludes ([string]$O['Exclude']) }
+                Invoke-AuditPumpToDone
+                Update-AuditExcludedHeadless
+            }
+            Complete-AuditOutput $Download
+            return
+        }
+        # Fresh: Phase A (Tier-1 + worklist) then Phase B (continuation), MERGING Tier-2 into Phase A's
+        # findings -> one combined audit-log.csv. The worklist + cursor are deleted on full completion.
+        $wl = Invoke-HeadlessAudit $O $true
+        if ($wl -and (Start-AuditTier2List $wl -KeepFindings)) {
+            Write-V 1 'Scanning Tier-2 worklist...'
+            Invoke-AuditPumpToDone
+            Update-AuditExcludedHeadless
+        }
+        Complete-AuditOutput $Download
+        return
+    }
+
+    # Phase A only: --defer-tier2 (Tier-1 + worklist, stop) or plain Tier-1.
+    $wl = Invoke-HeadlessAudit $O ([bool]$DeferTier2)
+    if ($DeferTier2) {
+        Complete-AuditOutput ('')
+        Write-V 1 ("Wrote $($script:AuditTier2ListTotal) Tier-2 candidate(s) to $wl")
+        Write-V 1 ("  resume Tier-2 later with:  audit --tier2-resume `"$wl`" -u $($script:BaseUrl)  (or just re-run with -2)")
+        return
+    }
+    # Plain Tier-1.
+    Complete-AuditOutput $Download
 }
 
 # ── SEARCH (REST + optional archive walk) ─────────────────────────────────────
@@ -502,8 +719,7 @@ try {
     return
 }
 switch ($verb.ToLower()) {
-    'scrape'   { Invoke-AuditScrape @splat }
-    'download' { Invoke-AuditDownload @splat }
+    'audit'    { Invoke-Audit @splat }
     'search'   { Invoke-Search @splat }
     'help'     { Show-AuditEngineUsage }
     '-h'       { Show-AuditEngineUsage }

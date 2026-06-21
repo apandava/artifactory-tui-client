@@ -310,45 +310,35 @@ function Get-ArchiveItemDetailLines($item, $info, [int]$paneW) {
     return $L.ToArray()
 }
 
-# Download a single internal archive entry. Returns a status line (same styling
-# as Save-Item). Files are saved under a per-archive subfolder of $OutDir.
-function Save-ArchiveEntry($node, [string]$subDir) {
-    $url = Get-EntryUrl $node
-    if (-not $url) { return "${RD}${BD}Download failed:${R} no download path for $(Get-NodeName $node)" }
-    $destDir = if ($subDir) { Join-Path $OutDir $subDir } else { $OutDir }
-    try {
-        if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
-    } catch {
-        return "${RD}${BD}Download failed:${R} cannot create folder ${CY}$destDir${R} - $($_.Exception.Message)"
-    }
-    $dest = Join-Path $destDir (Get-NodeName $node)
+# Build a dedup-engine entry (Core's Invoke-DedupDownload shape) from an archive tree node.
+# Archive entries carry no storage checksum, so KnownHash is '' (the engine hashes the bytes it
+# fetches); Size is the treebrowser size when known, else -1. VisitKey = the entry url so
+# Mark-Downloaded greys the row and hides it from re-listing.
+function ConvertTo-ArcDownloadEntry($node) {
+    $url  = Get-EntryUrl $node
     $info = Get-NodeInfo $node
-    $nsz  = if ($info -and $info.PSObject.Properties['size']) { [long]$info.size } else { [long]-1 }
-    $nrepo = if ($node.PSObject.Properties['repoKey']) { "$($node.repoKey)" } else { '' }
-    # Reuse bytes already held in memory from an earlier preview, if present.
-    if ($script:MemFiles.ContainsKey($url)) {
-        try {
-            [System.IO.File]::WriteAllBytes($dest, $script:MemFiles[$url])
-            # Archive entries have no storage checksum, so hash the saved bytes for the log.
-            $nhash = 'sha256:' + (Get-BytesSha256 $script:MemFiles[$url])
-            Write-DownloadLog $destDir (Get-NodeName $node) $nrepo (Get-NodeInternalPath $node) (Get-EntryArchiveName $node) $nsz '' $url '' '' $nhash
-            Mark-Downloaded $url $url
-            return "${BD}Saved${R} to ${CY}$dest${R} ${DM}(from preview cache)${R}"
-        } catch { }
+    $sz   = if ($info -and $info.PSObject.Properties['size']) { [long]$info.size } else { [long]-1 }
+    $repo = if ($node.PSObject.Properties['repoKey']) { "$($node.repoKey)" } else { '' }
+    return [PSCustomObject]@{
+        Ref = $null; Name = (Get-NodeName $node); Url = $url; KnownHash = ''
+        Repo = $repo; Path = (Get-NodeInternalPath $node); Archive = (Get-EntryArchiveName $node)
+        Size = $sz; Modified = ''; Sev = ''; Rule = ''; VisitKey = $url
     }
-    if (Test-NetworkBlocked) { return "${YL}Offline:${R} archive-entry content isn't cached - can't download without a connection." }
-    $old  = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-    try {
-        Invoke-WebRequest -Uri $url -Headers (Get-AuthHeaders) -OutFile $dest -ErrorAction Stop
-        $len = $nsz; try { $len = (Get-Item $dest).Length } catch { }
-        $nhash = Get-FileSha256 $dest
-        Write-DownloadLog $destDir (Get-NodeName $node) $nrepo (Get-NodeInternalPath $node) (Get-EntryArchiveName $node) $len '' $url '' '' $nhash
-        Mark-Downloaded $url $url
-        return "${BD}Saved${R} to ${CY}$dest${R}"
-    } catch {
-        try { if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force } } catch { }
-        return "${RD}${BD}Download failed:${R} $(Get-HttpErrorDetail $_)"
-    } finally { $ProgressPreference = $old }
+}
+
+# Download a single internal archive entry through the shared dedup engine (Core's
+# Invoke-DedupDownload): saved into $OutDir and traced by the one download-log.csv, with the same
+# content-dedup + hash-tagged-name handling, preview-cache byte reuse, and offline disk fallback
+# as every other download. Returns a status line (same styling as Save-Item).
+function Save-ArchiveEntry($node) {
+    if (-not (Get-EntryUrl $node)) { return "${RD}${BD}Download failed:${R} no download path for $(Get-NodeName $node)" }
+    $name = Get-NodeName $node
+    $res  = Invoke-DedupDownload @((ConvertTo-ArcDownloadEntry $node))
+    if ($res.Files -lt 1) {
+        $why = if (Test-NetworkBlocked) { " ${DM}(offline - no cached copy on disk)${R}" } else { '' }
+        return "${RD}${BD}Download failed:${R} could not fetch ${CY}$name${R}$why"
+    }
+    return "${BD}Saved${R} ${CY}$name${R} to ${CY}$OutDir${R}"
 }
 
 # A simple yes/no confirmation screen. $Lines is the message body. Returns $true
@@ -416,35 +406,30 @@ function Read-NumberSpec([string]$first) {
     return $buf.ToString().Trim()
 }
 
-# Confirm + download a set of entry nodes into a per-archive subfolder, warning
-# with the file count and total size first, then showing progress and a summary.
-# Shared by the search view's "download all" and numeric multi-select.
-function Save-Entries($nodes, [string]$arcName) {
+# Confirm + download a set of entry nodes through the shared dedup engine (Core's
+# Invoke-DedupDownload) into $OutDir + the one download-log.csv: identical content collapses to a
+# single file and same-named distinct contents are hash-tagged so neither clobbers the other.
+# Warns with the file count and total size first, then the engine streams progress (via the
+# Show-Popup hook) and we show the dedup summary. Shared by "download all" and numeric multi-select.
+function Save-Entries($nodes) {
     $nodes = @($nodes)
     $total = $nodes.Count
     if ($total -eq 0) { return }
-    $w = ((Get-Width) - 1)
     $bytes = 0L; $haveSize = $true
     foreach ($n in $nodes) {
         $info = Get-NodeInfo $n
         if ($info -and $info.PSObject.Properties['size']) { $bytes += [int64]$info.size } else { $haveSize = $false }
     }
     $szStr = if ($haveSize) { Format-Size $bytes } else { "$(Format-Size $bytes)+ (some sizes unknown)" }
-    $sub   = ($arcName -replace '[\\/:*?"<>|]', '_')
     $ok = Confirm-Prompt @(
         "${BD}Download $total file$(if ($total -ne 1){'s'})?${R}",
         "Total size: ${CY}$szStr${R}",
-        "Into: ${CY}$(Join-Path $OutDir $sub)${R}"
+        "Into: ${CY}$OutDir${R}"
     )
     if (-not $ok) { return }
-    $done = 0; $fail = 0; $i = 0
-    foreach ($n in $nodes) {
-        $i++
-        Show-Popup @("Downloading $i / $total", (Get-NodeName $n))
-        $res = Save-ArchiveEntry $n $sub
-        if ($res -like "*Download failed*") { $fail++ } else { $done++; Mark-Visited (Get-EntryUrl $n) }
-    }
-    Show-Popup @("Done.  Saved $done, failed $fail.", "Into $(Join-Path $OutDir $sub)", '', "press any key")
+    $entries = @($nodes | Where-Object { Get-EntryUrl $_ } | ForEach-Object { ConvertTo-ArcDownloadEntry $_ })
+    $res = Invoke-DedupDownload $entries
+    Show-Popup @((Get-DedupDoneLine $res), "Into $OutDir", '', "press any key")
     [void](Read-Key)
 }
 
@@ -479,11 +464,9 @@ function Format-EntrySearchRow($n, [int]$num, [bool]$sel, [bool]$dl,
 # highlight cursor. Enter downloads the highlighted entry; a number / spec (e.g.
 # 21,27,53-57) multi-downloads; A downloads all not-yet-downloaded matches; h hides/shows
 # already-downloaded matches; d cycles the simple / detailed / preview views (like the main
-# search view). $scopeLabel is the folder the search ran under; $fileNodes are file nodes;
-# $arcName seeds the save subfolder.
-function Show-TreeSearchResults($fileNodes, [string]$query, [string]$scopeLabel, [string]$arcName) {
+# search view). $scopeLabel is the folder the search ran under; $fileNodes are file nodes.
+function Show-TreeSearchResults($fileNodes, [string]$query, [string]$scopeLabel) {
     $fileNodes = @($fileNodes)
-    $sub        = ($arcName -replace '[\\/:*?"<>|]', '_')
     $cursor     = 0
     $hideDone   = $false    # hide already-downloaded matches from the list
     $navFooterLines = 1     # wrapped footer height from last render (reserved in body sizing)
@@ -722,7 +705,7 @@ function Show-TreeSearchResults($fileNodes, [string]$query, [string]$scopeLabel,
                 if ($total -gt 0) {
                     $n = $visible[$cursor]
                     Show-Popup @("Downloading", (Get-NodeName $n))
-                    $res = Save-ArchiveEntry $n $sub
+                    $res = Save-ArchiveEntry $n
                     if ($res -notlike "*Download failed*") { Mark-Visited (Get-EntryUrl $n) }
                     Show-Popup @((Strip-Ansi $res), '', "press any key")
                     [void](Read-Key)
@@ -737,7 +720,7 @@ function Show-TreeSearchResults($fileNodes, [string]$query, [string]$scopeLabel,
                     $idx  = @(Parse-NumberSpec $spec $total)   # @() so an empty spec doesn't $null under StrictMode
                     if ($idx.Count -gt 0) {
                         $picked = @($idx | ForEach-Object { $visible[$_ - 1] })
-                        Save-Entries $picked $arcName
+                        Save-Entries $picked
                     }
                 }
             }
@@ -745,7 +728,7 @@ function Show-TreeSearchResults($fileNodes, [string]$query, [string]$scopeLabel,
                 # Download all matches not already downloaded (a/A; no audit here).
                 if ($total -gt 0) {
                     $pending = @($visible | Where-Object { -not (Test-Visited (Get-EntryUrl $_)) })
-                    if ($pending.Count -gt 0) { Save-Entries $pending $arcName }
+                    if ($pending.Count -gt 0) { Save-Entries $pending }
                     else { Show-Popup @('Nothing to download - all matches already downloaded.', '', 'press any key'); [void](Read-Key) }
                 }
             }
@@ -1248,7 +1231,7 @@ function Show-ArchiveTree([object]$item) {
                         $acc = [Collections.Generic.List[object]]::new()
                         Get-MatchingFiles (Get-NodeKidsResolved $scopeNode $subCache) $subCache $pattern $acc
                         $scopeLabel = Get-NodeInternalPath $scopeNode
-                        Show-TreeSearchResults $acc $q $scopeLabel ([string]$item.Name)
+                        Show-TreeSearchResults $acc $q $scopeLabel
                     }
                 }
             }
@@ -1289,8 +1272,7 @@ function Expand-TreeNodeInline($cur, $item, $subCache, $expanded) {
 function Download-EntryInline($cur, $item, [ref]$Notice, [int]$w) {
     if ($cur.IsFolder) { return }
     Show-Popup @("Downloading", $cur.Name)
-    $sub = ([string]$item.Name) -replace '[\\/:*?"<>|]', '_'
-    $Notice.Value = @{ Message = (Save-ArchiveEntry $cur.Node $sub); At = [DateTime]::UtcNow }
+    $Notice.Value = @{ Message = (Save-ArchiveEntry $cur.Node); At = [DateTime]::UtcNow }
     Mark-Visited (Get-EntryUrl $cur.Node)
 }
 
