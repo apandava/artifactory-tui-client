@@ -467,8 +467,8 @@ function Format-NameCell([object]$item, [int]$nameW, [bool]$vis, [bool]$preview 
 # washed-out (dim).
 # In preview mode only #, Name, Type, Size, Modified are shown (the right pane
 # carries repo/path/etc.); Name takes all the freed width.
-function Format-DetailedRow($item, [int]$Number, [int]$colW, [bool]$vis, [bool]$preview = $false, [bool]$showRule = $false) {
-    $numW = 4; $typeW = 5; $sizeW = 9; $modW = 10; $rtypeW = 6; $ptypeW = 8; $ruleW = 0
+function Format-DetailedRow($item, [int]$Number, [int]$colW, [bool]$vis, [bool]$preview = $false, [bool]$showRule = $false, [int]$numW = 4) {
+    $typeW = 5; $sizeW = 9; $modW = 10; $rtypeW = 6; $ptypeW = 8; $ruleW = 0
     $repoW = [Math]::Min(16, [Math]::Max(8, [int]($colW * 0.14)))
     if ($preview) {
         $nameW = [Math]::Max(10, $colW - ($numW + $typeW + $sizeW + $modW + 8))  # 4 gaps + 2 gutter + 2 margin
@@ -511,8 +511,8 @@ function Format-DetailedRow($item, [int]$Number, [int]$colW, [bool]$vis, [bool]$
     return ($cells -join ' ')
 }
 
-function Format-DetailedHeader([int]$colW, [bool]$preview = $false, [bool]$showRule = $false) {
-    $numW = 4; $typeW = 5; $sizeW = 9; $modW = 10; $rtypeW = 6; $ptypeW = 8; $ruleW = 0
+function Format-DetailedHeader([int]$colW, [bool]$preview = $false, [bool]$showRule = $false, [int]$numW = 4) {
+    $typeW = 5; $sizeW = 9; $modW = 10; $rtypeW = 6; $ptypeW = 8; $ruleW = 0
     $repoW = [Math]::Min(16, [Math]::Max(8, [int]($colW * 0.14)))
     if ($preview) {
         $nameW = [Math]::Max(10, $colW - ($numW + $typeW + $sizeW + $modW + 8))  # match Format-DetailedRow
@@ -520,7 +520,9 @@ function Format-DetailedHeader([int]$colW, [bool]$preview = $false, [bool]$showR
                  (Clip 'Modified' $modW))
     } else {
         if ($showRule) { $ruleW = [Math]::Min(20, [Math]::Max(10, [int]($colW * 0.16))) }
-        $fixed = $numW + $typeW + $sizeW + $modW + $repoW + $rtypeW + $ptypeW + 18 + $(if ($showRule) { $ruleW + 1 } else { 0 })
+        # Must match Format-DetailedRow's $fixed EXACTLY (same +12) so the header columns line up
+        # with the data columns; a divergent constant shifts every heading off its values.
+        $fixed = $numW + $typeW + $sizeW + $modW + $repoW + $rtypeW + $ptypeW + 12 + $(if ($showRule) { $ruleW + 1 } else { 0 })
         $rest  = [Math]::Max(12, $colW - $fixed)
         $nameW = [Math]::Max(10, [int]($rest * 0.55))
         $pathW = [Math]::Max(0, $rest - $nameW)
@@ -621,10 +623,14 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
 
     # Build the column header + data rows (each row already includes its gutter).
     $ruleW = 0
-    if ($detailed) { $hdrLine = Format-DetailedHeader $colW $preview $showRule }
+    # The '#' column must fit the largest row number (1-based, max = $TotalItems) so it is NEVER
+    # truncated; widen from the default 4 for large result sets. Sized off the total (not the current
+    # page) so the column width stays stable as you page. Shared by detailed + simple rendering.
+    $numW = [Math]::Max(4, ([string][Math]::Max(1, $TotalItems)).Length)
+    if ($detailed) { $hdrLine = Format-DetailedHeader $colW $preview $showRule $numW }
     else {
         # Budget: gutter(2) + num + 3 single-space gaps = 5 overhead columns.
-        $numW = 4; $repoW = 22
+        $repoW = 22
         if ($showRule) { $ruleW = [Math]::Min(20, [Math]::Max(10, [int]($colW * 0.16))) }
         $avail = [Math]::Max(20, $colW - $numW - $repoW - 8 - $(if ($showRule) { $ruleW + 1 } else { 0 }))
         $nameW = [Math]::Max(16, [int]($avail * 0.55))
@@ -644,7 +650,7 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
         $vis  = (Test-Visited ([string]$item.Uri)) -or (Test-NameMatchesAny ([string]$item.Name) $ExcludeRx)
         $sel  = ($ri -eq $SelRow)
         if ($detailed) {
-            $rowBody = Format-DetailedRow $item ($Offset + $ri + 1) $colW $vis $preview $showRule
+            $rowBody = Format-DetailedRow $item ($Offset + $ri + 1) $colW $vis $preview $showRule $numW
         } else {
             # Simple view shows no archive/preview badges (detailed/preview only).
             $name = if ($item.Name) { $item.Name } else { '?' }
@@ -854,7 +860,11 @@ function Show-Error([string]$Msg) {
 }
 
 function Show-Loading([string]$Query) {
-    Show-Popup @('Searching', $Query)
+    $lines = @('Searching', $Query)
+    # Offline (index/all): the catalogue is streamed from the on-disk shards, which is the
+    # perceptible pause here - label it. Test-SearchLocalOnly is the existing offline predicate.
+    if ($script:IndexAvailable -and (Test-SearchLocalOnly)) { $lines += @('', 'Loading offline index...') }
+    Show-Popup $lines
 }
 
 # Download an artifact into $OutDir (created on demand). Returns a status line.

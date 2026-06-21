@@ -33,7 +33,8 @@
 
     Flag <-> parameter map:
       -q/--query <name>   -Query          -F/--full            -Full
-      -r/--repos <list>   -Repos          -2/--tier2           -Tier2
+      -r/--repos <list>   -Repos          --repo-types <list>  -RepoTypes
+      --all-repos         -RepoTypes all  -2/--tier2           -Tier2
       -w/--walk-archives  -WalkArchives   -x/--exclude <globs> -Exclude
       --all-versions      -AllVersions    (search verb; default: skip duplicate archive versions)
       --offline <mode>    -Offline        (search verb only; 'index' or 'all')
@@ -114,6 +115,8 @@ function ConvertFrom-AuditArgv([string[]]$tokens) {
             '^(-q|--query)$'         { $p.Query        = $tokens[++$i] }
             '^(-F|--full)$'          { $p.Full         = $true }
             '^(-r|--repos)$'         { $p.Repos        = $tokens[++$i] }
+            '^--repo-types$'         { $p.RepoTypes    = $tokens[++$i] }
+            '^--all-repos$'          { $p.RepoTypes    = 'all' }
             '^(-2|--tier2)$'         { $p.Tier2        = $true }
             '^(-w|--walk-archives)$' { $p.WalkArchives = $true }
             '^--all-versions$'       { $p.AllVersions  = $true }
@@ -152,7 +155,9 @@ Usage:
 Scope (one of):
   -q, --query <name>      audit/search the results of this artifact name search
   -F, --full              audit the entire instance (audit verbs only)
-  -r, --repos <a,b>       restrict the scope to these repositories
+  -r, --repos <a,b>       restrict the scope to these repositories (bypasses the type filter)
+      --repo-types <list> repo rclasses to auto-enumerate (default: local). e.g. local,remote
+                          or 'all' (every non-virtual repo). --all-repos is shorthand for 'all'.
 
 Search options (search verb):
   -w, --walk-archives     also walk listable archives and add matching internal entries
@@ -204,6 +209,8 @@ function Initialize-AuditRunConfig([hashtable]$O) {
     if ($O.ContainsKey('Token'))     { $script:Token   = [string]$O['Token'] }
     if ($O.ContainsKey('Basic'))     { $script:Basic   = [string]$O['Basic'] }
     if ($O.ContainsKey('Repos'))     { $script:Repos   = [string]$O['Repos'] }
+    # Repo-type scope: default LOCAL only (set in Api.ps1); --repo-types widens the auto-enumeration.
+    if ($O.ContainsKey('RepoTypes')) { Set-RepoTypeScope ([string]$O['RepoTypes']) }
     if (-not $script:BaseUrl) { throw 'A base URL is required (-u/--base-url).' }
     $script:BaseUrl = $script:BaseUrl.TrimEnd('/')
     Resolve-RunOutput $O
@@ -329,7 +336,7 @@ function Invoke-DownloadFromScrape([string]$file) {
 # ── ENTRY FUNCTIONS ───────────────────────────────────────────────────────────
 function Invoke-AuditScrape {
     param(
-        [string]$Query, [switch]$Full, [string]$Repos,
+        [string]$Query, [switch]$Full, [string]$Repos, [string]$RepoTypes,
         [switch]$Tier2, [switch]$WalkArchives, [string]$Exclude,
         [long]$Cap, [int]$Workers, [int]$DelayMs,
         [string]$OutDir, [int]$Verbosity,
@@ -350,7 +357,7 @@ function Invoke-AuditScrape {
 
 function Invoke-AuditDownload {
     param(
-        [string]$Query, [switch]$Full, [string]$Repos,
+        [string]$Query, [switch]$Full, [string]$Repos, [string]$RepoTypes,
         [switch]$Tier2, [switch]$WalkArchives, [string]$Exclude,
         [long]$Cap, [int]$Workers, [int]$DelayMs,
         [string]$OutDir, [int]$Verbosity,
@@ -406,7 +413,7 @@ function Invoke-ArcSearchPumpToDone {
 # walked archive contents to the index for reuse.
 function Invoke-Search {
     param(
-        [string]$Query, [string]$Repos, [switch]$WalkArchives, [switch]$AllVersions,
+        [string]$Query, [string]$Repos, [string]$RepoTypes, [switch]$WalkArchives, [switch]$AllVersions,
         [string]$IndexPath, [switch]$NoIndex, [string]$Offline,
         [long]$Cap, [int]$Workers, [int]$DelayMs,
         [string]$OutDir, [int]$Verbosity,
@@ -423,6 +430,8 @@ function Invoke-Search {
     if ($O.ContainsKey('Token'))     { $script:Token   = [string]$O['Token'] }
     if ($O.ContainsKey('Basic'))     { $script:Basic   = [string]$O['Basic'] }
     if ($O.ContainsKey('Repos'))     { $script:Repos   = [string]$O['Repos'] }
+    # Repo-type scope: default LOCAL only (set in Api.ps1); --repo-types widens the auto-enumeration.
+    if ($O.ContainsKey('RepoTypes')) { Set-RepoTypeScope ([string]$O['RepoTypes']) }
     if (-not $script:BaseUrl) { throw 'A base URL is required (-u/--base-url).' }
     if (-not $Query)          { throw 'Specify a query: -q/--query <name>.' }
     Resolve-RunOutput $O

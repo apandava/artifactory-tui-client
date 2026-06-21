@@ -111,6 +111,42 @@ function Resolve-Repo([string]$repo) {
     return [PSCustomObject]@{ Type = '?'; PackageType = '?' }
 }
 
+# ── REPO-TYPE SCOPE (default: LOCAL only) ─────────────────────────────────────
+# Every "what do we target" path (auto repo enumeration for the index/audit/arc-search
+# walks, the public search verb, the index search) is scoped to a SET of allowed repo
+# rclasses. The default is LOCAL only: the tool's focus is artifacts the organisation
+# itself published (its own builds/packages/configs - where its credentials leak), not
+# the millions of third-party files proxied into REMOTE / remote-CACHE repos from public
+# registries. Widen with the launchers' --repo-types flag (e.g. local,remote or 'all');
+# an explicit -Repos list bypasses this filter entirely (you named them, you get them).
+$script:RepoTypeScope = @('local')   # lowercased rclass names, or the sentinel '*' = all (non-virtual)
+
+# Configure the scope from a launcher flag. $null/empty restores the LOCAL default; 'all'/'*'
+# allows every non-virtual rclass; otherwise a comma/space list of rclasses (local/remote/
+# federated/cache). Mirrors Set-OfflineMode's spot in the config surface.
+function Set-RepoTypeScope([string]$spec) {
+    if (-not "$spec".Trim()) { $script:RepoTypeScope = @('local'); return }
+    $s = "$spec".ToLower().Trim()
+    if ($s -eq 'all' -or $s -eq '*' -or $s -eq 'any') { $script:RepoTypeScope = @('*'); return }
+    $list = @($s -split '[,\s]+' | Where-Object { $_ })
+    $script:RepoTypeScope = if (@($list).Count -gt 0) { $list } else { @('local') }
+}
+
+# Is this repo key in the active type scope? VIRTUAL is ALWAYS excluded (it aggregates other
+# repos, so walking it re-enumerates the same artifacts under their backing keys - duplicate
+# work + findings). An UNKNOWN type ('?', e.g. anonymous access denied /api/repositories) is
+# kept rather than dropped: we can't classify it, so we don't silently hide results - the same
+# graceful degradation the type/package columns use. Otherwise the rclass must be in the scope
+# set; a remote-CACHE repo counts as 'remote' for this purpose.
+function Test-RepoTypeInScope([string]$repo) {
+    $t = "$((Resolve-Repo $repo).Type)".ToLower()
+    if ($t -eq 'virtual')        { return $false }
+    if (-not $t -or $t -eq '?')  { return $true }
+    if ($script:RepoTypeScope -contains '*') { return $true }
+    if ($script:RepoTypeScope -contains $t)  { return $true }
+    return ($t -eq 'cache' -and ($script:RepoTypeScope -contains 'remote'))
+}
+
 # Copy any already-cached size/modified onto the items for display. This never
 # touches the network — fetching is done entirely by the background prefetch
 # pool below, so rows simply populate as their entries land in the cache.
@@ -199,6 +235,15 @@ function Search-Artifacts([string]$Query) {
         $items = @()
         if ($resp.PSObject.Properties['results']) {
             $items = @($resp.results | ForEach-Object { Convert-UriToItem $_.uri })
+        }
+        # Scope to the active repo-type set (default LOCAL only). The REST search has no rclass
+        # filter, so we classify each hit via the repo map and drop out-of-scope ones (REMOTE/
+        # CACHE/VIRTUAL by default). An explicit -Repos already narrows the query server-side, so
+        # this is a no-op there; unknown-type hits are kept (Test-RepoTypeInScope is graceful when
+        # /api/repositories is denied). Initialize-RepoMap is idempotent + offline-safe.
+        if (-not $Repos) {
+            Initialize-RepoMap
+            $items = @($items | Where-Object { Test-RepoTypeInScope $_.Repo })
         }
         $total = $items.Count
 

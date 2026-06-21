@@ -1074,14 +1074,15 @@ $script:AuditWalkScript = {
 function Get-AuditWalkRepos {
     if ($Repos) { return @($Repos -split '[,\s]+' | Where-Object { $_ }) }
     Initialize-RepoMap
-    # Skip virtual repos: they aggregate other repos, so walking them re-enumerates the
-    # same artifacts already reached under their backing local/remote keys — every file
-    # found twice (duplicate findings + wasted requests). An explicit -Repos list above
-    # is honoured as given. If the repo map is empty (anonymous denied /api/repositories)
-    # this yields nothing, exactly as before.
-    return @($script:RepoMap.Keys | Where-Object {
-        "$($script:RepoMap[$_].Type)".ToLower() -ne 'virtual'
-    })
+    # Restrict to the active repo-type scope (default LOCAL only). The audit hunts for the
+    # organisation's OWN leaked credentials, which live in the artifacts it published to its
+    # LOCAL repos — not in the third-party files proxied into REMOTE/CACHE repos. Virtual repos
+    # are always excluded (Test-RepoTypeInScope): they aggregate other repos, so walking them
+    # re-enumerates the same artifacts under their backing keys (duplicate findings + wasted
+    # requests). Widen the type scope with --repo-types; an explicit -Repos list above is
+    # honoured as given. If the repo map is empty (anonymous denied /api/repositories) this
+    # yields nothing, exactly as before.
+    return @($script:RepoMap.Keys | Where-Object { Test-RepoTypeInScope $_ })
 }
 
 function Start-AuditWalk {

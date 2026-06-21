@@ -36,6 +36,7 @@
     Flag <-> parameter map:
       -F/--full           -Full           -q/--query <name>    -Query
       -a/--archives       -Archives       -r/--repos <list>    -Repos
+      --repo-types <list> -RepoTypes      --all-repos          -RepoTypes all
       --all-versions      -AllVersions    (default: skip duplicate archive versions)
       --resume            -Resume         (skip files already in the shards; no stale refresh)
       --index <dir>       -IndexPath      --workers <1-100>    -Workers
@@ -114,6 +115,8 @@ function ConvertFrom-IndexArgv([string[]]$tokens) {
             '^--skip-versions$'  { $p.AllVersions = $false }   # affirms the default (no-op)
             '^--resume$'         { $p.Resume    = $true }
             '^(-r|--repos)$'     { $p.Repos     = $tokens[++$i] }
+            '^--repo-types$'     { $p.RepoTypes = $tokens[++$i] }
+            '^--all-repos$'      { $p.RepoTypes = 'all' }
             '^--index$'          { $p.IndexPath = $tokens[++$i] }
             '^--workers$'        { $p.Workers    = [int]$tokens[++$i] }
             '^--walkers$'        { $p.Walkers    = [int]$tokens[++$i] }
@@ -143,7 +146,10 @@ Usage:
 Scope (one of -F or -q is required):
   -F, --full              index the entire instance (recursive /api/storage walk)
   -q, --query <name>      index the results of this artifact-name quick-search
-  -r, --repos <a,b>       restrict the scope to these repositories
+  -r, --repos <a,b>       restrict the scope to these repositories (bypasses the type filter)
+      --repo-types <list> repo rclasses to auto-enumerate (default: local). e.g. local,remote
+                          or 'all' (every non-virtual repo). --all-repos is shorthand for 'all'.
+                          Virtual repos are always skipped (they re-list their backing repos).
 
 Options:
   -a, --archives          also expand listable archives and index their internal entries
@@ -172,7 +178,7 @@ Auth:
 function Invoke-IndexBuild {
     param(
         [switch]$Full, [string]$Query, [switch]$Archives, [switch]$AllVersions, [switch]$Resume, [string]$Repos,
-        [string]$IndexPath, [int]$Workers, [int]$Walkers, [int]$ArcWorkers, [int]$DelayMs, [int]$Verbosity,
+        [string]$RepoTypes, [string]$IndexPath, [int]$Workers, [int]$Walkers, [int]$ArcWorkers, [int]$DelayMs, [int]$Verbosity,
         [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic
     )
     $O = $PSBoundParameters
@@ -182,6 +188,8 @@ function Invoke-IndexBuild {
     if ($O.ContainsKey('Token'))     { $script:Token   = [string]$O['Token'] }
     if ($O.ContainsKey('Basic'))     { $script:Basic   = [string]$O['Basic'] }
     if ($O.ContainsKey('Repos'))     { $script:Repos   = [string]$O['Repos'] }
+    # Repo-type scope: default LOCAL only (set in Api.ps1); --repo-types widens the auto-enumeration.
+    if ($O.ContainsKey('RepoTypes')) { Set-RepoTypeScope ([string]$O['RepoTypes']) }
     if (-not $script:BaseUrl) { throw 'A base URL is required (-u/--base-url).' }
     $script:BaseUrl = $script:BaseUrl.TrimEnd('/')
 
@@ -229,7 +237,7 @@ function Invoke-IndexBuild {
     $arcLabel   = if ($archives) { ' (+ listable archives)' } else { '' }
     Write-V 1 "Building index for $scopeLabel$arcLabel"
     Write-V 2 "  index dir: $($script:IndexPath)"
-    Write-V 5 ("  settings: archives=$archives skip-versions=$($script:ArcSkipVersions) resume=$($script:IdxResume) workers=$($script:IdxThrottle.MaxConcurrent) walkers=$($script:IdxWalkConcurrency) arc-workers=$($script:ArcThrottle.MaxConcurrent) delay=$($script:IdxThrottle.MinIntervalMs)ms queue-cap=$($script:IdxQueueCap) repos='$($script:Repos)'")
+    Write-V 5 ("  settings: archives=$archives skip-versions=$($script:ArcSkipVersions) resume=$($script:IdxResume) workers=$($script:IdxThrottle.MaxConcurrent) walkers=$($script:IdxWalkConcurrency) arc-workers=$($script:ArcThrottle.MaxConcurrent) delay=$($script:IdxThrottle.MinIntervalMs)ms queue-cap=$($script:IdxQueueCap) repos='$($script:Repos)' repo-types='$($script:RepoTypeScope -join ",")'")
 
     if ($full) {
         $walkRepos = @(Get-ArcSearchWalkRepos)

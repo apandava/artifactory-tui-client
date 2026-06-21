@@ -19,7 +19,15 @@
 .PARAMETER Basic
     Basic auth as "user:password".
 .PARAMETER Repos
-    Optional comma-separated list of repositories to restrict the search to.
+    Optional comma-separated list of repositories to restrict the search to. An explicit
+    list bypasses the repo-type filter (RepoTypes) entirely.
+.PARAMETER RepoTypes
+    Repo rclasses to target when no explicit -Repos list is given. Defaults to 'local' only:
+    the tool focuses on artifacts the organisation itself published (where its own credentials
+    leak), not the third-party files proxied into remote/cache repos. Set to 'all' (every
+    non-virtual repo) or a comma list (e.g. 'local,remote') to widen. Virtual repos are always
+    excluded (they re-list their backing repos). Affects search results, the archive-search
+    walk, and the index.
 .PARAMETER PageSize
     Rows per page. Paging is client-side over the result set. Defaults to 0,
     meaning auto-size to fill the current window (and re-fit when it's resized);
@@ -44,6 +52,7 @@ param(
     [string] $Token    = '',
     [string] $Basic    = '',
     [string] $Repos    = '',
+    [string] $RepoTypes = '',
     [int]    $PageSize = 0,
     [int]    $Prefetch = 5,
     [string] $OutDir   = '',
@@ -167,6 +176,10 @@ $BaseUrl = $BaseUrl.TrimEnd('/')
 Set-OfflineMode $Offline
 if (Test-NetworkBlocked) { $script:AuditAvailable = $false }
 
+# Repo-type scope: default LOCAL only (set in Api.ps1); -RepoTypes widens the auto-enumeration
+# used by search/the archive walk/the index. An explicit -Repos list bypasses this filter.
+if ($RepoTypes) { Set-RepoTypeScope $RepoTypes }
+
 # Resolve the per-instance output layout (now that the base URL is known): downloads + audit
 # dirs under output/<host>/. An explicit -OutDir is kept verbatim.
 $script:OutDirExplicit = ($PSBoundParameters.ContainsKey('OutDir') -and $OutDir)
@@ -180,6 +193,9 @@ if ($script:IndexAvailable) {
     if ($PSBoundParameters.ContainsKey('IndexPath') -and $IndexPath) { Set-IndexPath $IndexPath }
     Resolve-IndexPath
     if ($script:IndexEnabled) { Import-Index $script:IndexPath }
+    # Route index-scan progress (the offline initial search streams the shards, blocking the UI)
+    # through the popup overlay, mirroring $DownloadProgress. Index.ps1 only fires it when offline.
+    $script:IndexProgress = { param($lines) Show-Popup $lines }
 }
 
 $query    = Read-Query

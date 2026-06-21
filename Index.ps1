@@ -222,15 +222,14 @@ function Get-ArcNodeFns {
 }
 
 # == REPO ENUMERATION ==========================================================
-# Repos to walk: an explicit -Repos list wins; otherwise the non-virtual keys from
-# the repo map. Virtual repos aggregate other repos, so walking them re-enumerates the
-# same artifacts already reached under their backing keys. Mirrors Get-AuditWalkRepos.
+# Repos to walk: an explicit -Repos list wins; otherwise the repo-map keys that fall in
+# the active repo-type scope (default LOCAL only - see Test-RepoTypeInScope, which also
+# always drops virtual repos since they re-enumerate their backing keys). Widen the type
+# scope with --repo-types. Mirrors Get-AuditWalkRepos.
 function Get-ArcSearchWalkRepos {
     if ($Repos) { return @($Repos -split '[,\s]+' | Where-Object { $_ }) }
     Initialize-RepoMap
-    return @($script:RepoMap.Keys | Where-Object {
-        "$($script:RepoMap[$_].Type)".ToLower() -ne 'virtual'
-    })
+    return @($script:RepoMap.Keys | Where-Object { Test-RepoTypeInScope $_ })
 }
 
 # Archive-extension lookup passed to the walker runspace.
@@ -708,16 +707,44 @@ function Update-IndexFromMeta($items) {
 $script:IndexSearchTotal = 0
 # The chunk/window size the interactive TUI loads at a time (and auto-tops-up past).
 $script:IndexSearchMax   = 5000
+
+# Index-scan progress hook (mirrors Core's $DownloadProgress). The TUI sets this to a Show-Popup
+# wrapper so the initial offline search shows live progress while Search-Index streams the shards;
+# left $null (headless) it's a no-op. Report-IndexProgress time-throttles so callers can call it
+# liberally from the hot row loop without flooding the renderer.
+$script:IndexProgress     = $null
+$script:IndexProgressLast = [DateTime]::MinValue
+function Report-IndexProgress([string[]]$lines) {
+    if (-not $script:IndexProgress) { return }
+    if (([DateTime]::UtcNow - $script:IndexProgressLast).TotalMilliseconds -lt 80) { return }
+    $script:IndexProgressLast = [DateTime]::UtcNow
+    & $script:IndexProgress $lines
+}
+
 function Search-Index([string]$query, [int]$skip = 0, [int]$take = 0, [switch]$WantTotal) {
     $q = "$query".ToLower()
     $script:IndexSearchTotal = 0
     if (-not $q -or -not $script:IndexPath) { return @() }
-    $repos   = if ($Repos) { @($Repos -split '[,\s]+' | Where-Object { $_ }) } else { Get-IndexedRepos }
+    # Explicit -Repos wins; otherwise the indexed repos narrowed to the active type scope
+    # (default LOCAL only), so an index built wider (--repo-types) still browses local-only by
+    # default. Test-RepoTypeInScope is graceful when the repo map is unavailable (offline /
+    # anonymous-denied): types read as '?' and pass through, leaving the index as the source of truth.
+    $repos   = if ($Repos) { @($Repos -split '[,\s]+' | Where-Object { $_ }) }
+               else        { @(Get-IndexedRepos | Where-Object { Test-RepoTypeInScope $_ }) }
     $out     = [Collections.Generic.List[object]]::new()
     $matched = 0
     $limit   = if ($take -gt 0) { $skip + $take } else { [int]::MaxValue }
     $scanAll = ([bool]$WantTotal -or $take -le 0)   # keep counting past the window for the total
-    :scan foreach ($repo in $repos) {
+    # Progress: only when the hook is set (TUI) AND search is index-served (offline). The scan
+    # blocks the UI, so we redraw a popup as repos/rows stream by. Cheap when off (one bool/row).
+    $reposArr   = @($repos)
+    $nrepo      = $reposArr.Count
+    $ridx       = 0
+    $scanned    = 0
+    $reportProg = ($null -ne $script:IndexProgress) -and (Test-SearchLocalOnly)
+    :scan foreach ($repo in $reposArr) {
+        $ridx++
+        if ($reportProg) { Report-IndexProgress @('Loading offline index', "repo $ridx of $nrepo", "$matched match(es) $([char]0x00B7) $scanned rows scanned") }
         # Top-level artifact shard: path,name,size,modified.
         $sp = Get-ArtifactShardPath $repo
         if (Test-Path -LiteralPath $sp) {
@@ -725,6 +752,10 @@ function Search-Index([string]$query, [int]$skip = 0, [int]$take = 0, [switch]$W
             try {
                 while ($en.MoveNext()) {
                     if (-not $scanAll -and $matched -ge $limit) { break scan }   # window built; stop
+                    if ($reportProg) {
+                        $scanned++
+                        if (($scanned % 20000) -eq 0) { Report-IndexProgress @('Loading offline index', "repo $ridx of $nrepo", "$matched match(es) $([char]0x00B7) $scanned rows scanned") }
+                    }
                     $line = $en.Current
                     if (-not $line -or -not $line.ToLower().Contains($q)) { continue }
                     $f = Read-CsvRow $line
@@ -746,6 +777,10 @@ function Search-Index([string]$query, [int]$skip = 0, [int]$take = 0, [switch]$W
             try {
                 while ($en.MoveNext()) {
                     if (-not $scanAll -and $matched -ge $limit) { break scan }
+                    if ($reportProg) {
+                        $scanned++
+                        if (($scanned % 20000) -eq 0) { Report-IndexProgress @('Loading offline index', "repo $ridx of $nrepo", "$matched match(es) $([char]0x00B7) $scanned rows scanned") }
+                    }
                     $line = $en.Current
                     if (-not $line -or -not $line.ToLower().Contains($q)) { continue }
                     $f = Read-CsvRow $line
@@ -844,6 +879,16 @@ function Warm-IndexMeta($items) {
         $u = [string]$it.Uri
         if (-not $u -or $script:MetaCache.ContainsKey($u)) { continue }
         if (Get-ItemArchiveName $it) { continue }
+        # Index-search results already carry size/modified from their shard row (Search-Index),
+        # so seed the cache directly - no need to rebuild the whole repo shard table (the simple->
+        # detailed hang). REST-search items have empty size/modified and still take the table path.
+        if ("$($it.Size)" -ne '' -or "$($it.Modified)" -ne '') {
+            $script:MetaCache[$u] = [PSCustomObject]@{ Size = $it.Size; Modified = $it.Modified; Hash = '' }
+            $script:MetaOrder.Enqueue($u)
+            [void]$script:IndexPersisted.Add($u)
+            $warmed++
+            continue
+        }
         $table = Get-RepoIndexTable ([string]$it.Repo)
         $rk = Get-IndexRelKey ([string]$it.Path) ([string]$it.Name)
         if (-not $table.ContainsKey($rk)) { continue }
