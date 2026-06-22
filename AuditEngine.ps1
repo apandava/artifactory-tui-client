@@ -580,6 +580,19 @@ function Get-AuditMatchIdentity([string]$repo, [string]$path, [string]$name, [st
     $z = [char]0
     return "$repo$z$path$z$name$z$archive"
 }
+# Normalize a comma-joined rule label to a stable, order-independent form (sorted, unique).
+function Get-AuditRulesNorm([string]$rules) {
+    return ((@("$rules" -split '\s*,\s*') | Where-Object { $_ } | Sort-Object -Unique) -join ',')
+}
+# Dedupe key for a logged row: identity PLUS the finding's current severity + normalized rule set.
+# Keying on the (sev,rules) STATE - not the identity alone - lets a Tier-1 match and its later Tier-2
+# UPGRADE both persist (two rows for one identity), so the consolidated audit-log can recover the
+# merged Tier-1+Tier-2 truth even across resumed runs; re-running the same audit still dedupes because
+# the final state's signature is already present.
+function Get-AuditMatchSignature([string]$repo, [string]$path, [string]$name, [string]$archive, [string]$sev, [string]$rules) {
+    $z = [char]0
+    return (Get-AuditMatchIdentity $repo $path $name $archive) + $z + $sev + $z + (Get-AuditRulesNorm $rules)
+}
 function Get-AuditMatchFile([string]$repo) {
     $safe = ($repo -replace '[^A-Za-z0-9._-]', '_'); if (-not $safe) { $safe = 'unknown' }
     return "$safe-matches.csv"
@@ -600,15 +613,19 @@ function Ensure-AuditMatchesLoaded {
                 if ($first) { $first = $false; continue }   # header
                 if (-not "$line".Trim()) { continue }
                 $f = Read-CsvRow $line
-                if ($f.Count -lt 6) { continue }
-                [void]$script:AuditMatchesPersisted.Add((Get-AuditMatchIdentity $f[3] $f[4] $f[1] $f[5]))
+                if ($f.Count -lt 11) { continue }
+                # Seed the (identity, severity, rules) signature - cols: FileName=1, Repository=3,
+                # Path=4, Archive=5, Severity=9, MatchedRule=10 - so prior runs' rows (incl. upgrades)
+                # don't re-log.
+                [void]$script:AuditMatchesPersisted.Add((Get-AuditMatchSignature $f[3] $f[4] $f[1] $f[5] $f[9] $f[10]))
             }
         } catch { }
     }
 }
-# Append a finding to its repo's audit/<repo>-matches.csv (scrape-style: blank Timestamp +
-# Hash). Once per repo|path|name|archive identity (this session AND prior runs). Real matches
-# only. Cheap no-op when no audit dir is configured. Called from Add-AuditFinding.
+# Append a finding to its repo's audit/<repo>-matches.csv (scrape-style: blank Timestamp + Hash).
+# Written through once per (identity, severity, rule-set) STATE - this session AND prior runs - so a
+# Tier-1 match and its later Tier-2 upgrade BOTH land on disk (consolidation merges them by identity),
+# while re-running the same audit re-logs nothing. Real matches only. Cheap no-op when no audit dir.
 function Save-AuditMatch($f) {
     if (-not $script:AuditDir -or $null -eq $f) { return }
     $rule = [string]$f.Rule
@@ -616,11 +633,60 @@ function Save-AuditMatch($f) {
     Ensure-AuditMatchesLoaded
     $repo = if ([string]$f.Repo) { [string]$f.Repo } else { 'unknown' }
     $arch = if ($f.InArchive) { [string]$f.ArchiveName } else { '' }
-    $id   = Get-AuditMatchIdentity $repo ([string]$f.Path) ([string]$f.Name) $arch
-    if (-not $script:AuditMatchesPersisted.Add($id)) { return }
+    $sig  = Get-AuditMatchSignature $repo ([string]$f.Path) ([string]$f.Name) $arch ([string]$f.Sev) ([string]$f.AllRules)
+    if (-not $script:AuditMatchesPersisted.Add($sig)) { return }
     $sz = if ($f.Size -ge 0) { [long]$f.Size } else { -1 }
     Write-DownloadLog $script:AuditDir ([string]$f.Name) $repo ([string]$f.Path) $arch `
         $sz ([string]$f.Modified) ([string]$f.Url) ([string]$f.Sev) ([string]$f.AllRules) '' (Get-AuditMatchFile $repo) -Scrape
+}
+
+# Build the single definitive audit-log.csv by consolidating EVERY per-repo <repo>-matches.csv: group
+# all rows by repo|path|name|archive identity and merge each group into one row - the UNION of all
+# MatchedRule tokens and the HIGHEST severity seen (so a file's Tier-1 row + its Tier-2 upgrade row
+# collapse to the merged Tier-1+Tier-2 label). Because matches.csv is cumulative + write-through, this
+# is complete across resumed/split runs and crash-safe. Overwrites $outFile (one clean file, no append
+# duplicates). Size/Modified/Url come from the highest-severity row. Returns the row count written.
+function Build-AuditLogFromMatches([string]$outFile) {
+    if (-not $script:AuditDir -or -not (Test-Path -LiteralPath $script:AuditDir)) { return 0 }
+    $byId = @{}   # identity -> @{ Repo;Path;Name;Archive;Url;Size;Modified;Rank;Sev; Rules=HashSet }
+    foreach ($file in (Get-ChildItem -LiteralPath $script:AuditDir -File -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -like '*-matches.csv' })) {
+        $first = $true
+        try {
+            foreach ($line in [System.IO.File]::ReadLines($file.FullName)) {
+                if ($first) { $first = $false; continue }   # header
+                if (-not "$line".Trim()) { continue }
+                $r = Read-CsvRow $line
+                if ($r.Count -lt 11) { continue }
+                # cols: FileName=1 Repository=3 Path=4 Archive=5 SizeBytes=6 Modified=7 DownloadUrl=8 Severity=9 MatchedRule=10
+                $id   = Get-AuditMatchIdentity $r[3] $r[4] $r[1] $r[5]
+                $rank = Get-AuditRank $r[9]
+                $e = $byId[$id]
+                if ($null -eq $e) {
+                    $e = @{ Repo=$r[3]; Path=$r[4]; Name=$r[1]; Archive=$r[5]; Url=$r[8]; Size=$r[6]; Modified=$r[7]
+                            Rank=$rank; Sev=$r[9]; Rules=(New-Object 'System.Collections.Generic.HashSet[string]') }
+                    $byId[$id] = $e
+                } elseif ($rank -gt $e.Rank) {
+                    # Higher-severity row wins for severity + the representative size/modified/url.
+                    $e.Rank = $rank; $e.Sev = $r[9]; $e.Url = $r[8]; $e.Size = $r[6]; $e.Modified = $r[7]
+                }
+                foreach ($t in (@("$($r[10])" -split '\s*,\s*') | Where-Object { $_ })) { [void]$e.Rules.Add($t) }
+            }
+        } catch { }
+    }
+    # Overwrite the destination so re-runs don't accumulate; then append one merged row per identity.
+    try { Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue } catch { }
+    $dir  = Split-Path -Parent $outFile
+    $name = Split-Path -Leaf $outFile
+    $n = 0
+    foreach ($e in ($byId.Values | Sort-Object @{Expression={$_.Rank};Descending=$true}, @{Expression={$_.Repo}}, @{Expression={$_.Path}}, @{Expression={$_.Name}})) {
+        $rules = ((@($e.Rules) | Sort-Object) -join ', ')
+        $sz = -1; if ("$($e.Size)" -match '^\d+$') { $sz = [long]$e.Size }
+        Write-DownloadLog $dir ([string]$e.Name) ([string]$e.Repo) ([string]$e.Path) ([string]$e.Archive) `
+            $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) $rules '' $name -Scrape
+        $n++
+    }
+    return $n
 }
 
 # Exclude filter: compiled glob terms ('*.xml', '*testing*', ...). A finding whose
@@ -650,7 +716,8 @@ $script:AuditPendingNodes = [Collections.Generic.Queue[object]]::new()
 # progress out of the box; the user dials it up or down from the audit view.
 $script:AuditThrottle = @{ MaxConcurrent = 3; MinIntervalMs = 150 }
 $script:AuditLastLaunch = [DateTime]::MinValue
-$script:AuditMaxWorkers = 10   # ceiling for the w/W worker control (and the runspace pool)
+$script:AuditMaxWorkers = 50   # ceiling for the w/W worker control (and the runspace pool); the
+                               # headless audit defaults to 15 workers, so the pool must allow >10
 
 # Delay ladder for the +/- controls: increments are small near 0 and grow toward
 # 5000 ms, so fine control where it matters and coarse steps at the slow end.
@@ -1029,7 +1096,7 @@ function Dispatch-AuditWork {
         if ($iv -gt 0 -and ([DateTime]::UtcNow - $script:AuditLastLaunch).TotalMilliseconds -lt $iv) { break }
         $rec = $script:AuditQueue.Dequeue()
         if ($null -eq $script:AuditPool) {
-            $script:AuditPool = [RunspaceFactory]::CreateRunspacePool(1, 10)
+            $script:AuditPool = [RunspaceFactory]::CreateRunspacePool(1, $script:AuditMaxWorkers)
             $script:AuditPool.Open()
         }
         $kind = if ($rec.ContainsKey('Kind')) { $rec.Kind } else { 'file' }

@@ -166,7 +166,7 @@ function Get-DownloadLogIndex {
     if ($null -ne $script:DownloadLogIndex) { return $script:DownloadLogIndex }
     $map = @{}
     try {
-        $csv = Join-Path $OutDir 'download-log.csv'
+        $csv = Join-Path $script:OutDir 'download-log.csv'
         if (Test-Path -LiteralPath $csv) {
             foreach ($row in (Import-Csv -LiteralPath $csv)) {
                 $u = "$($row.DownloadUrl)"
@@ -187,8 +187,8 @@ function Get-DownloadedBytes([string]$url) {
     $cands = [Collections.Generic.List[string]]::new()
     try {
         if ($rec.FileName) {
-            $cands.Add((Join-Path $OutDir $rec.FileName))
-            if ($rec.Hash) { $cands.Add((Join-Path $OutDir (Add-NameTag $rec.FileName (Get-DedupTag $rec.Hash $url)))) }
+            $cands.Add((Join-Path $script:OutDir $rec.FileName))
+            if ($rec.Hash) { $cands.Add((Join-Path $script:OutDir (Add-NameTag $rec.FileName (Get-DedupTag $rec.Hash $url)))) }
         }
     } catch { return $null }
     foreach ($p in $cands) {
@@ -617,7 +617,7 @@ function Save-DedupFile([string]$dest, [byte[]]$bytes) {
 # downloaded. Called once per entry even when several share one on-disk file.
 function Write-DedupEntry($e, [string]$hash) {
     $sz = if ($e.Size -ge 0) { [long]$e.Size } else { -1 }
-    Write-DownloadLog $OutDir ([string]$e.Name) ([string]$e.Repo) ([string]$e.Path) ([string]$e.Archive) `
+    Write-DownloadLog $script:OutDir ([string]$e.Name) ([string]$e.Repo) ([string]$e.Path) ([string]$e.Archive) `
                       $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) ([string]$e.Rule) ([string]$hash)
     Mark-Downloaded ([string]$e.VisitKey) ([string]$e.Url)
 }
@@ -638,7 +638,7 @@ function Write-DedupEntry($e, [string]$hash) {
 function Invoke-DedupDownload($entries) {
     $entries = @($entries | Where-Object { $_ })
     $total = $entries.Count
-    try { if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null } } catch { }
+    try { if (-not (Test-Path -LiteralPath $script:OutDir)) { New-Item -ItemType Directory -Path $script:OutDir -Force | Out-Null } } catch { }
 
     # Group by filename (case-insensitive), preserving first-seen order.
     $nameGroups = [Collections.Generic.List[object]]::new()
@@ -662,7 +662,7 @@ function Invoke-DedupDownload($entries) {
             $b = Get-DedupBytes $e
             if ($null -eq $b) { $failed++; continue }
             $h = if ("$($e.KnownHash)") { [string]$e.KnownHash } else { 'sha256:' + (Get-BytesSha256 $b) }
-            if (Save-DedupFile (Join-Path $OutDir ([string]$e.Name)) $b) { Write-DedupEntry $e $h; $files++; $logged++ } else { $failed++ }
+            if (Save-DedupFile (Join-Path $script:OutDir ([string]$e.Name)) $b) { Write-DedupEntry $e $h; $files++; $logged++ } else { $failed++ }
             continue
         }
         # Shared filename — hash each member (storage checksum if known, else the bytes) and
@@ -691,7 +691,7 @@ function Invoke-DedupDownload($entries) {
             Report-DownloadProgress @("Saving $gi / $($nameGroups.Count)", $destName)
             $b = if ($c.Bytes) { $c.Bytes } else { Get-DedupBytes $primary }
             if ($null -eq $b) { $failed += $c.Members.Count; continue }
-            if (Save-DedupFile (Join-Path $OutDir $destName) $b) {
+            if (Save-DedupFile (Join-Path $script:OutDir $destName) $b) {
                 $files++; if ($tagged) { $renamed++ }
                 foreach ($e in $c.Members) { Write-DedupEntry $e $c.Hash; $logged++ }
             } else { $failed += $c.Members.Count }

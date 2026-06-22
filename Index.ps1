@@ -1671,6 +1671,109 @@ function Stop-IndexBuild {
     if ($script:IdxBuildState -eq 'building') { $script:IdxBuildState = 'idle' }
 }
 
+# == INDEX-BUILD DRIVER (shared by StartIndex + audit --populate-index) =========
+# Verbosity for the build driver, set by whichever launcher calls it (StartIndex from -v; the audit
+# launcher forwards its own verbosity when auto-populating). Lives here so the driver is self-contained
+# and callable from either launcher (the audit launcher does NOT load StartIndex.ps1).
+$script:IndexVerbosity = 1
+function Write-IdxV([int]$level, [string]$msg) { if ($script:IndexVerbosity -ge $level) { Write-Host $msg } }
+function Format-Eta([int]$seconds) {
+    if ($seconds -lt 0) { $seconds = 0 }
+    if ($seconds -lt 60)    { return "${seconds}s" }
+    if ($seconds -lt 3600)  { return ('{0}m {1}s' -f [int][Math]::Floor($seconds / 60), ($seconds % 60)) }
+    if ($seconds -lt 86400) { return ('{0}h {1}m' -f [int][Math]::Floor($seconds / 3600), [int][Math]::Floor(($seconds % 3600) / 60)) }
+    return ('{0}d {1}h' -f [int][Math]::Floor($seconds / 86400), [int][Math]::Floor(($seconds % 86400) / 3600))
+}
+
+# Drive a configured index build to completion. Preconditions the CALLER sets: $BaseUrl (trimmed) +
+# auth, $Repos / repo-type scope, $IndexPath (resolved), $IndexVerbosity. Applies the index throttle
+# DEFAULTS (workers 50, walkers 20, arc-workers 15, delay 0) when a value is <=0 (delay <0). Used by
+# StartIndex's Invoke-IndexBuildCore AND the audit launcher's --populate-index auto-build, so the
+# defaults + drive logic live in exactly one place.
+function Invoke-IndexBuildRun {
+    param([bool]$Full, [bool]$Archives, [string]$Query = '', [bool]$AllVersions = $false, [bool]$Resume = $false,
+          [int]$Workers = 0, [int]$Walkers = 0, [int]$ArcWorkers = 0, [int]$DelayMs = -1)
+
+    $script:IndexEnabled = $true
+    $script:IdxThrottle.MaxConcurrent = if ($Workers -gt 0)    { [Math]::Max(1, [Math]::Min(100, $Workers)) }    else { 50 }
+    $script:IdxWalkConcurrency        = if ($Walkers -gt 0)    { [Math]::Max(1, [Math]::Min(32,  $Walkers)) }    else { 20 }
+    $script:ArcThrottle.MaxConcurrent = if ($ArcWorkers -gt 0) { [Math]::Max(1, [Math]::Min(20,  $ArcWorkers)) } else { 15 }
+    $d = if ($DelayMs -ge 0) { $DelayMs } else { 0 }
+    $script:IdxThrottle.MinIntervalMs = $d; $script:ArcThrottle.MinIntervalMs = $d
+    $script:ArcSkipVersions = -not $AllVersions
+    $script:IdxResume = $Resume
+
+    $scopeLabel = if ($Full) { 'entire instance' } else { "search: $Query" }
+    $arcLabel   = if ($Archives) { ' (+ listable archives)' } else { '' }
+    Write-IdxV 1 "Building index for $scopeLabel$arcLabel"
+    Write-IdxV 2 "  index dir: $($script:IndexPath)"
+    Write-IdxV 5 ("  settings: archives=$Archives skip-versions=$($script:ArcSkipVersions) resume=$($script:IdxResume) workers=$($script:IdxThrottle.MaxConcurrent) walkers=$($script:IdxWalkConcurrency) arc-workers=$($script:ArcThrottle.MaxConcurrent) delay=$($script:IdxThrottle.MinIntervalMs)ms queue-cap=$($script:IdxQueueCap) repos='$($script:Repos)' repo-types='$($script:RepoTypeScope -join ",")'")
+
+    if ($Full) {
+        $walkRepos = @(Get-ArcSearchWalkRepos)
+        if ($walkRepos.Count -eq 0) {
+            Write-IdxV 1 'Nothing to index: no readable repositories (anonymous access may be denied /api/repositories; try -r/--repos).'
+            return
+        }
+        $repoPreview = (@($walkRepos | Select-Object -First 12) -join ', ')
+        if ($walkRepos.Count -gt 12) { $repoPreview += ', ...' }
+        Write-IdxV 3 "  walking $($walkRepos.Count) repo(s): $repoPreview"
+        if (-not (Start-IndexBuild $true $Archives $null)) { Write-IdxV 1 'Nothing to index.'; return }
+    } else {
+        Write-IdxV 1 "Searching for '$Query'..."
+        $res = Search-Artifacts $Query
+        if ($res.Error) { throw "Search failed: $($res.Error)" }
+        Write-IdxV 2 "  $($res.Total) result(s) from the REST quick-search"
+        [void](Start-IndexBuild $false $Archives $res.Items)
+    }
+
+    $start = [DateTime]::UtcNow; $lastTick = [DateTime]::MinValue; $lastGc = [DateTime]::UtcNow; $lastFlush = [DateTime]::UtcNow
+    $arcBase = $script:ArcIndexedArchives.Count
+    while ($script:IdxBuildState -ne 'done') {
+        Invoke-IndexBuildPump
+        if (([DateTime]::UtcNow - $lastGc).TotalSeconds -ge 20) { [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers(); $lastGc = [DateTime]::UtcNow }
+        if (([DateTime]::UtcNow - $lastFlush).TotalSeconds -ge 5) { Flush-IndexWrites; $lastFlush = [DateTime]::UtcNow }
+        if ($script:IndexVerbosity -ge 2 -and ([DateTime]::UtcNow - $lastTick).TotalSeconds -ge 1) {
+            $done    = $script:IdxDone + $script:IdxSkipped
+            $denom   = $script:IdxSeen.Count
+            $walking = Test-IndexWalkActive
+            $arcBusy = $Archives -and ($script:ArcQueue.Count -gt 0 -or $script:ArcJobs.Count -gt 0)
+            $elapsed = ([DateTime]::UtcNow - $start).TotalSeconds
+            $rate    = if ($elapsed -gt 0) { $done / $elapsed } else { 0 }
+            $pct     = if ($denom -gt 0) { [int][Math]::Floor($done * 100.0 / $denom) } else { 0 }
+            $status =
+                if ($walking)                              { '(walking - discovered total still rising)' }
+                elseif ($done -lt $denom -and $rate -gt 0) { 'ETA ' + (Format-Eta ([int][Math]::Ceiling(($denom - $done) / $rate))) }
+                elseif ($arcBusy) {
+                    $arcLeft  = $script:ArcQueue.Count + $script:ArcJobs.Count
+                    $arcDone2 = $script:ArcIndexedArchives.Count - $arcBase
+                    $arcRate  = if ($elapsed -gt 0) { $arcDone2 / $elapsed } else { 0 }
+                    $arcEta   = if ($arcRate -gt 0) { ', ETA ' + (Format-Eta ([int][Math]::Ceiling($arcLeft / $arcRate))) } else { '' }
+                    "(expanding archives $arcDone2/$($arcDone2 + $arcLeft)$arcEta)"
+                }
+                else { '' }
+            $rateStr = if ($rate -gt 0) { ' | {0:0.0} files/s' -f $rate } else { '' }
+            $arc  = if ($Archives -and $script:IndexVerbosity -ge 4) { " | archives expanded=$($script:ArcIndexedArchives.Count)" } else { '' }
+            $dbg  = if ($script:IndexVerbosity -ge 5) {
+                $aq = if ($Archives) { " | arc-expand queued=$($script:ArcQueue.Count) active=$($script:ArcJobs.Count)" } else { '' }
+                "  [meta-fetch queued=$($script:IdxMetaQueue.Count) workers=$($script:IdxCtl.Target)/$($script:IdxWorkers.Count)$aq]"
+            } else { '' }
+            $skip = if ($script:IdxSkipped -gt 0) { " | $($script:IdxSkipped) already-indexed skipped" } else { '' }
+            Write-Host ("  ...metadata fetched for $done/$denom discovered files ($pct%), $($script:IndexCount) index rows$rateStr$skip $status$arc$dbg".TrimEnd())
+            $lastTick = [DateTime]::UtcNow
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    Stop-IndexBuild
+
+    $secs = [int]([DateTime]::UtcNow - $start).TotalSeconds
+    $skipNote = if ($script:IdxSkipped -gt 0) { " ($($script:IdxSkipped) already-indexed file(s) skipped via --resume)" } else { '' }
+    Write-IdxV 1 ''
+    Write-IdxV 1 ("Index build complete in ${secs}s: metadata fetched for $($script:IdxDone) file(s)$skipNote, $($script:IndexCount) index row(s) written this run (top-level + archive entries).")
+    if ($Archives) { Write-IdxV 1 ("  archives expanded (incl. prior runs): $($script:ArcIndexedArchives.Count)") }
+    Write-IdxV 2 "  index: $($script:IndexPath)"
+}
+
 # == HEADLESS RESULTS WRITER ===================================================
 # Write the combined search results (REST + archive matches) to a CSV. Columns:
 # Name,Repo,Path,Archive,Url,Size,Modified. UTF-8 no-BOM, RFC-4180 quoting.

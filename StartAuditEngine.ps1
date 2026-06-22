@@ -1,4 +1,3 @@
-#Requires -Version 5.1
 <#
 .SYNOPSIS
     Non-interactive (headless) credential/secret audit of a JFrog Artifactory
@@ -14,22 +13,21 @@
     the server. Two verbs:
 
       audit     Classify every indexed artifact (and indexed archive-internal entry) with
-                the ruleset. By default it CATALOGUES matches to audit-log.csv (rule +
-                severity, blank Hash/Timestamp) without downloading. With --download [all]
-                it also DOWNLOADS the matching findings (dedup/rename/hash like the TUI's
-                "download all") -> download-log.csv; --download <sev,...> (e.g. high,medium)
-                downloads only those severities; --download count catalogues and prints the
-                per-severity count + total size of the would-be download set (no download).
-                With -s/--from-log <file> it
-                skips auditing entirely and just downloads every file listed in a prior
-                audit-log.csv. Per-repo matches are also written through to
-                audit/<repo>-matches.csv as they are found.
-                Tier-2 (content scanning) is a two-phase, resumable, worklist-driven flow:
-                a Tier-1 pass writes tier2-pending.csv listing every file Tier-2 would
-                content-inspect, then a pass content-scans it (resumable via a .progress
-                cursor: pause/crash/cancel and re-run to continue). -2/--tier2 does both in
-                one run; --defer-tier2 writes the worklist and stops; --tier2-resume <file>
-                content-scans an existing worklist later.
+                the ruleset, cataloguing matches to audit-log.csv (rule + severity). An index
+                must exist; pass --populate-index to auto-build a full+archives index first.
+                Tier-2 (content scanning) is the DEFAULT - a two-phase, resumable, worklist-
+                driven flow: a Tier-1 pass writes tier2-pending.csv listing every file Tier-2
+                would content-inspect, then a pass content-scans it (resumable via a .progress
+                cursor: pause/crash/cancel and re-run to continue). Use --tier1/--no-tier2 for
+                a Tier-1-only catalogue; --defer-tier2 writes the worklist and stops;
+                --tier2-resume <file> content-scans an existing worklist later.
+                --download [all] DOWNLOADS the matching findings (dedup/rename/hash like the
+                TUI's "download all") -> download-log.csv; --download <sev,...> (e.g.
+                high,medium) only those severities; --download count prints the per-severity
+                count + total size without downloading; --max-size <n> skips oversized files.
+                -s/--from-log <file> skips auditing entirely and downloads the files listed in
+                a prior audit-log.csv. Per-repo matches are written through to
+                audit/<repo>-matches.csv; the consolidated audit-log.csv is rebuilt from them.
       search    Run the public quick-search and, with -w/--walk-archives, also walk the
                 instance's listable archives and add internal entries whose name matches
                 the query, writing a results CSV. Reuses + grows the persistent local index
@@ -42,21 +40,27 @@
       .\StartAuditEngine.ps1 audit -u https://art.example.com -s audit-log.csv
 
     Or paste Core.ps1, Api.ps1, AuditEngine.ps1, Index.ps1 then this file into a console
-    and call the entry functions with native parameters:
-      Invoke-Audit -BaseUrl https://art.example.com -Tier2 -Verbosity 3
-      Invoke-Audit -BaseUrl https://art.example.com -DeferTier2 -OutDir out
-      Invoke-Audit -BaseUrl https://art.example.com -Tier2Resume tier2-pending.csv
+    and call Invoke-Audit / Invoke-Search with the SAME unix-style flags as the script (no
+    verb needed - the function IS the verb):
+      Invoke-Audit -u https://art.example.com -2 -v 3
+      Invoke-Audit -u https://art.example.com --defer-tier2 -o out
+      Invoke-Audit -u https://art.example.com --tier2-resume tier2-pending.csv
+      Invoke-Audit -u https://art.example.com -s audit-log.csv --download critical,high,medium
+    (The native-parameter implementations are Invoke-AuditCore / Invoke-SearchCore if you'd
+    rather splat -ParamName values.)
 
-    Flag <-> parameter map:
+    Flag <-> parameter map (native names, for the *Core functions / the flag map below):
       -r/--repos <list>   -Repos          --repo-types <list>  -RepoTypes
-      --all-repos         -RepoTypes all  -2/--tier2           -Tier2
+      --all-repos         -RepoTypes all  -2/--tier2           -Tier2 (default on)
+      --tier1/--no-tier2  -NoTier2        --populate-index     -PopulateIndex
       --defer-tier2       -DeferTier2     --tier2-resume <f>   -Tier2Resume
       --download [all|count|<sev,...>]    -Download  (default 'all'; omitted = catalogue only)
+      --max-size <size>                   -MaxSize   (per-file download limit, e.g. 100MB; default none)
       -x/--exclude <globs>                -Exclude
       -s/--from-log <f>   -FromLog        --index <dir>        -IndexPath
       -o/--out <dir>      -OutDir         -v/--verbose <0-5>   -Verbosity
-      --cap <bytes>       -Cap            --workers <1-10>     -Workers
-      --delay <ms>        -DelayMs
+      --cap <bytes>       -Cap            --workers <1-50>     -Workers (default 15)
+      --delay <ms>        -DelayMs (default 0)
       -u/--base-url <url> -BaseUrl        -t/--token <tok>     -Token
       -k/--api-key <key>  -ApiKey         -b/--basic <u:p>     -Basic
     (search verb also: -q/--query, -w/--walk-archives, --all-versions, --offline, --no-index.)
@@ -118,6 +122,34 @@ function Format-Duration([int]$secs) {
     return ('{0}d {1}h' -f [int][Math]::Floor($secs / 86400), [int][Math]::Floor(($secs % 86400) / 3600))
 }
 
+# Parse a size string to bytes: plain number, or a binary suffix (K/M/G/T, optional B), e.g.
+# '100MB', '1.5g', '500000', '250 KB'. Empty/unset -> 0 (meaning no limit). Throws on garbage.
+function Convert-ToBytes([string]$s) {
+    $t = "$s".Trim()
+    if (-not $t) { return 0 }
+    if ($t -match '^\s*(?<n>\d+(?:\.\d+)?)\s*(?<u>[KMGT])?B?\s*$') {
+        $mult = switch ("$($Matches['u'])".ToUpper()) { 'K' {1024} 'M' {1048576} 'G' {1073741824} 'T' {1099511627776} default {1} }
+        return [long][Math]::Floor([double]$Matches['n'] * $mult)
+    }
+    throw "Invalid size '$s'. Use bytes or a suffix like 100MB, 1.5G, 500KB."
+}
+
+# Drop entries whose KNOWN size exceeds $maxBytes (0 = no limit). Entries with unknown size (-1, e.g.
+# some archive entries) are KEPT - we can't measure them up front. Reports how many/how much was
+# skipped. Items carry a .Size (bytes) field (findings and from-log rows both do).
+function Select-WithinSize($items, [long]$maxBytes) {
+    if ($maxBytes -le 0) { return @($items) }
+    $kept = [Collections.Generic.List[object]]::new()
+    $skip = 0; $skipBytes = 0L
+    foreach ($it in @($items)) {
+        $sz = -1; if ("$($it.Size)" -match '^-?\d+$') { $sz = [long]$it.Size }
+        if ($sz -ge 0 -and $sz -gt $maxBytes) { $skip++; $skipBytes += $sz }
+        else { [void]$kept.Add($it) }
+    }
+    if ($skip -gt 0) { Write-V 1 ("Size limit $(Format-Size $maxBytes): skipping $skip file(s) over the limit ($(Format-Size $skipBytes) not downloaded)") }
+    return @($kept.ToArray())
+}
+
 # Route the shared bulk-download engine's progress lines to level-4 output (the TUI
 # routes the same hook to Show-Popup instead).
 $script:DownloadProgress = {
@@ -143,8 +175,10 @@ function ConvertFrom-AuditArgv([string[]]$tokens) {
             '^--repo-types$'         { $p.RepoTypes    = $tokens[++$i] }
             '^--all-repos$'          { $p.RepoTypes    = 'all' }
             '^(-2|--tier2)$'         { $p.Tier2        = $true }
+            '^(--no-tier2|--tier1)$' { $p.NoTier2      = $true }
             '^--defer-tier2$'        { $p.DeferTier2   = $true }
             '^--tier2-resume$'       { $p.Tier2Resume  = $tokens[++$i] }
+            '^--populate-index$'     { $p.PopulateIndex = $true }
             '^--download$'           {
                 # Optional value: 'all' (default), 'count', or a severity list (e.g. high,medium).
                 # Consume the next token only when it isn't another flag.
@@ -156,6 +190,7 @@ function ConvertFrom-AuditArgv([string[]]$tokens) {
             '^--skip-versions$'      { $p.AllVersions  = $false }   # affirms the default (no-op)
             '^(-x|--exclude)$'       { $p.Exclude      = $tokens[++$i] }
             '^(-s|--from-log)$'      { $p.FromLog      = $tokens[++$i] }
+            '^--max-size$'           { $p.MaxSize      = $tokens[++$i] }
             '^--index$'              { $p.IndexPath    = $tokens[++$i] }
             '^--no-index$'           { $p.NoIndex      = $true }
             '^--offline$'            { $p.Offline      = $tokens[++$i] }
@@ -180,39 +215,50 @@ function Show-AuditEngineUsage {
 ARTCA headless audit
 
 Usage:
-  StartAuditEngine.ps1 audit  <options>             Tier-1 audit of the index -> audit-log.csv
-  StartAuditEngine.ps1 audit  -2 <options>          Tier-1 + Tier-2 content scan (one run)
+  StartAuditEngine.ps1 audit  <options>             Tier-1 + Tier-2 audit of the index (DEFAULT)
+  StartAuditEngine.ps1 audit  --tier1 <options>     Tier-1 only -> audit-log.csv (no content fetch)
+  StartAuditEngine.ps1 audit  --populate-index <o>  build a full+archives index first if none exists
   StartAuditEngine.ps1 audit  --defer-tier2 <opts>  Tier-1 + write a Tier-2 worklist, then stop
   StartAuditEngine.ps1 audit  --tier2-resume <file> content-scan a worklist (resumable)
   StartAuditEngine.ps1 audit  --download <options>  audit + download all matches -> download-log.csv
   StartAuditEngine.ps1 audit  --download count      audit + show the per-severity download breakdown
   StartAuditEngine.ps1 audit  --download high,medium   download only those severities
   StartAuditEngine.ps1 audit  -s audit-log.csv      download a previous audit-log (no audit)
+  StartAuditEngine.ps1 audit  -s audit-log.csv --download critical,high,medium   ... only those sevs
+  StartAuditEngine.ps1 audit  --download all --max-size 100MB   ... skip files over 100 MB
   StartAuditEngine.ps1 search <options>             quick-search (+ optional archive walk) to a CSV
 
-The audit reads ONLY the local index (no searching/discovery) - build one first with
-StartIndex.ps1. It audits every indexed artifact AND indexed archive-internal entry. Tier-2 is a
-two-phase flow: a Tier-1 pass writes a worklist of every file Tier-2 would content-inspect
-(tier2-pending.csv), then a resumable pass content-scans it. `-2` does both in one run; split them
-with --defer-tier2 (write the list) and --tier2-resume (scan it later, survives pause/crash/cancel).
+The audit reads ONLY the local index (no searching/discovery) - build one first with StartIndex.ps1,
+or pass --populate-index to build it automatically. It audits every indexed artifact AND indexed
+archive-internal entry. Tier-2 (content scanning) is the DEFAULT: a Tier-1 pass writes a worklist of
+every file Tier-2 would content-inspect (tier2-pending.csv), then a resumable pass content-scans it
+(`-2` is implied). Use --tier1/--no-tier2 for a quick Tier-1 catalogue; split the phases with
+--defer-tier2 (write the list) and --tier2-resume (scan it later, survives pause/crash/cancel).
 
 Audit options (audit verb):
-  -2, --tier2             Tier-2: also fetch file content and scan it (Tier-1 -> worklist -> scan)
-      --defer-tier2       Tier-1 only, but write the Tier-2 worklist (tier2-pending.csv) and stop
+  -2, --tier2             Tier-2 content scan (this is the DEFAULT; the flag is explicit/no-op)
+      --tier1, --no-tier2 Tier-1 only: metadata catalogue, no file content fetched
+      --populate-index    if no index exists, auto-build a full+archives index first, then audit
+      --defer-tier2       Tier-1 + write the Tier-2 worklist (tier2-pending.csv) and stop
       --tier2-resume <f>  content-scan an existing worklist; resumable via its .progress cursor
       --download [spec]   download matched findings (no flag = catalogue only). spec: 'all' (default),
                           a severity list e.g. 'high,medium' (critical/high/medium/low/informational,
                           short forms c/h/m/l/i ok), or 'count' = catalogue + print the per-severity
                           count and total size of the would-be download set without downloading
-  -s, --from-log <file>   skip auditing; download every row of a prior audit-log.csv (fills hashes)
+  -s, --from-log <file>   skip auditing; download rows of a prior audit-log.csv (fills hashes).
+                          combine with --download <sev,...> to grab only those severities, or
+                          --download count to preview the per-severity breakdown without downloading
+      --max-size <size>   per-file download limit - files larger than this are NOT downloaded
+                          (e.g. 100MB, 1.5G, 500KB, or plain bytes). Default: no limit. Files of
+                          unknown size are kept. Applies to --download and -s/--from-log.
   -r, --repos <a,b>       restrict to these indexed repositories (bypasses the type filter)
       --repo-types <list> indexed repo rclasses to audit (default: local). e.g. local,remote or
                           'all' (every non-virtual repo). --all-repos is shorthand for 'all'.
   -x, --exclude <globs>   comma/space globs to exclude from the set (e.g. "*.xml,*test*")
       --index <dir>       local index directory to read (default ./output/<host>/index)
       --cap <bytes>       max file size to content-scan (default 2 MB)
-      --workers <1-10>    parallel fetch workers (default 3)
-      --delay <ms>        delay between request launches (default 150)
+      --workers <1-50>    parallel fetch workers (default 15)
+      --delay <ms>        delay between request launches (default 0)
 
 Search options (search verb):
   -q, --query <name>      the artifact name to search for
@@ -227,7 +273,9 @@ Search options (search verb):
   -o, --out <file|dir>    results CSV (default search-results.csv under the out dir)
 
 Output / auth:
-  -o, --out <dir>         output folder (default ./output/<host>/downloads)
+  -o, --out <dir>         DOWNLOADS folder for saved files + download-log.csv (default
+                          ./output/<host>/downloads). Audit catalogues (audit-log.csv,
+                          tier2-pending.csv[.progress], <repo>-matches.csv) go to ./output/<host>/audit.
   -v, --verbose <0-5>     0 silent .. 5 debug (default 1)
   -u, --base-url <url>    Artifactory base URL (required)
   -t, --token <tok>       bearer token        -k, --api-key <key>   JFrog API key
@@ -282,8 +330,12 @@ function Initialize-AuditRunConfig([hashtable]$O) {
     # between holding one finding object per relay-eligible file and holding none.
     $script:AuditEmitSkipped  = $false
     if ($O.ContainsKey('Cap') -and [long]$O['Cap'] -gt 0)        { $script:AuditCap = [long]$O['Cap'] }
-    if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { $script:AuditThrottle.MaxConcurrent = [Math]::Max(1, [Math]::Min(10, [int]$O['Workers'])) }
-    if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { $script:AuditThrottle.MinIntervalMs = [int]$O['DelayMs'] }
+    # Headless throttle DEFAULTS: 15 workers, 0ms delay (more aggressive than the TUI's gentle 3/150).
+    $script:AuditThrottle.MaxConcurrent =
+        if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { [Math]::Max(1, [Math]::Min($script:AuditMaxWorkers, [int]$O['Workers'])) }
+        else { [Math]::Min($script:AuditMaxWorkers, 15) }
+    $script:AuditThrottle.MinIntervalMs =
+        if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { [int]$O['DelayMs'] } else { 0 }
 }
 
 # Re-apply the exclude filter to every finding's Included flag (headless equivalent of
@@ -371,12 +423,23 @@ function Invoke-HeadlessAudit([hashtable]$O, [bool]$emitList = $false) {
     Write-V 5 ("Settings: tier=1$(if ($emitList) { '+worklist' } else { '' }) cap=$script:AuditCap workers=$($script:AuditThrottle.MaxConcurrent) delay=$($script:AuditThrottle.MinIntervalMs)ms index=$script:IndexPath out=$script:OutDir")
 
     # Load the index (lightweight: migrations + the small re-walk skip-set; nothing bulk-loaded).
-    if (-not (Test-Path -LiteralPath $script:IndexPath)) {
-        throw "No local index found at $($script:IndexPath). Build one first with StartIndex.ps1 (e.g. .\StartIndex.ps1 -F -u $($script:BaseUrl))."
-    }
     Import-Index $script:IndexPath
-    if (-not $Repos -and @(Get-IndexedRepos).Count -eq 0) {
-        throw "The local index at $($script:IndexPath) is empty (no repos). Build it first with StartIndex.ps1."
+    $haveIndex = (Test-Path -LiteralPath $script:IndexPath) -and ([bool]$script:Repos -or @(Get-IndexedRepos).Count -gt 0)
+    if (-not $haveIndex) {
+        $populate = [bool]($O.ContainsKey('PopulateIndex') -and $O['PopulateIndex'])
+        if (-not $populate) {
+            throw "No local index found at $($script:IndexPath). Build one first with StartIndex.ps1 (e.g. .\StartIndex.ps1 -u $($script:BaseUrl)), or pass --populate-index to build it automatically."
+        }
+        # Auto-build a full+archives index first, forwarding the relevant config (BaseUrl/auth/repos/
+        # repo-types/index-path already set above; verbosity forwarded). Uses the INDEX throttle
+        # defaults (workers 50 / walkers 20 / arc-workers 15 / delay 0), not the audit ones.
+        Write-V 1 'No local index found - building one first (--populate-index)...'
+        $script:IndexVerbosity = $script:AuditVerbosity
+        Invoke-IndexBuildRun -Full $true -Archives $true
+        $script:IndexManifest = $null; Import-Index $script:IndexPath
+        if (-not ([bool]$script:Repos -or @(Get-IndexedRepos).Count -gt 0)) {
+            throw "Index build produced nothing to audit at $($script:IndexPath) (no readable repos?)."
+        }
     }
 
     Write-V 1 'Auditing the local index...'
@@ -387,7 +450,7 @@ function Invoke-HeadlessAudit([hashtable]$O, [bool]$emitList = $false) {
     # Open the Tier-2 worklist AFTER Start-AuditIndex's reset (which doesn't touch the worklist), so
     # rows are written through during the pump below. Reset-AuditEngine cleared the path either way.
     $wl = ''
-    if ($emitList) { $wl = Join-Path $script:OutDir 'tier2-pending.csv'; Open-AuditTier2List $wl }
+    if ($emitList) { $wl = Join-Path $script:AuditDir 'tier2-pending.csv'; Open-AuditTier2List $wl }
 
     # Excludes must be set AFTER the launch (Reset-AuditEngine clears them); the run
     # honours them for new findings and Update-AuditExcludedHeadless catches the rest.
@@ -444,39 +507,33 @@ function Write-AuditDownloadBreakdown($cands) {
     $u = if ($tu -gt 0) { " (+$tu unknown size)" } else { '' }
     Write-Host ("  {0,-14} {1,7}   {2}{3}" -f 'Total', $tc, (Format-Size $tb), $u)
 }
-# Write the consolidated audit-log.csv (scrape-style: blank Hash/Timestamp) from a candidate set.
-function Write-AuditCatalogue($cands) {
-    foreach ($f in @($cands)) {
-        $arch = if ($f.InArchive) { [string]$f.ArchiveName } else { '' }
-        $sz   = if ($f.Size -ge 0) { [long]$f.Size } else { -1 }
-        Write-DownloadLog $script:OutDir ([string]$f.Name) ([string]$f.Repo) ([string]$f.Path) $arch `
-            $sz ([string]$f.Modified) ([string]$f.Url) ([string]$f.Sev) ([string]$f.AllRules) '' 'audit-log.csv' -Scrape
-    }
-    Write-V 1 ("Wrote $(@($cands).Count) finding(s) to " + (Join-Path $script:OutDir 'audit-log.csv'))
-}
-
-# Write the included findings out per the $downloadSpec:
-#   ''        (no --download)         -> CATALOGUE to audit-log.csv only.
-#   'count'                           -> catalogue + print the per-severity download breakdown (no download).
-#   'all'                             -> DOWNLOAD every included finding (download-log.csv).
-#   '<sev,...>' (e.g. high,medium)    -> download only findings of those severities.
-# Per-repo audit/<repo>-matches.csv are written through during the run regardless.
-function Complete-AuditOutput([string]$downloadSpec) {
+# Write the run's output. ALWAYS (re)builds the single definitive audit-log.csv by consolidating the
+# cumulative per-repo <repo>-matches.csv (merged Tier-1+Tier-2 label, highest severity, one row per
+# file, complete across resumed/split runs - overwritten, no append dups). $downloadSpec then governs
+# downloading the included findings of THIS run:
+#   ''        (no --download)         -> catalogue only (audit-log.csv).
+#   'count'                           -> catalogue + print the per-severity download breakdown.
+#   'all'                             -> download every included finding (download-log.csv).
+#   '<sev,...>' (e.g. high,medium)    -> download only those severities.
+function Complete-AuditOutput([string]$downloadSpec, [long]$maxBytes = 0) {
     $cands = @(Get-AuditIncludedCandidates)
     Write-AuditSummary
-    $spec = "$downloadSpec".Trim().ToLower()
 
-    if (-not $spec -or $spec -eq 'count') {
-        Write-AuditCatalogue $cands
-        if ($spec -eq 'count') { Write-AuditDownloadBreakdown $cands }
-        return
-    }
+    # The definitive consolidated catalogue - always produced after any completed run.
+    $logPath = Join-Path $script:AuditDir 'audit-log.csv'
+    $n = Build-AuditLogFromMatches $logPath
+    Write-V 1 "Consolidated $n finding(s) -> $logPath"
+
+    $spec = "$downloadSpec".Trim().ToLower()
+    if (-not $spec) { return }
+    if ($spec -eq 'count') { Write-AuditDownloadBreakdown (Select-WithinSize $cands $maxBytes); return }
 
     $sel = $cands
     if ($spec -ne 'all') {
         $set = Resolve-AuditSevSet $spec
         $sel = @($cands | Where-Object { $set.Contains([string]$_.Sev) })
     }
+    $sel = Select-WithinSize $sel $maxBytes   # drop files over the per-file size limit (if any)
     Write-AuditDownloadBreakdown $sel
     if ($sel.Count -eq 0) { Write-V 1 'No findings to download.'; return }
     $res = Invoke-AuditDownloadSet $sel
@@ -484,9 +541,11 @@ function Complete-AuditOutput([string]$downloadSpec) {
     Write-V 1 ('Logged to ' + (Join-Path $script:OutDir 'download-log.csv'))
 }
 
-# Download every file listed in a prior audit-log.csv, no auditing. The catalogue left Hash and
-# Timestamp blank; this recomputes them and writes download-log.csv with both filled.
-function Invoke-DownloadFromLog([string]$file) {
+# Download files listed in a prior audit-log.csv, no auditing. The catalogue left Hash and Timestamp
+# blank; this recomputes them and writes download-log.csv with both filled. $downloadSpec narrows the
+# set by severity exactly like the audit path's --download: '' or 'all' = every row; '<sev,...>'
+# (e.g. high,medium) = only those severities; 'count' = print the per-severity breakdown, no download.
+function Invoke-DownloadFromLog([string]$file, [string]$downloadSpec = '', [long]$maxBytes = 0) {
     if (-not (Test-Path -LiteralPath $file)) { throw "Audit-log file not found: $file" }
     $rows = @(Import-Csv -LiteralPath $file)
     $entries = @($rows | ForEach-Object {
@@ -499,8 +558,19 @@ function Invoke-DownloadFromLog([string]$file) {
         }
     })
     if ($entries.Count -eq 0) { Write-V 1 "No rows in $file."; return }
-    Write-V 1 "Downloading $($entries.Count) file(s) listed in $file ..."
-    $res = Invoke-DedupDownload $entries
+
+    $spec = "$downloadSpec".Trim().ToLower()
+    if ($spec -eq 'count') { Write-AuditDownloadBreakdown (Select-WithinSize $entries $maxBytes); return }
+    $sel = $entries
+    if ($spec -and $spec -ne 'all') {
+        $set = Resolve-AuditSevSet $spec
+        $sel = @($entries | Where-Object { $set.Contains([string]$_.Sev) })
+    }
+    $sel = Select-WithinSize $sel $maxBytes   # drop rows over the per-file size limit (if any)
+    if ($sel.Count -eq 0) { Write-V 1 "No rows in $file to download (after severity/size filters)."; return }
+    Write-AuditDownloadBreakdown $sel
+    Write-V 1 "Downloading $($sel.Count) file(s) listed in $file ..."
+    $res = Invoke-DedupDownload $sel
     Write-V 1 (Get-DedupDoneLine $res)
     Write-V 1 ('Logged to ' + (Join-Path $script:OutDir 'download-log.csv'))
 }
@@ -523,27 +593,35 @@ function Initialize-AuditBaseConfig([hashtable]$O, [bool]$requireBaseUrl = $true
 }
 
 # ── ENTRY FUNCTION ────────────────────────────────────────────────────────────
-# The single audit entry. Tier-2 is a two-phase, resumable, worklist-driven flow:
-#   (default Tier-1)   classify the index, catalogue matches to audit-log.csv (or --download).
-#   -Tier2 / -2        Phase A (Tier-1 + worklist) then Phase B (content-scan the worklist) in one run.
+# The single audit entry. Tier-2 (content scanning) is the DEFAULT and is a two-phase, resumable,
+# worklist-driven flow:
+#   (default)          Tier-1 + Tier-2: Phase A (Tier-1 + worklist) then Phase B (content scan), merged.
+#   -NoTier2 / --tier1 Tier-1 only: classify the index, catalogue matches to audit-log.csv.
 #   -DeferTier2        Phase A only: Tier-1 + write the worklist (tier2-pending.csv), then stop.
 #   -Tier2Resume <f>   Phase B only: content-scan an existing worklist, resumable via its .progress cursor.
+#   -PopulateIndex     if no index exists, build a full+archives index first, then audit.
 #   -FromLog <f>       skip auditing; just download the rows of a prior audit-log.csv.
-function Invoke-Audit {
+# Native-parameter implementation (splat-callable). The public Invoke-Audit front-end below accepts
+# the unix-style flags instead, so paste-mode and the .ps1 share one flag vocabulary.
+function Invoke-AuditCore {
     param(
         [string]$Repos, [string]$RepoTypes,
-        [switch]$Tier2, [string]$Download, [string]$Exclude,
+        [switch]$Tier2, [switch]$NoTier2, [string]$Download, [string]$Exclude,
         [string]$IndexPath, [long]$Cap, [int]$Workers, [int]$DelayMs,
         [string]$OutDir, [int]$Verbosity,
         [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic,
-        [string]$FromLog, [switch]$DeferTier2, [string]$Tier2Resume
+        [string]$FromLog, [switch]$DeferTier2, [string]$Tier2Resume, [string]$MaxSize, [switch]$PopulateIndex
     )
     $O = $PSBoundParameters
+    # Per-file download size limit (bytes, or a suffix like 100MB). 0 = no limit. Applied to the
+    # download selection (and the count/breakdown) so files larger than this aren't fetched.
+    $maxBytes = Convert-ToBytes $MaxSize
 
-    # -FromLog: skip auditing, just download a prior audit-log.csv.
+    # -FromLog: skip auditing, just download a prior audit-log.csv (optionally severity-filtered or
+    # previewed via --download <sev,...>|count).
     if ($O.ContainsKey('FromLog') -and $O['FromLog']) {
         Initialize-AuditBaseConfig $O $true
-        Invoke-DownloadFromLog ([string]$O['FromLog'])
+        Invoke-DownloadFromLog ([string]$O['FromLog']) ([string]$Download) $maxBytes
         return
     }
 
@@ -558,18 +636,28 @@ function Invoke-Audit {
         if ($O.ContainsKey('Exclude')) { Set-AuditExcludes ([string]$O['Exclude']) }
         Invoke-AuditPumpToDone
         Update-AuditExcludedHeadless
-        Complete-AuditOutput $Download
+        Complete-AuditOutput $Download $maxBytes
         return
     }
 
     if ($DeferTier2 -and $Tier2) { throw 'Use either -2/--tier2 (scan now) or --defer-tier2 (write the worklist and stop), not both.' }
+    # Tier-2 is the DEFAULT; --no-tier2 / --tier1 runs a Tier-1 catalogue only.
+    $doTier2 = -not $NoTier2
 
-    if ($Tier2) {
-        # If a worklist from a prior interrupted -2 (or a --defer-tier2) is already on disk, RESUME it
-        # from its .progress cursor instead of rebuilding it with a fresh Tier-1 pass. Resolve the
-        # output layout first so we know where the default worklist would live.
+    if ($DeferTier2) {
+        # Phase A only: Tier-1 + write the worklist, then stop (resume later with --tier2-resume / -2).
+        $wl = Invoke-HeadlessAudit $O $true
+        Complete-AuditOutput ('') $maxBytes
+        Write-V 1 ("Wrote $($script:AuditTier2ListTotal) Tier-2 candidate(s) to $wl")
+        Write-V 1 ("  resume Tier-2 later with:  audit --tier2-resume `"$wl`" -u $($script:BaseUrl)  (or just re-run with -2)")
+        return
+    }
+
+    if ($doTier2) {
+        # If a worklist from a prior interrupted run (or a --defer-tier2) is already on disk, RESUME it
+        # from its .progress cursor instead of rebuilding. Resolve output first so we know where it is.
         Initialize-AuditBaseConfig $O $true
-        $wlPath = Join-Path $script:OutDir 'tier2-pending.csv'
+        $wlPath = Join-Path $script:AuditDir 'tier2-pending.csv'
         if (Test-Path -LiteralPath $wlPath) {
             $cur = Read-AuditT2Cursor $wlPath
             Write-V 1 "Found an existing Tier-2 worklist ($wlPath; $cur row(s) already done) - resuming. Delete it to force a fresh scan."
@@ -579,7 +667,7 @@ function Invoke-Audit {
                 Invoke-AuditPumpToDone
                 Update-AuditExcludedHeadless
             }
-            Complete-AuditOutput $Download
+            Complete-AuditOutput $Download $maxBytes
             return
         }
         # Fresh: Phase A (Tier-1 + worklist) then Phase B (continuation), MERGING Tier-2 into Phase A's
@@ -590,20 +678,13 @@ function Invoke-Audit {
             Invoke-AuditPumpToDone
             Update-AuditExcludedHeadless
         }
-        Complete-AuditOutput $Download
+        Complete-AuditOutput $Download $maxBytes
         return
     }
 
-    # Phase A only: --defer-tier2 (Tier-1 + worklist, stop) or plain Tier-1.
-    $wl = Invoke-HeadlessAudit $O ([bool]$DeferTier2)
-    if ($DeferTier2) {
-        Complete-AuditOutput ('')
-        Write-V 1 ("Wrote $($script:AuditTier2ListTotal) Tier-2 candidate(s) to $wl")
-        Write-V 1 ("  resume Tier-2 later with:  audit --tier2-resume `"$wl`" -u $($script:BaseUrl)  (or just re-run with -2)")
-        return
-    }
-    # Plain Tier-1.
-    Complete-AuditOutput $Download
+    # Tier-1 only (--no-tier2): catalogue the index, no content scanning.
+    [void](Invoke-HeadlessAudit $O $false)
+    Complete-AuditOutput $Download $maxBytes
 }
 
 # ── SEARCH (REST + optional archive walk) ─────────────────────────────────────
@@ -627,8 +708,9 @@ function Invoke-ArcSearchPumpToDone {
 # `search` verb: run the public quick-search and, with -w/--walk-archives, also walk the
 # instance's listable archives in the background and add internal entries whose name
 # matches the query. Writes the combined results to a CSV and (unless --no-index) caches
-# walked archive contents to the index for reuse.
-function Invoke-Search {
+# walked archive contents to the index for reuse. Native-parameter implementation; the public
+# Invoke-Search front-end (below) takes the unix-style flags.
+function Invoke-SearchCore {
     param(
         [string]$Query, [string]$Repos, [string]$RepoTypes, [switch]$WalkArchives, [switch]$AllVersions,
         [string]$IndexPath, [switch]$NoIndex, [string]$Offline,
@@ -704,25 +786,47 @@ function Invoke-Search {
     if ($script:IndexEnabled) { Write-V 1 "Wrote $($script:IndexCount) new record(s) to the index this run ($($script:IndexPath))" }
 }
 
-# ── DISPATCH (script-file invocation) ─────────────────────────────────────────
-# Skip when loaded only for testing, or pasted/dot-sourced with no verb.
-if ($env:ARTCA_NOMAIN) { return }
-if ($args.Count -eq 0) { Show-AuditEngineUsage; return }
-
-$verb = [string]$args[0]
-$rest = if ($args.Count -gt 1) { @($args[1..($args.Count - 1)]) } else { @() }
-try {
-    $splat = ConvertFrom-AuditArgv $rest
-} catch {
-    Write-Host "Error: $($_.Exception.Message)`n"
-    Show-AuditEngineUsage
-    return
+# ── CONSOLE/PASTE FRONT-ENDS ──────────────────────────────────────────────────
+# Take the SAME unix-style flags as the script (e.g. Invoke-Audit -s audit-log.csv --download
+# critical,high,medium --max-size 100MB), identical to `.\StartAuditEngine.ps1 audit -s ...`. No
+# param() block, so dash-flags land in $args instead of being bound as native parameters; they're
+# parsed by ConvertFrom-AuditArgv and forwarded to the native-parameter Invoke-AuditCore/SearchCore.
+function Invoke-Audit {
+    if (@($args).Count -eq 0) { Show-AuditEngineUsage; return }
+    try { $splat = ConvertFrom-AuditArgv @($args) }
+    catch { Write-Host "Error: $($_.Exception.Message)`n"; Show-AuditEngineUsage; return }
+    Invoke-AuditCore @splat
 }
-switch ($verb.ToLower()) {
-    'audit'    { Invoke-Audit @splat }
-    'search'   { Invoke-Search @splat }
-    'help'     { Show-AuditEngineUsage }
-    '-h'       { Show-AuditEngineUsage }
-    '--help'   { Show-AuditEngineUsage }
-    default    { Write-Host "Unknown verb: $verb`n"; Show-AuditEngineUsage }
+function Invoke-Search {
+    if (@($args).Count -eq 0) { Show-AuditEngineUsage; return }
+    try { $splat = ConvertFrom-AuditArgv @($args) }
+    catch { Write-Host "Error: $($_.Exception.Message)`n"; Show-AuditEngineUsage; return }
+    Invoke-SearchCore @splat
+}
+
+# ── DISPATCH (script-file invocation) ─────────────────────────────────────────
+# Paste-safe: if/else (not guard-and-return) because a bare `return` does NOT halt the remaining
+# pasted lines in an interactive session - so pasting the whole file just shows usage instead of
+# throwing on an empty $args (the IndexOutOfRange on `$args[0]`).
+if (-not $env:ARTCA_NOMAIN) {
+    if (@($args).Count -eq 0) {
+        Show-AuditEngineUsage
+    } else {
+        $verb = [string]$args[0]
+        $rest = if ($args.Count -gt 1) { @($args[1..($args.Count - 1)]) } else { @() }
+        try {
+            $splat = ConvertFrom-AuditArgv $rest
+            switch ($verb.ToLower()) {
+                'audit'    { Invoke-AuditCore @splat }
+                'search'   { Invoke-SearchCore @splat }
+                'help'     { Show-AuditEngineUsage }
+                '-h'       { Show-AuditEngineUsage }
+                '--help'   { Show-AuditEngineUsage }
+                default    { Write-Host "Unknown verb: $verb`n"; Show-AuditEngineUsage }
+            }
+        } catch {
+            Write-Host "Error: $($_.Exception.Message)`n"
+            Show-AuditEngineUsage
+        }
+    }
 }

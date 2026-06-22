@@ -1,4 +1,3 @@
-#Requires -Version 5.1
 <#
 .SYNOPSIS
     Non-interactive (headless) local-index BUILDER for a JFrog Artifactory instance —
@@ -29,9 +28,11 @@
       .\StartIndex.ps1 -F -a -u https://art.example.com -r repo1,repo2 -v 2
       .\StartIndex.ps1 -q secrets -a -u https://art.example.com
 
-    Or paste Core.ps1, Api.ps1, Index.ps1 then this file into a console and call:
-      Invoke-IndexBuild -BaseUrl https://art.example.com -Full -Archives -Verbosity 2
-      Invoke-IndexBuild -BaseUrl https://art.example.com -Query secrets
+    Or paste Core.ps1, Api.ps1, Index.ps1 then this file into a console and call Invoke-IndexBuild
+    with the SAME unix-style flags as the script:
+      Invoke-IndexBuild -F -a -u https://art.example.com -v 2
+      Invoke-IndexBuild -q secrets -u https://art.example.com --workers 50 --arc-workers 15
+    (The native-parameter implementation is Invoke-IndexBuildCore if you'd rather splat -ParamName.)
 
     Flag <-> parameter map:
       -F/--full           -Full           -q/--query <name>    -Query
@@ -111,6 +112,7 @@ function ConvertFrom-IndexArgv([string[]]$tokens) {
             '^(-F|--full)$'      { $p.Full      = $true }
             '^(-q|--query)$'     { $p.Query     = $tokens[++$i] }
             '^(-a|--archives)$'  { $p.Archives  = $true }
+            '^--no-archives$'    { $p.NoArchives = $true }
             '^--all-versions$'   { $p.AllVersions = $true }
             '^--skip-versions$'  { $p.AllVersions = $false }   # affirms the default (no-op)
             '^--resume$'         { $p.Resume    = $true }
@@ -140,29 +142,30 @@ function Show-IndexUsage {
 ARTCA headless index builder
 
 Usage:
-  StartIndex.ps1 -F        <options>     index the entire instance
-  StartIndex.ps1 -q <name> <options>     index the results of an artifact-name search
+  StartIndex.ps1            <options>     index the entire instance + archives (the DEFAULT)
+  StartIndex.ps1 -q <name>  <options>     index the results of an artifact-name search
 
-Scope (one of -F or -q is required):
-  -F, --full              index the entire instance (recursive /api/storage walk)
-  -q, --query <name>      index the results of this artifact-name quick-search
+Scope (defaults to -F --full when neither is given):
+  -F, --full              index the entire instance (recursive /api/storage walk) [DEFAULT]
+  -q, --query <name>      index the results of this artifact-name quick-search instead
   -r, --repos <a,b>       restrict the scope to these repositories (bypasses the type filter)
       --repo-types <list> repo rclasses to auto-enumerate (default: local). e.g. local,remote
                           or 'all' (every non-virtual repo). --all-repos is shorthand for 'all'.
                           Virtual repos are always skipped (they re-list their backing repos).
 
 Options:
-  -a, --archives          also expand listable archives and index their internal entries
+  -a, --archives          expand listable archives + index their internal entries [DEFAULT ON]
+      --no-archives       do NOT expand archives (top-level metadata only)
       --all-versions      expand EVERY version of an archive (default: skip - index only the
                           first version of each artifact, by version-normalized filename)
       --resume            skip files already present in the shards (finish/extend an interrupted
                           build). NOTE: does NOT refresh stale rows - the index is a point-in-time
                           snapshot; --resume only adds what's missing.
       --index <dir>       local index directory to write (default ./output/<host>/index)
-      --workers <1-100>   parallel metadata-fetch workers (default 32; long-lived worker loops)
-      --walkers <1-32>    parallel storage-walk discovery runspaces (default 8; feed the workers -
+      --workers <1-100>   parallel metadata-fetch workers (default 50; long-lived worker loops)
+      --walkers <1-32>    parallel storage-walk discovery runspaces (default 20; feed the workers -
                           raise alongside --workers so discovery doesn't starve them)
-      --arc-workers <1-20> parallel archive-expansion workers (default 6)
+      --arc-workers <1-20> parallel archive-expansion workers (default 15)
       --delay <ms>        per-request politeness delay (default 0; the adaptive throttle backs off
                           automatically on 429/503)
   -v, --verbose <0-5>     0 silent · 1 summary · 2 progress · 3 milestones · 4 detail · 5 debug (default 1)
@@ -175,9 +178,11 @@ Auth:
 }
 
 # ── ENTRY ─────────────────────────────────────────────────────────────────────
-function Invoke-IndexBuild {
+# Native-parameter implementation (splat-callable). The public Invoke-IndexBuild front-end below
+# accepts the unix-style flags instead, so paste-mode and the .ps1 share one flag vocabulary.
+function Invoke-IndexBuildCore {
     param(
-        [switch]$Full, [string]$Query, [switch]$Archives, [switch]$AllVersions, [switch]$Resume, [string]$Repos,
+        [switch]$Full, [string]$Query, [switch]$Archives, [switch]$NoArchives, [switch]$AllVersions, [switch]$Resume, [string]$Repos,
         [string]$RepoTypes, [string]$IndexPath, [int]$Workers, [int]$Walkers, [int]$ArcWorkers, [int]$DelayMs, [int]$Verbosity,
         [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic
     )
@@ -193,14 +198,13 @@ function Invoke-IndexBuild {
     if (-not $script:BaseUrl) { throw 'A base URL is required (-u/--base-url).' }
     $script:BaseUrl = $script:BaseUrl.TrimEnd('/')
 
-    $full     = [bool]($O.ContainsKey('Full') -and $O['Full'])
-    $archives = [bool]($O.ContainsKey('Archives') -and $O['Archives'])
-    $query    = if ($O.ContainsKey('Query')) { [string]$O['Query'] } else { '' }
-    # Skip-versions defaults on (set in Index.ps1); --all-versions/-AllVersions turns it off so
-    # every version of each archive is expanded. (--skip-versions passes AllVersions=$false.)
-    if ($O.ContainsKey('AllVersions')) { $script:ArcSkipVersions = -not [bool]$O['AllVersions'] }
-    if (-not $full -and -not $query) { throw 'Specify a scope: -F/--full or -q/--query <name>.' }
-    if ($full -and $query)           { throw 'Choose one scope: -F/--full OR -q/--query, not both.' }
+    # Scope: default to FULL when neither -F nor -q is given (the index default is the whole instance).
+    $hasFull = [bool]($O.ContainsKey('Full') -and $O['Full'])
+    $query   = if ($O.ContainsKey('Query')) { [string]$O['Query'] } else { '' }
+    if ($hasFull -and $query) { throw 'Choose one scope: -F/--full OR -q/--query, not both.' }
+    $full    = $hasFull -or (-not $query)
+    # Archives default ON (-a is implied); --no-archives opts out.
+    $archives = -not ($O.ContainsKey('NoArchives') -and $O['NoArchives'])
 
     # Output layout + index dir (output/<host>/index unless --index overrides).
     $script:OutDirExplicit = $false
@@ -210,146 +214,45 @@ function Invoke-IndexBuild {
     $script:IndexEnabled = $true     # building the index is the whole point
     Import-Index $script:IndexPath   # migrations + archive skip-set
 
-    # Throttle. --workers scales the metadata-fetch worker loops; --walkers scales the parallel
-    # storage-walk discovery runspaces that feed them (raise together so discovery doesn't starve
-    # the workers). --arc-workers scales archive expansion (each tree is now flattened in its
-    # worker, so it's no longer the main-thread stall it once was). --delay is a per-request
-    # politeness sleep; the adaptive throttle (B) also backs all pools off on 429/503.
-    if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) {
-        $script:IdxThrottle.MaxConcurrent = [Math]::Max(1, [Math]::Min(100, [int]$O['Workers']))
-    }
-    if ($O.ContainsKey('Walkers') -and [int]$O['Walkers'] -gt 0) {
-        $script:IdxWalkConcurrency = [Math]::Max(1, [Math]::Min(32, [int]$O['Walkers']))
-    }
-    # Build-mode arc defaults: 6 workers, no pacing - safe now the per-archive tree is flattened in
-    # the worker (not the main thread). The interactive [w] walk keeps its gentler 3/150ms defaults.
-    $script:ArcThrottle.MaxConcurrent =
-        if ($O.ContainsKey('ArcWorkers') -and [int]$O['ArcWorkers'] -gt 0) { [Math]::Max(1, [Math]::Min(20, [int]$O['ArcWorkers'])) }
-        else { 6 }
-    if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) {
-        $script:IdxThrottle.MinIntervalMs = [int]$O['DelayMs']; $script:ArcThrottle.MinIntervalMs = [int]$O['DelayMs']
-    } else {
-        $script:ArcThrottle.MinIntervalMs = 0
-    }
-    $script:IdxResume = ($O.ContainsKey('Resume') -and [bool]$O['Resume'])   # (F) skip already-indexed files
+    # Drive the build via the shared driver (Index.ps1). Throttle defaults (workers 50 / walkers 20 /
+    # arc-workers 15 / delay 0) are applied there unless overridden; 0 / -1 here = "use the default".
+    $workers    = if ($O.ContainsKey('Workers'))    { [int]$O['Workers'] }    else { 0 }
+    $walkers    = if ($O.ContainsKey('Walkers'))    { [int]$O['Walkers'] }    else { 0 }
+    $arcWorkers = if ($O.ContainsKey('ArcWorkers')) { [int]$O['ArcWorkers'] } else { 0 }
+    $delay      = if ($O.ContainsKey('DelayMs'))    { [int]$O['DelayMs'] }    else { -1 }
+    $allVers    = [bool]($O.ContainsKey('AllVersions') -and $O['AllVersions'])
+    $resume     = [bool]($O.ContainsKey('Resume') -and $O['Resume'])
+    Invoke-IndexBuildRun -Full $full -Archives $archives -Query $query -AllVersions $allVers -Resume $resume `
+        -Workers $workers -Walkers $walkers -ArcWorkers $arcWorkers -DelayMs $delay
+}
 
-    $scopeLabel = if ($full) { 'entire instance' } else { "search: $query" }
-    $arcLabel   = if ($archives) { ' (+ listable archives)' } else { '' }
-    Write-V 1 "Building index for $scopeLabel$arcLabel"
-    Write-V 2 "  index dir: $($script:IndexPath)"
-    Write-V 5 ("  settings: archives=$archives skip-versions=$($script:ArcSkipVersions) resume=$($script:IdxResume) workers=$($script:IdxThrottle.MaxConcurrent) walkers=$($script:IdxWalkConcurrency) arc-workers=$($script:ArcThrottle.MaxConcurrent) delay=$($script:IdxThrottle.MinIntervalMs)ms queue-cap=$($script:IdxQueueCap) repos='$($script:Repos)' repo-types='$($script:RepoTypeScope -join ",")'")
-
-    if ($full) {
-        $walkRepos = @(Get-ArcSearchWalkRepos)
-        if ($walkRepos.Count -eq 0) {
-            Write-V 1 'Nothing to index: no readable repositories (anonymous access may be denied /api/repositories; try -r/--repos).'
-            return
-        }
-        $repoPreview = (@($walkRepos | Select-Object -First 12) -join ', ')
-        if ($walkRepos.Count -gt 12) { $repoPreview += ', ...' }
-        Write-V 3 "  walking $($walkRepos.Count) repo(s): $repoPreview"
-        if (-not (Start-IndexBuild $true $archives $null)) {
-            Write-V 1 'Nothing to index.'
-            return
-        }
-    } else {
-        Write-V 1 "Searching for '$query'..."
-        $res = Search-Artifacts $query
-        if ($res.Error) { throw "Search failed: $($res.Error)" }
-        Write-V 2 "  $($res.Total) result(s) from the REST quick-search"
-        [void](Start-IndexBuild $false $archives $res.Items)
-    }
-
-    # Drive to completion, emitting progress per verbosity. Levels: 0 silent · 1 summary ·
-    # 2 +periodic progress · 3 +scope/milestones · 4 +archive detail · 5 +debug counters.
-    $start    = [DateTime]::UtcNow
-    $lastTick = [DateTime]::MinValue
-    $lastGc   = [DateTime]::UtcNow
-    $lastFlush = [DateTime]::UtcNow
-    $arcBase  = $script:ArcIndexedArchives.Count   # prior-run archives (skip-set); subtract for this run's archive progress
-    while ($script:IdxBuildState -ne 'done') {
-        Invoke-IndexBuildPump
-        # Reclaim churn periodically: parsing thousands of archive trees + building entries +
-        # CSV rows generates large transient garbage that .NET Framework is slow to return to
-        # the OS, so the working set climbs even though nothing is logically retained. A forced
-        # gen-2 collection on a cadence keeps it bounded over a long batch run.
-        if (([DateTime]::UtcNow - $lastGc).TotalSeconds -ge 20) {
-            [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
-            $lastGc = [DateTime]::UtcNow
-        }
-        # Periodically flush buffered shard writes (D) so rows reach disk incrementally - a long
-        # build then survives a kill with most progress persisted (and --resume can skip it).
-        if (([DateTime]::UtcNow - $lastFlush).TotalSeconds -ge 5) {
-            Flush-IndexWrites
-            $lastFlush = [DateTime]::UtcNow
-        }
-        if ($script:IndexVerbosity -ge 2 -and ([DateTime]::UtcNow - $lastTick).TotalSeconds -ge 1) {
-            # The headline fraction is the PER-FILE METADATA pipeline: $done = files whose
-            # /api/storage metadata has been fetched + top-level row written; $denom = files the
-            # storage walk has DISCOVERED so far ($IdxSeen). In location mode every file is seeded
-            # up front, so $denom is the true total and the % is exact from the start. In full mode
-            # the walk keeps discovering, so it's "of what's found so far" and only becomes the true
-            # total once the walk finishes (no count is available up front - Artifactory gives none
-            # without enumerating, and AQL is off the table). ETA is shown only when $denom is
-            # stable (walk done); rate is files/sec overall. NOTE: archives are a SUBSET of these
-            # files (counted here for their own metadata) AND are separately expanded into entries -
-            # that work is tracked by the "archives=" count, not this fraction; "rows" is the index
-            # rows written (top-level + every archive entry), which is why it far exceeds the file
-            # count.
-            # Resolved = fetched (IdxDone) + skipped-as-already-indexed (IdxSkipped, resume mode); both
-            # are counted in $denom ($IdxSeen), so the fraction only reaches 100% when we add skips back.
-            $done    = $script:IdxDone + $script:IdxSkipped
-            $denom   = $script:IdxSeen.Count
-            $walking = Test-IndexWalkActive
-            $arcBusy = $archives -and ($script:ArcQueue.Count -gt 0 -or $script:ArcJobs.Count -gt 0)
-            $elapsed = ([DateTime]::UtcNow - $start).TotalSeconds
-            $rate    = if ($elapsed -gt 0) { $done / $elapsed } else { 0 }
-            $pct     = if ($denom -gt 0) { [int][Math]::Floor($done * 100.0 / $denom) } else { 0 }
-            # Archive-tail ETA: once the walk + files are done, no more archives are discovered,
-            # so ArcQueue+ArcJobs IS the true remaining count and we have a completion rate -
-            # the one phase where an archive ETA is honest (there's no upfront archive total).
-            $status =
-                if ($walking)                              { '(walking - discovered total still rising)' }
-                elseif ($done -lt $denom -and $rate -gt 0) { 'ETA ' + (Format-Eta ([int][Math]::Ceiling(($denom - $done) / $rate))) }
-                elseif ($arcBusy) {
-                    $arcLeft  = $script:ArcQueue.Count + $script:ArcJobs.Count
-                    $arcDone2 = $script:ArcIndexedArchives.Count - $arcBase
-                    $arcRate  = if ($elapsed -gt 0) { $arcDone2 / $elapsed } else { 0 }
-                    $arcEta   = if ($arcRate -gt 0) { ', ETA ' + (Format-Eta ([int][Math]::Ceiling($arcLeft / $arcRate))) } else { '' }
-                    "(expanding archives $arcDone2/$($arcDone2 + $arcLeft)$arcEta)"
-                }
-                else { '' }
-            $rateStr = if ($rate -gt 0) { ' | {0:0.0} files/s' -f $rate } else { '' }
-            $arc  = if ($archives -and $script:IndexVerbosity -ge 4) { " | archives expanded=$($script:ArcIndexedArchives.Count)" } else { '' }
-            $dbg  = if ($script:IndexVerbosity -ge 5) {
-                $aq = if ($archives) { " | arc-expand queued=$($script:ArcQueue.Count) active=$($script:ArcJobs.Count)" } else { '' }
-                "  [meta-fetch queued=$($script:IdxMetaQueue.Count) workers=$($script:IdxCtl.Target)/$($script:IdxWorkers.Count)$aq]"
-            } else { '' }
-            $skip = if ($script:IdxSkipped -gt 0) { " | $($script:IdxSkipped) already-indexed skipped" } else { '' }
-            Write-Host ("  ...metadata fetched for $done/$denom discovered files ($pct%), $($script:IndexCount) index rows$rateStr$skip $status$arc$dbg".TrimEnd())
-            $lastTick = [DateTime]::UtcNow
-        }
-        Start-Sleep -Milliseconds 100
-    }
-    Stop-IndexBuild
-
-    $secs = [int]([DateTime]::UtcNow - $start).TotalSeconds
-    $skipNote = if ($script:IdxSkipped -gt 0) { " ($($script:IdxSkipped) already-indexed file(s) skipped via --resume)" } else { '' }
-    Write-V 1 ''
-    Write-V 1 ("Index build complete in ${secs}s: metadata fetched for $($script:IdxDone) file(s)$skipNote, $($script:IndexCount) index row(s) written this run (top-level + archive entries).")
-    if ($archives) { Write-V 1 ("  archives expanded (incl. prior runs): $($script:ArcIndexedArchives.Count)") }
-    Write-V 2 "  index: $($script:IndexPath)"
+# Console/paste front-end: takes the SAME unix-style flags as the script (e.g.
+#   Invoke-IndexBuild -F -a -u https://repo.example.com --workers 50 --arc-workers 15 -v 5
+# identical to `.\StartIndex.ps1 -F -a -u ... --workers 50 ...`). No param() block, so dash-flags
+# land in $args instead of being bound as native parameters; they're parsed by ConvertFrom-IndexArgv
+# and forwarded to the native-parameter Invoke-IndexBuildCore.
+function Invoke-IndexBuild {
+    if (@($args).Count -eq 0) { Show-IndexUsage; return }
+    try { $splat = ConvertFrom-IndexArgv @($args) }
+    catch { Write-Host "Error: $($_.Exception.Message)`n"; Show-IndexUsage; return }
+    if ($splat.ContainsKey('Help')) { Show-IndexUsage; return }
+    Invoke-IndexBuildCore @splat
 }
 
 # ── DISPATCH (script-file invocation) ─────────────────────────────────────────
-if ($env:ARTCA_NOMAIN) { return }
-if ($args.Count -eq 0) { Show-IndexUsage; return }
-try {
-    $splat = ConvertFrom-IndexArgv @($args)
-} catch {
-    Write-Host "Error: $($_.Exception.Message)`n"
-    Show-IndexUsage
-    return
+# Paste-safe: if/else (not guard-and-return) because a bare `return` does NOT halt the remaining
+# pasted lines in an interactive session - so pasting the whole file just shows usage instead of
+# throwing on an empty $args.
+if (-not $env:ARTCA_NOMAIN) {
+    if (@($args).Count -eq 0) {
+        Show-IndexUsage
+    } else {
+        try {
+            $splat = ConvertFrom-IndexArgv @($args)
+            if ($splat.ContainsKey('Help')) { Show-IndexUsage } else { Invoke-IndexBuildCore @splat }
+        } catch {
+            Write-Host "Error: $($_.Exception.Message)`n"
+            Show-IndexUsage
+        }
+    }
 }
-if ($splat.ContainsKey('Help')) { Show-IndexUsage; return }
-Invoke-IndexBuild @splat
