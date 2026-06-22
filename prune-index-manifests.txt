@@ -1,0 +1,21 @@
+# Run from inside the index directory. Edits _repos.csv and _archives.csv IN PLACE.
+
+# _repos.csv (rows: stem,repo) — keep a line only if its <stem>.csv shard exists on disk;
+# delete it otherwise. The first quoted field is the shard name (stem == repo in this index).
+$repos = Join-Path $PWD '_repos.csv'
+$kept = @(foreach ($line in [IO.File]::ReadLines($repos)) {
+    if (-not $line.Trim()) { continue }
+    $name = ($line.Trim('"') -split '","')[0]
+    if (Test-Path -LiteralPath "$name.csv") { $line }
+})
+[IO.File]::WriteAllLines($repos, [string[]]$kept, [Text.UTF8Encoding]::new($false))
+
+# _archives.csv (rows: repo,archDir,archName) — keep a line only if the repo's <repo>.arc
+# folder exists on disk; delete it otherwise. The first quoted field is the repo name.
+$arcs = Join-Path $PWD '_archives.csv'
+$kept = @(foreach ($line in [IO.File]::ReadLines($arcs)) {
+    if (-not $line.Trim()) { continue }
+    $name = ($line.Trim('"') -split '","')[0]
+    if (Test-Path -LiteralPath "$name.arc") { $line }
+})
+[IO.File]::WriteAllLines($arcs, [string[]]$kept, [Text.UTF8Encoding]::new($false))
