@@ -147,6 +147,25 @@ function Test-RepoTypeInScope([string]$repo) {
     return ($t -eq 'cache' -and ($script:RepoTypeScope -contains 'remote'))
 }
 
+# Explain why a walk/audit found ZERO in-scope repositories — the two causes look identical to the
+# caller (an empty repo set) but mean different things, so a single fixed message ("anonymous access
+# may be denied") misleads when the real cause is the LOCAL-only type filter. Inspects the repo map:
+#   · empty map  -> /api/repositories returned nothing (denied, or genuinely no repos): keep the
+#                   privilege hint.
+#   · non-empty but all filtered out -> report the count + the rclass breakdown of what WAS returned
+#                   and the active scope, so the user knows to widen with --all-repos/--repo-types.
+# Used by the headless launchers' "nothing to index/audit" dead-ends.
+function Get-RepoScopeDiagnostic {
+    Initialize-RepoMap
+    $scope = ($script:RepoTypeScope -join ',')
+    if ($script:RepoMap.Count -eq 0) {
+        return "no repositories returned from /api/repositories (you may lack read access to that endpoint, or it's denied to anonymous). Try naming repos with -r/--repos."
+    }
+    $byType = @($script:RepoMap.Values | Group-Object { "$($_.Type)".ToUpper() } |
+                Sort-Object Count -Descending | ForEach-Object { "$($_.Count) $($_.Name)" })
+    return "/api/repositories returned $($script:RepoMap.Count) repo(s) (types: $($byType -join ', ')), but 0 are in the active type scope '$scope' (virtual repos are always excluded). Widen with --all-repos (or --repo-types local,remote,...), or name repos with -r/--repos."
+}
+
 # Copy any already-cached size/modified onto the items for display. This never
 # touches the network — fetching is done entirely by the background prefetch
 # pool below, so rows simply populate as their entries land in the cache.

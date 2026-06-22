@@ -447,7 +447,7 @@ function Invoke-HeadlessAudit([hashtable]$O, [bool]$emitList = $false) {
         Invoke-IndexBuildRun -Full $true -Archives $true
         $script:IndexManifest = $null; Import-Index $script:IndexPath
         if (-not ([bool]$script:Repos -or @(Get-IndexedRepos).Count -gt 0)) {
-            throw "Index build produced nothing to audit at $($script:IndexPath) (no readable repos?)."
+            throw "Index build produced nothing to audit at $($script:IndexPath): $(Get-RepoScopeDiagnostic)"
         }
     }
 

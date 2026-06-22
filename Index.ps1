@@ -1712,7 +1712,7 @@ function Invoke-IndexBuildRun {
     if ($Full) {
         $walkRepos = @(Get-ArcSearchWalkRepos)
         if ($walkRepos.Count -eq 0) {
-            Write-IdxV 1 'Nothing to index: no readable repositories (anonymous access may be denied /api/repositories; try -r/--repos).'
+            Write-IdxV 1 "Nothing to index: $(Get-RepoScopeDiagnostic)"
             return
         }
         $repoPreview = (@($walkRepos | Select-Object -First 12) -join ', ')
