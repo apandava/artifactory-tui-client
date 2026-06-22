@@ -565,6 +565,16 @@ function Test-RepoTypeInScope([string]$repo) {
     if ($script:RepoTypeScope -contains $t)  { return $true }
     return ($t -eq 'cache' -and ($script:RepoTypeScope -contains 'remote'))
 }
+function Get-RepoScopeDiagnostic {
+    Initialize-RepoMap
+    $scope = ($script:RepoTypeScope -join ',')
+    if ($script:RepoMap.Count -eq 0) {
+        return "no repositories returned from /api/repositories (you may lack read access to that endpoint, or it's denied to anonymous). Try naming repos with -r/--repos."
+    }
+    $byType = @($script:RepoMap.Values | Group-Object { "$($_.Type)".ToUpper() } |
+                Sort-Object Count -Descending | ForEach-Object { "$($_.Count) $($_.Name)" })
+    return "/api/repositories returned $($script:RepoMap.Count) repo(s) (types: $($byType -join ', ')), but 0 are in the active type scope '$scope' (virtual repos are always excluded). Widen with --all-repos (or --repo-types local,remote,...), or name repos with -r/--repos."
+}
 function Apply-Meta([object[]]$Items) {
     if ($null -eq $Items) { return }
     foreach ($it in $Items) {
@@ -1874,7 +1884,7 @@ function Invoke-IndexBuildRun {
     if ($Full) {
         $walkRepos = @(Get-ArcSearchWalkRepos)
         if ($walkRepos.Count -eq 0) {
-            Write-IdxV 1 'Nothing to index: no readable repositories (anonymous access may be denied /api/repositories; try -r/--repos).'
+            Write-IdxV 1 "Nothing to index: $(Get-RepoScopeDiagnostic)"
             return
         }
         $repoPreview = (@($walkRepos | Select-Object -First 12) -join ', ')
@@ -3701,7 +3711,7 @@ function Invoke-HeadlessAudit([hashtable]$O, [bool]$emitList = $false) {
         Invoke-IndexBuildRun -Full $true -Archives $true
         $script:IndexManifest = $null; Import-Index $script:IndexPath
         if (-not ([bool]$script:Repos -or @(Get-IndexedRepos).Count -gt 0)) {
-            throw "Index build produced nothing to audit at $($script:IndexPath) (no readable repos?)."
+            throw "Index build produced nothing to audit at $($script:IndexPath): $(Get-RepoScopeDiagnostic)"
         }
     }
     Write-V 1 'Auditing the local index...'
