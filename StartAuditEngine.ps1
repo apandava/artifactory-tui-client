@@ -542,7 +542,7 @@ function Complete-AuditOutput([string]$downloadSpec, [long]$maxBytes = 0) {
         $set = Resolve-AuditSevSet $spec
         $sel = @($cands | Where-Object { $set.Contains([string]$_.Sev) })
     }
-    $sel = Select-WithinSize $sel $maxBytes   # drop files over the per-file size limit (if any)
+    $sel = @(Select-WithinSize $sel $maxBytes)   # drop files over the per-file size limit (if any)
     Write-AuditDownloadBreakdown $sel
     if ($sel.Count -eq 0) { Write-V 1 'No findings to download.'; return }
     $res = Invoke-AuditDownloadSet $sel
@@ -575,7 +575,7 @@ function Invoke-DownloadFromLog([string]$file, [string]$downloadSpec = '', [long
         $set = Resolve-AuditSevSet $spec
         $sel = @($entries | Where-Object { $set.Contains([string]$_.Sev) })
     }
-    $sel = Select-WithinSize $sel $maxBytes   # drop rows over the per-file size limit (if any)
+    $sel = @(Select-WithinSize $sel $maxBytes)   # drop rows over the per-file size limit (if any)
     if ($sel.Count -eq 0) { Write-V 1 "No rows in $file to download (after severity/size filters)."; return }
     Write-AuditDownloadBreakdown $sel
     Write-V 1 "Downloading $($sel.Count) file(s) listed in $file ..."
