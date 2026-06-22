@@ -352,6 +352,11 @@ function Update-AuditExcludedHeadless {
 function Invoke-AuditPumpToDone {
     if ($script:AuditState -eq 'paused') { $script:AuditState = 'running' }
     $printed  = 0
+    # Findings carried in from a prior phase (the Tier-2 -KeepFindings continuation keeps the list,
+    # so the first pump tick re-flushes them at $printed 0..N-1). Tag those re-prints as already
+    # reported in Tier-1 instead of looking like fresh hits. Zero for every other pump path (they
+    # start from an empty findings list), so Tier-1-only / --defer-tier2 / --tier2-resume are unaffected.
+    $seenBaseline = $script:AuditFindings.Count
     $lastTick = [DateTime]::MinValue
     $lastGc   = [DateTime]::UtcNow
     while ($script:AuditState -ne 'done' -and $script:AuditState -ne 'cancelled' -and $script:AuditState -ne 'idle') {
@@ -361,9 +366,11 @@ function Invoke-AuditPumpToDone {
         if (([DateTime]::UtcNow - $lastGc).TotalSeconds -ge 10) { [GC]::Collect(); $lastGc = [DateTime]::UtcNow }
         if ($script:AuditVerbosity -ge 3) {
             while ($printed -lt $script:AuditFindings.Count) {
-                $f = $script:AuditFindings[$printed]; $printed++
+                $f = $script:AuditFindings[$printed]
+                $tag = if ($printed -lt $seenBaseline) { '  (Tier 1 - Seen)' } else { '' }
+                $printed++
                 $loc = (@($f.Repo, $f.Path, $f.Name) | Where-Object { "$_" -ne '' }) -join '/'
-                Write-Host ("  [{0}] {1} - {2}" -f $f.Sev, $loc, $f.AllRules)
+                Write-Host ("  [{0}] {1} - {2}{3}" -f $f.Sev, $loc, $f.AllRules, $tag)
             }
         }
         if ($script:AuditVerbosity -ge 2 -and ([DateTime]::UtcNow - $lastTick).TotalSeconds -ge 1) {
@@ -390,9 +397,11 @@ function Invoke-AuditPumpToDone {
     }
     if ($script:AuditVerbosity -ge 3) {
         while ($printed -lt $script:AuditFindings.Count) {
-            $f = $script:AuditFindings[$printed]; $printed++
+            $f = $script:AuditFindings[$printed]
+            $tag = if ($printed -lt $seenBaseline) { '  (Tier 1 - Seen)' } else { '' }
+            $printed++
             $loc = (@($f.Repo, $f.Path, $f.Name) | Where-Object { "$_" -ne '' }) -join '/'
-            Write-Host ("  [{0}] {1} - {2}" -f $f.Sev, $loc, $f.AllRules)
+            Write-Host ("  [{0}] {1} - {2}{3}" -f $f.Sev, $loc, $f.AllRules, $tag)
         }
     }
 }
