@@ -406,31 +406,9 @@ function Test-AuditMeta([string]$name, [string]$path) {
     return @{ Discard=$false; Findings=@($findings.ToArray()); ContentRules=@($crules) }
 }
 
-# Extract a single-line preview snippet centred on a regex match: $AuditPreviewWindow TOTAL context
-# chars split evenly each side of the match (40 -> 20 left + match + 20 right; odd windows put the
-# spare char on the right). The match itself sits between the context. Whitespace is collapsed to
-# single spaces (CR/LF/TAB -> space) so the snippet is one CSV record and readable, and the result is
-# hard-capped so one enormous match span can't bloat the row (truncation marked with '...').
-function Get-AuditSnippet([string]$text, [int]$idx, [int]$len, [int]$window) {
-    if ($window -lt 0) { $window = 0 }
-    if ($len -lt 0)    { $len = 0 }
-    $half   = [int][Math]::Floor($window / 2)
-    $start  = [Math]::Max(0, $idx - $half)
-    $mStart = [Math]::Min($text.Length, $idx)
-    $mEnd   = [Math]::Min($text.Length, $idx + $len)
-    $end    = [Math]::Min($text.Length, $mEnd + ($window - $half))
-    if ($mStart -lt $start) { $mStart = $start }
-    if ($end -lt $mEnd)     { $end = $mEnd }
-    # Keep the three parts separate so the renderer can show the EXACT match in white and the surrounding
-    # context grey. Whitespace is collapsed in each part (CR/LF/TAB -> space); only the outer edges trim.
-    $norm  = { param($x) ($x -replace '[\r\n\t]+', ' ') -replace ' {2,}', ' ' }
-    $pre   = (& $norm $text.Substring($start, $mStart - $start)).TrimStart()
-    $match =  & $norm $text.Substring($mStart, $mEnd - $mStart)
-    $post  = (& $norm $text.Substring($mEnd, $end - $mEnd)).TrimEnd()
-    $mMax = $window + 120
-    if ($match.Length -gt $mMax) { $match = $match.Substring(0, $mMax) + '...' }
-    return @{ Pre = $pre; Match = $match; Post = $post; Text = ($pre + $match + $post) }
-}
+# Get-AuditSnippet + Test-AuditContent now live in the worker-injected $AuditScanFn here-string below
+# (the content regex scan runs IN the fetch worker so it's PARALLEL across the pool, not serial on the
+# main thread). They are defined nowhere else - nothing on the main thread calls them.
 
 # Encode an array of strings as a compact, single-line JSON array (no external dependency, so it's
 # deterministic and avoids ConvertTo-Json's formatting/unicode-escaping quirks). Only ", \, and control
@@ -471,29 +449,52 @@ function ConvertFrom-AuditJsonArray([string]$json) {
     try { return @($t | ConvertFrom-Json) } catch { return @() }
 }
 
-# Content pass: run the named content rules' regexes over decoded text, enumerating EVERY occurrence
-# (not just the first) so we can report the true instance count and collect up to $AuditPreviewMax
-# preview snippets. Returns @{ Findings=@(@{Rule;Sev}...); Count=<total occurrences>; Snippets=@(...) }.
-# Counting removes the old IsMatch+break short-circuit, so a content rule now scans the whole file for
-# all hits - negligible for sparse secret patterns; $AuditPreviewCountCeil bounds the pathological tail.
-function Test-AuditContent([string]$text, [string[]]$contentRules) {
-    if (-not $text -or $null -eq $contentRules -or $contentRules.Count -eq 0) {
+# ── WORKER-INJECTED CONTENT SCAN ($AuditScanFn) ───────────────────────────────
+# The content regex pass runs IN the fetch worker (PARALLEL across the runspace pool), not serially on
+# the main thread - so a region of large text files no longer bottlenecks the whole run on one core.
+# Dispatch-AuditWork AddScript()s this into each file worker (like Core's $PvErrFn) ahead of
+# $AuditWkScript, passing the (immutable, thread-safe) compiled ruleset + preview settings as arguments.
+# Single-quoted here-string: the bodies are literal, so this is the SINGLE source of truth for both
+# functions and survives the headless-paste generator (here-strings are kept verbatim).
+$script:AuditScanFn = @'
+# Single-line preview snippet centred on a regex match: $window TOTAL context chars split evenly each
+# side (40 -> 20 left + match + 20 right; odd -> spare char on the right). Whitespace is collapsed to
+# single spaces so the snippet is one CSV record; the match span is hard-capped so it can't bloat the row.
+function Get-AuditSnippet([string]$text, [int]$idx, [int]$len, [int]$window) {
+    if ($window -lt 0) { $window = 0 }
+    if ($len -lt 0)    { $len = 0 }
+    $half   = [int][Math]::Floor($window / 2)
+    $start  = [Math]::Max(0, $idx - $half)
+    $mStart = [Math]::Min($text.Length, $idx)
+    $mEnd   = [Math]::Min($text.Length, $idx + $len)
+    $end    = [Math]::Min($text.Length, $mEnd + ($window - $half))
+    if ($mStart -lt $start) { $mStart = $start }
+    if ($end -lt $mEnd)     { $end = $mEnd }
+    $norm  = { param($x) ($x -replace '[\r\n\t]+', ' ') -replace ' {2,}', ' ' }
+    $pre   = (& $norm $text.Substring($start, $mStart - $start)).TrimStart()
+    $match =  & $norm $text.Substring($mStart, $mEnd - $mStart)
+    $post  = (& $norm $text.Substring($mEnd, $end - $mEnd)).TrimEnd()
+    $mMax = $window + 120
+    if ($match.Length -gt $mMax) { $match = $match.Substring(0, $mMax) + '...' }
+    return @{ Pre = $pre; Match = $match; Post = $post; Text = ($pre + $match + $post) }
+}
+
+# Content pass: run the named content rules' regexes over decoded text, enumerating EVERY occurrence so
+# we report the true instance count and collect up to $capN preview snippets (each carrying its producing
+# rule + severity for level-5 colouring; SevCounts tallies occurrences per severity). $contentMap is the
+# shared ruleset's Content dict (name -> {Sev; Regexes}); $win/$capN/$ceil are the preview settings.
+# Returns @{ Findings=@(@{Rule;Sev}...); Count=<total occurrences>; Snippets=@(...); SevCounts=@{} }.
+function Test-AuditContent([string]$text, $contentRules, $contentMap, [int]$win, [int]$capN, [int]$ceil) {
+    if (-not $text -or $null -eq $contentRules -or @($contentRules).Count -eq 0) {
         return @{ Findings=@(); Count=0; Snippets=@(); SevCounts=@{} }
     }
-    $rs    = Get-AuditRuleSet
-    $win   = [int]$script:AuditPreviewWindow
-    $capN  = [int]$script:AuditPreviewMax
-    $ceil  = [int]$script:AuditPreviewCountCeil
     $out   = [Collections.Generic.List[object]]::new()
-    # Snippets carry the producing rule + its severity (known here, discarded otherwise) so the level-5
-    # output can colour each preview by its rule WITHOUT any later lookup or content re-read. SevCounts
-    # tallies occurrences per severity for the 'N more matches' breakdown.
     $snips = [Collections.Generic.List[object]]::new()
     $sevCounts = @{}
     $total = 0
     foreach ($cn in $contentRules) {
-        if (-not $rs.Content.ContainsKey($cn)) { continue }
-        $c = $rs.Content[$cn]
+        if (-not $contentMap.ContainsKey($cn)) { continue }
+        $c = $contentMap[$cn]
         $ruleHit = $false
         foreach ($rx in $c.Regexes) {
             $m = $rx.Match($text)
@@ -515,6 +516,7 @@ function Test-AuditContent([string]$text, [string[]]$contentRules) {
     }
     return @{ Findings=@($out.ToArray()); Count=$total; Snippets=@($snips.ToArray()); SevCounts=$sevCounts }
 }
+'@
 
 # Reduce a set of @{Rule;Sev} findings to the single highest-severity finding (for the marker) and a
 # combined rule label. Returns $null when empty. Count defaults to the number of matched rules (Tier-1
@@ -889,7 +891,7 @@ $script:AuditStartedAt = [DateTime]::UtcNow
 # no file content is retained. Get-WkError (from Prefetch.ps1's $PvErrFn) is injected
 # ahead of this body by the dispatcher.
 $script:AuditWkScript = {
-    param($key, $storageUri, $downloadUrl, $headers, $cap, $knownSize, $cache, $alert)
+    param($key, $storageUri, $downloadUrl, $headers, $cap, $knownSize, $cache, $alert, $contentRules, $contentMap, $win, $capN, $ceil)
     $old = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
     try {
         $size = [int64]$knownSize
@@ -907,13 +909,13 @@ $script:AuditWkScript = {
                 $we = Get-WkError $_
                 if ($we.Code -eq 429 -or $we.Code -eq 503) { $alert.Message = "Server rate-limited an audit request (HTTP $($we.Code))."; $alert.At = [DateTime]::UtcNow }
                 if ($size -lt 0) {
-                    $cache[$key] = [PSCustomObject]@{ Ok=$false; Size=-1; Modified=''; Text=$null; TooBig=$false; Error=$we.Message }
+                    $cache[$key] = [PSCustomObject]@{ Ok=$false; Size=-1; Modified=''; TooBig=$false; Error=$we.Message; TextLen=0; Scan=$null }
                     return
                 }
             }
         }
         if ($size -ge 0 -and $size -gt $cap) {
-            $cache[$key] = [PSCustomObject]@{ Ok=$true; Size=$size; Modified=$modified; Text=$null; TooBig=$true; Error='' }
+            $cache[$key] = [PSCustomObject]@{ Ok=$true; Size=$size; Modified=$modified; TooBig=$true; Error=''; TextLen=0; Scan=$null }
             return
         }
         # BOUNDED content fetch: read AT MOST $cap bytes. We only ever scan the first $cap, so there is
@@ -954,11 +956,15 @@ $script:AuditWkScript = {
         # read the HTTP Last-Modified header here — that's RFC 1123 ("Fri, 28 Aug ...")
         # and would mix formats. Findings whose size was already known (storage call
         # skipped above) get their Modified from the MetaCache warm in the view instead.
-        $cache[$key] = [PSCustomObject]@{ Ok=$true; Size=$size; Modified=$modified; Text=$text; TooBig=$false; Error='' }
+        # Run the content regex pass HERE (in the worker) so scanning is parallel; the main thread (
+        # Complete-AuditJob) only reduces/merges the result. Drop the raw text - we keep just its length
+        # (for the bytes metric) + the small scan result (findings + up to $capN snippets).
+        $scan = Test-AuditContent $text $contentRules $contentMap $win $capN $ceil
+        $cache[$key] = [PSCustomObject]@{ Ok=$true; Size=$size; Modified=$modified; TooBig=$false; Error=''; TextLen=[long]$text.Length; Scan=$scan }
     } catch {
         $we = Get-WkError $_
         if ($we.Code -eq 429 -or $we.Code -eq 503) { $alert.Message = "Server rate-limited an audit request (HTTP $($we.Code))."; $alert.At = [DateTime]::UtcNow }
-        $cache[$key] = [PSCustomObject]@{ Ok=$false; Size=-1; Modified=''; Text=$null; TooBig=$false; Error=$we.Message }
+        $cache[$key] = [PSCustomObject]@{ Ok=$false; Size=-1; Modified=''; TooBig=$false; Error=$we.Message; TextLen=0; Scan=$null }
     } finally { $ProgressPreference = $old }
 }
 
@@ -1250,14 +1256,16 @@ function Complete-AuditJob($rec) {
     $script:AuditDone++
     [void]$script:AuditDecided.Add((Get-AuditKeyHash $key))
     if ($null -eq $res) { return }
-    if ($res.Ok -and $res.Text) {
-        $cf = Test-AuditContent $res.Text $rec.ContentRules
+    # The content regex pass already ran IN the worker (parallel); $res.Scan carries its result, so the
+    # main thread only reduces/merges here. $res.Scan is $null for an oversize/failed fetch (handled below).
+    if ($res.Ok -and $null -ne $res.Scan) {
+        $cf = $res.Scan
         if (@($cf.Findings).Count -gt 0) {
             Add-AuditFinding $rec (Resolve-AuditFindings $cf.Findings $cf.Snippets $cf.Count $cf.SevCounts) $res.Size $res.Modified
-            $script:AuditBytes += [long]$res.Text.Length
+            $script:AuditBytes += [long]$res.TextLen
             return
         }
-        $script:AuditBytes += [long]$res.Text.Length
+        $script:AuditBytes += [long]$res.TextLen
     }
     # No content hit. If it's a readable text file skipped only for size, and it has
     # no other finding, surface it under the synthetic oversize rule (default-excluded).
@@ -1271,6 +1279,13 @@ function Dispatch-AuditWork {
     $maxc  = [Math]::Max(1, [Math]::Min($script:AuditMaxWorkers, [int]$script:AuditThrottle.MaxConcurrent))
     $iv    = [int]$script:AuditThrottle.MinIntervalMs
     $headers = Get-AuthHeaders
+    # Shared, read-only scan inputs handed to every file worker so the content regex pass runs IN the
+    # worker (parallel) rather than serially here. The ruleset (compiled [regex]s) is immutable +
+    # thread-safe, so one object is shared across the pool; Get-AuditRuleSet returns the cached instance.
+    $contentMap = (Get-AuditRuleSet).Content
+    $scanWin    = [int]$script:AuditPreviewWindow
+    $scanCap    = [int]$script:AuditPreviewMax
+    $scanCeil   = [int]$script:AuditPreviewCountCeil
     while ($script:AuditJobs.Count -lt $maxc -and $script:AuditQueue.Count -gt 0) {
         if ($iv -gt 0 -and ([DateTime]::UtcNow - $script:AuditLastLaunch).TotalMilliseconds -lt $iv) { break }
         $rec = $script:AuditQueue.Dequeue()
@@ -1288,10 +1303,13 @@ function Dispatch-AuditWork {
                 AddArgument($rec.Headers).AddArgument($rec.Ua).AddArgument($script:AuditFetch).AddArgument($script:Alert)
         } else {
             $cap = if ($rec.ContainsKey('Cap')) { [long]$rec.Cap } else { [long]$script:AuditCapActive }
+            [void]$ps.AddScript($script:AuditScanFn)   # define Test-AuditContent/Get-AuditSnippet in the worker scope
             [void]$ps.AddScript($script:AuditWkScript).
                 AddArgument($rec.Key).AddArgument($rec.Uri).AddArgument($rec.Url).
                 AddArgument($headers).AddArgument($cap).
-                AddArgument([long]$rec.KnownSize).AddArgument($script:AuditFetch).AddArgument($script:Alert)
+                AddArgument([long]$rec.KnownSize).AddArgument($script:AuditFetch).AddArgument($script:Alert).
+                AddArgument(@($rec.ContentRules)).AddArgument($contentMap).
+                AddArgument($scanWin).AddArgument($scanCap).AddArgument($scanCeil)
         }
         $script:AuditJobs.Add([PSCustomObject]@{ PS=$ps; Handle=$ps.BeginInvoke(); Key=$rec.Key; Rec=$rec; Kind=$kind })
         $script:AuditLastLaunch = [DateTime]::UtcNow
