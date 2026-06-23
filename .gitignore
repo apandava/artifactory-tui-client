@@ -15,6 +15,12 @@ art-downloads/
 *.jsonl
 *.jsonl.migrated
 
+# Local paste-bundle generator + its output. The headless-paste bundle lives ONLY on the
+# headless-paste branch; never commit the generator or a generated bundle to dev/main.
+make-headless-paste.ps1
+headless-paste.txt
+tui-paste.txt
+
 # Secrets / local config — never commit tokens or API keys
 *.secret
 *.token
