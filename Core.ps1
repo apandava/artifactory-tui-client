@@ -462,6 +462,11 @@ function Get-TreeBrowseRequest([string]$repoKey, [string]$repoType, [string]$rep
 # engine sets a verbosity writer; left $null it's a no-op. Invoke-DedupDownload calls it
 # through Report-DownloadProgress so it never references a UI primitive directly.
 $script:DownloadProgress = $null
+# Optional structured sidecar describing the latest progress event (Kind=Saving|Hashing + per-file
+# index/total/name/sev/size and cumulative bytes/elapsed). The headless launcher reads this to render a
+# rich per-file line; the TUI ignores it and keeps using $lines, so its popup path is unaffected. The
+# dedup engine sets it right before each Report-DownloadProgress call and clears it when done.
+$script:DownloadProgressData = $null
 function Report-DownloadProgress([string[]]$lines) {
     if ($script:DownloadProgress) { & $script:DownloadProgress $lines }
 }
@@ -545,7 +550,8 @@ function Resolve-OutputPaths {
 function Write-DownloadLog([string]$dir, [string]$name, [string]$repo, [string]$path, [string]$archive,
                            [long]$sizeBytes, [string]$modified, [string]$url,
                            [string]$severity, [string]$rule, [string]$hash = '',
-                           [string]$fileName = 'download-log.csv', [switch]$Scrape) {
+                           [string]$fileName = 'download-log.csv', [switch]$Scrape,
+                           [int]$matchCount = -1, [string]$contentPreview = '') {
     try {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $csv  = Join-Path $dir $fileName
@@ -558,6 +564,14 @@ function Write-DownloadLog([string]$dir, [string]$name, [string]$repo, [string]$
         $hsh  = if ($Scrape) { '' } else { $hash }
         $row  = @($ts, $name, $hsh, $repo, $path, $archive, $sz, $modified, $url,
                   $(if ($severity) { $severity } else { 'N/A' }), $(if ($rule) { $rule } else { 'N/A' }))
+        # Optional audit columns (appended at the END so existing index-based readers are unaffected):
+        # the secret-audit match log passes a non-negative count to carry the per-row instance count +
+        # a JSON array of content-match previews. The plain download log leaves matchCount at -1, so its
+        # schema is untouched. Within a file the header + every row agree because the caller is consistent.
+        if ($matchCount -ge 0) {
+            $cols += @('MatchCount','MatchedContentPreview')
+            $row  += @("$matchCount", $contentPreview)
+        }
         $new = -not (Test-Path -LiteralPath $csv)
         $sb  = [Text.StringBuilder]::new()
         if ($new) { [void]$sb.AppendLine((@($cols | ForEach-Object { & $q $_ }) -join ',')) }
@@ -622,6 +636,13 @@ function Write-DedupEntry($e, [string]$hash) {
     Mark-Downloaded ([string]$e.VisitKey) ([string]$e.Url)
 }
 
+# Severity -> numeric rank, kept here (not the audit engine's Get-AuditRank) so the shared dedup engine
+# stays independent of the optional audit module. Used to pick the highest severity across files that
+# collapsed under one name.
+function Get-SevRank([string]$sev) {
+    switch ("$sev".ToLower()) { 'critical' { 5 } 'high' { 4 } 'medium' { 3 } 'low' { 2 } 'informational' { 1 } default { 0 } }
+}
+
 # Shared bulk-download engine for the results view and the audit view. Identical CONTENT is
 # written to disk ONCE — the same bytes under different paths, repos or archives collapse to a
 # single file — but a download-log.csv row is written for EVERY entry, so each listed
@@ -639,6 +660,11 @@ function Invoke-DedupDownload($entries) {
     $entries = @($entries | Where-Object { $_ })
     $total = $entries.Count
     try { if (-not (Test-Path -LiteralPath $script:OutDir)) { New-Item -ItemType Directory -Path $script:OutDir -Force | Out-Null } } catch { }
+    # Progress accounting for the rich headless Saving line: total known bytes up front, cumulative saved
+    # bytes + elapsed for the speed/ETA readout. Sizes are per-entry (so it tracks the breakdown total).
+    $dlStart = [DateTime]::UtcNow
+    $totalBytes = 0L; foreach ($e in $entries) { if ($e.Size -ge 0) { $totalBytes += [long]$e.Size } }
+    $doneBytes = 0L
 
     # Group by filename (case-insensitive), preserving first-seen order.
     $nameGroups = [Collections.Generic.List[object]]::new()
@@ -653,50 +679,74 @@ function Invoke-DedupDownload($entries) {
     foreach ($grp in $nameGroups) {
         $gi++
         $members = @($grp)
+        $grpName = [string]$members[0].Name
+        # 'Saving' event (line A): per name-group progress, with cumulative speed/ETA accounting.
+        $script:DownloadProgressData = @{ Kind='Saving'; Index=$gi; Total=$nameGroups.Count; Name=$grpName
+            DoneBytes=$doneBytes; TotalBytes=$totalBytes; ElapsedSec=([DateTime]::UtcNow - $dlStart).TotalSeconds }
+        Report-DownloadProgress @("Saving $gi / $($nameGroups.Count)", $grpName)
+        $savedFiles = [Collections.Generic.List[object]]::new()   # {Name;Size;Sev} per DISTINCT file written
+
         if ($members.Count -eq 1) {
-            # Unique filename — no collision possible; save under its own name. Hash comes
-            # from the storage checksum if known, else the bytes we just fetched (no extra
-            # download, no separate hashing pass).
+            # Unique filename — no collision possible; save under its own name. Hash from the storage
+            # checksum if known, else the bytes we just fetched (no extra download / hashing pass).
             $e = $members[0]
-            Report-DownloadProgress @("Saving $gi / $($nameGroups.Count)", [string]$e.Name)
             $b = Get-DedupBytes $e
             if ($null -eq $b) { $failed++; continue }
             $h = if ("$($e.KnownHash)") { [string]$e.KnownHash } else { 'sha256:' + (Get-BytesSha256 $b) }
-            if (Save-DedupFile (Join-Path $script:OutDir ([string]$e.Name)) $b) { Write-DedupEntry $e $h; $files++; $logged++ } else { $failed++ }
-            continue
-        }
-        # Shared filename — hash each member (storage checksum if known, else the bytes) and
-        # split into distinct-content sub-groups. Bytes fetched for hashing are kept for the
-        # write so each copy is downloaded only once.
-        $contents = [Collections.Generic.List[object]]::new()
-        $byHash   = @{}
-        $mi = 0
-        foreach ($e in $members) {
-            $mi++
-            Report-DownloadProgress @("Hashing $gi / $($nameGroups.Count)", "$([string]$e.Name)  ($mi/$($members.Count))")
-            $h = [string]$e.KnownHash
-            $b = $null
-            if (-not $h) { $b = Get-DedupBytes $e; if ($b) { $h = 'sha256:' + (Get-BytesSha256 $b) } }
-            $key = if ($h) { 'h:' + $h.ToLower() } else { 'fb:' + [string]$e.Url }
-            if ($byHash.ContainsKey($key)) { [void]$byHash[$key].Members.Add($e) }
-            else {
-                $c = [PSCustomObject]@{ Hash = $h; Key = $key; Bytes = $b; Members = [Collections.Generic.List[object]]::new() }
-                [void]$c.Members.Add($e); $byHash[$key] = $c; [void]$contents.Add($c)
+            if (Save-DedupFile (Join-Path $script:OutDir ([string]$e.Name)) $b) {
+                Write-DedupEntry $e $h; $files++; $logged++; if ($e.Size -ge 0) { $doneBytes += [long]$e.Size }
+                $sz = if ($e.Size -ge 0) { [long]$e.Size } elseif ($b) { [long]$b.Length } else { -1 }
+                [void]$savedFiles.Add(@{ Name=[string]$e.Name; Size=$sz; Sev=[string]$e.Sev })
+            } else { $failed++ }
+        } else {
+            # Shared filename — hash each member (storage checksum if known, else the bytes) and split into
+            # distinct-content sub-groups. Bytes fetched for hashing are kept for the write (downloaded once).
+            $contents = [Collections.Generic.List[object]]::new()
+            $byHash   = @{}
+            $mi = 0
+            foreach ($e in $members) {
+                $mi++
+                $h = [string]$e.KnownHash
+                $b = $null
+                if (-not $h) { $b = Get-DedupBytes $e; if ($b) { $h = 'sha256:' + (Get-BytesSha256 $b) } }
+                $key = if ($h) { 'h:' + $h.ToLower() } else { 'fb:' + [string]$e.Url }
+                # Hashing event: carries the file's 7-char content tag for the verbose line.
+                $script:DownloadProgressData = @{ Kind='Hashing'; Index=$gi; Total=$nameGroups.Count
+                    Name=[string]$e.Name; MemberIndex=$mi; MemberCount=$members.Count; Hash=(Get-DedupTag $h ([string]$e.Url)) }
+                Report-DownloadProgress @("Hashing $gi / $($nameGroups.Count)", "$([string]$e.Name)  ($mi/$($members.Count))")
+                if ($byHash.ContainsKey($key)) { [void]$byHash[$key].Members.Add($e) }
+                else {
+                    $c = [PSCustomObject]@{ Hash = $h; Key = $key; Bytes = $b; Members = [Collections.Generic.List[object]]::new() }
+                    [void]$c.Members.Add($e); $byHash[$key] = $c; [void]$contents.Add($c)
+                }
+            }
+            $tagged = ($contents.Count -gt 1)   # >1 distinct content under one name -> disambiguate
+            foreach ($c in $contents) {
+                $primary  = $c.Members[0]
+                $destName = if ($tagged) { Add-NameTag ([string]$primary.Name) (Get-DedupTag $c.Hash $c.Key) } else { [string]$primary.Name }
+                $b = if ($c.Bytes) { $c.Bytes } else { Get-DedupBytes $primary }
+                if ($null -eq $b) { $failed += $c.Members.Count; continue }
+                if (Save-DedupFile (Join-Path $script:OutDir $destName) $b) {
+                    $files++; if ($tagged) { $renamed++ }
+                    # Highest severity among the entries sharing this content; size from the actual bytes.
+                    $cSev = ''; $cRank = -1
+                    foreach ($e in $c.Members) {
+                        Write-DedupEntry $e $c.Hash; $logged++; if ($e.Size -ge 0) { $doneBytes += [long]$e.Size }
+                        $rk = Get-SevRank ([string]$e.Sev); if ($rk -gt $cRank) { $cRank = $rk; $cSev = [string]$e.Sev }
+                    }
+                    $cSize = if ($b) { [long]$b.Length } elseif ($primary.Size -ge 0) { [long]$primary.Size } else { -1 }
+                    [void]$savedFiles.Add(@{ Name=$destName; Size=$cSize; Sev=$cSev })
+                } else { $failed += $c.Members.Count }
             }
         }
-        $tagged = ($contents.Count -gt 1)   # >1 distinct content under one name -> disambiguate
-        foreach ($c in $contents) {
-            $primary  = $c.Members[0]
-            $destName = if ($tagged) { Add-NameTag ([string]$primary.Name) (Get-DedupTag $c.Hash $c.Key) } else { [string]$primary.Name }
-            Report-DownloadProgress @("Saving $gi / $($nameGroups.Count)", $destName)
-            $b = if ($c.Bytes) { $c.Bytes } else { Get-DedupBytes $primary }
-            if ($null -eq $b) { $failed += $c.Members.Count; continue }
-            if (Save-DedupFile (Join-Path $script:OutDir $destName) $b) {
-                $files++; if ($tagged) { $renamed++ }
-                foreach ($e in $c.Members) { Write-DedupEntry $e $c.Hash; $logged++ }
-            } else { $failed += $c.Members.Count }
+        # 'Saved' event (line B): one per name-group, carrying the distinct file(s) written so the renderer
+        # can show a single 'Downloaded [Sev] name' or a '[Multiple]' summary + per-file breakdown.
+        if ($savedFiles.Count -gt 0) {
+            $script:DownloadProgressData = @{ Kind='Saved'; BaseName=$grpName; Files=@($savedFiles.ToArray()) }
+            Report-DownloadProgress @("Saved", $grpName)
         }
     }
+    $script:DownloadProgressData = $null
     return [PSCustomObject]@{ Files = $files; Entries = $total; Renamed = $renamed; Failed = $failed; Identical = ($logged - $files) }
 }
 

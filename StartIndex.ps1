@@ -125,6 +125,7 @@ function ConvertFrom-IndexArgv([string[]]$tokens) {
             '^--arc-workers$'    { $p.ArcWorkers = [int]$tokens[++$i] }
             '^--delay$'          { $p.DelayMs    = [int]$tokens[++$i] }
             '^(-v|--verbose)$'   { $p.Verbosity = [int]$tokens[++$i] }
+            '^--no-?colou?r$'    { $p.NoColour  = $true }
             '^(-u|--base-url)$'  { $p.BaseUrl   = $tokens[++$i] }
             '^(-t|--token)$'     { $p.Token     = $tokens[++$i] }
             '^(-k|--api-key)$'   { $p.ApiKey    = $tokens[++$i] }
@@ -169,6 +170,7 @@ Options:
       --delay <ms>        per-request politeness delay (default 0; the adaptive throttle backs off
                           automatically on 429/503)
   -v, --verbose <0-5>     0 silent · 1 summary · 2 progress · 3 milestones · 4 detail · 5 debug (default 1)
+      --nocolour          disable coloured (dark-grey) progress output
 
 Auth:
   -u, --base-url <url>    Artifactory base URL (required)
@@ -184,9 +186,10 @@ function Invoke-IndexBuildCore {
     param(
         [switch]$Full, [string]$Query, [switch]$Archives, [switch]$NoArchives, [switch]$AllVersions, [switch]$Resume, [string]$Repos,
         [string]$RepoTypes, [string]$IndexPath, [int]$Workers, [int]$Walkers, [int]$ArcWorkers, [int]$DelayMs, [int]$Verbosity,
-        [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic
+        [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic, [switch]$NoColour
     )
     $O = $PSBoundParameters
+    $script:IndexColour = -not ($O.ContainsKey('NoColour') -and $O['NoColour'])
     if ($O.ContainsKey('Verbosity')) { $script:IndexVerbosity = [int]$O['Verbosity'] }
     if ($O.ContainsKey('BaseUrl'))   { $script:BaseUrl = [string]$O['BaseUrl'] }
     if ($O.ContainsKey('ApiKey'))    { $script:ApiKey  = [string]$O['ApiKey'] }

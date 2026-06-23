@@ -2,6 +2,9 @@
 CLAUDE.md
 .claude/
 
+# Keep README local for now
+README.md
+
 # Per-instance output root: output/<host>/{index,downloads,audit}. All runtime-
 # generated and regenerable (the index is a point-in-time cache; downloads + audit
 # match logs are produced per run). Never source artifacts.

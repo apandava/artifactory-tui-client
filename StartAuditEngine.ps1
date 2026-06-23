@@ -122,6 +122,129 @@ function Format-Duration([int]$secs) {
     return ('{0}d {1}h' -f [int][Math]::Floor($secs / 86400), [int][Math]::Floor(($secs % 86400) / 3600))
 }
 
+# Tighter, no-space duration for the inline progress/Saving lines: 13s / 3m12s / 2h14m / 1d06h. Two
+# adjacent units max (hour-scale shows h+m, minute-scale m+s), so the field stays short and stable-width.
+function Format-DurationCompact([int]$secs) {
+    if ($secs -lt 0) { $secs = 0 }
+    if ($secs -lt 60)    { return "${secs}s" }
+    if ($secs -lt 3600)  { return ('{0}m{1:00}s' -f [int][Math]::Floor($secs / 60), ($secs % 60)) }
+    if ($secs -lt 86400) { return ('{0}h{1:00}m' -f [int][Math]::Floor($secs / 3600), [int][Math]::Floor(($secs % 3600) / 60)) }
+    return ('{0}d{1:00}h' -f [int][Math]::Floor($secs / 86400), [int][Math]::Floor(($secs % 86400) / 3600))
+}
+
+# Build the single-line audit progress string (dark grey at the call site). Column widths are fixed so
+# successive lines align vertically. ETA uses the average rate over the run (steadier than the rolling
+# FPS) and a wall-clock finish time; the denominator is the known index-row/worklist total when set
+# (so done/total + ETA are meaningful from the very first tick). The bracketed engine-internal counters
+# are appended only at verbosity 5.
+function Format-AuditProgressLine {
+    $den  = if ($script:AuditEnqTotal -gt 0) { $script:AuditEnqTotal } else { $script:AuditEnq }
+    $done = $script:AuditDone
+    # Each field is its own [bracket], space-separated, after the unbracketed '...audited N/M files' prefix
+    # (no column padding - the brackets delimit, so nothing needs to align).
+    $fields = [Collections.Generic.List[string]]::new()
+    $fields.Add("[{0:0.0} files/s]" -f [double]$script:AuditRate.FPS)
+    $fields.Add("[{0} findings]" -f $script:AuditFindings.Count)
+    $elapsed = ([DateTime]::UtcNow - $script:AuditStartedAt).TotalSeconds
+    if ($den -gt 0 -and $done -gt 0 -and $elapsed -ge 1) {
+        $rem = $den - $done; if ($rem -lt 0) { $rem = 0 }
+        $avg = $done / $elapsed
+        if ($avg -gt 0) {
+            $secs = [int][Math]::Ceiling($rem / $avg)
+            $fields.Add(("[ETA {0} ({1})]" -f (Format-DurationCompact $secs), ((Get-Date).AddSeconds($secs).ToString('h:mmtt').ToLower())))
+        }
+    }
+    if ($script:AuditVerbosity -ge 5) {
+        $fields.Add(("[audit queue:{0} jobs:{1} pending:{2} launched:{3}]" -f `
+                    $script:AuditQueue.Count, $script:AuditJobs.Count, $script:AuditPendingNodes.Count, $script:AuditLaunched))
+    }
+    return ("...audited {0}/{1} files {2}" -f $done, $den, ($fields -join ' '))
+}
+
+# Compact, no-space size for inline progress (0.1MB / 10MB / 123KB). '?' for unknown.
+function ConvertTo-CompactSize([long]$bytes) {
+    if ($bytes -lt 0)          { return '?' }
+    if ($bytes -lt 1024)       { return ("{0}B"    -f $bytes) }
+    if ($bytes -lt 1048576)    { return ("{0:0.#}KB" -f ($bytes / 1024.0)) }
+    if ($bytes -lt 1073741824) { return ("{0:0.#}MB" -f ($bytes / 1048576.0)) }
+    return ("{0:0.#}GB" -f ($bytes / 1073741824.0))
+}
+
+# 'Saving' line (line A) from the sidecar - the in-progress file. Whole line dark grey, columns aligned:
+#   ...saving file <name>   saved i/total   <kbps>   <done>/<total>   ETA <dur> (<wall>)
+# The speed/bytes/ETA columns appear at level 5 only (cheap, from the cumulative byte/time accounting).
+function Write-DownloadSavingLine($d) {
+    if ($script:AuditVerbosity -lt 5) { return }
+    $fields = [Collections.Generic.List[string]]::new()
+    $fields.Add(("[saved {0}/{1}]" -f $d.Index, $d.Total))
+    if ([long]$d.TotalBytes -gt 0 -and [double]$d.ElapsedSec -ge 0.5) {
+        $rate = [long]([double]$d.DoneBytes / [double]$d.ElapsedSec)   # bytes/sec
+        $fields.Add("[{0:0}kbps]" -f ($rate / 1000.0))
+        $fields.Add(("[{0}/{1}]" -f (ConvertTo-CompactSize ([long]$d.DoneBytes)), (ConvertTo-CompactSize ([long]$d.TotalBytes))))
+        if ($rate -gt 0) {
+            $rem = [long]$d.TotalBytes - [long]$d.DoneBytes; if ($rem -lt 0) { $rem = 0 }
+            $secs = [int][Math]::Ceiling($rem / [double]$rate)
+            $fields.Add(("[ETA {0} ({1})]" -f (Format-DurationCompact $secs), ((Get-Date).AddSeconds($secs).ToString('h:mmtt').ToLower())))
+        }
+    }
+    Write-AuditColor ("...saving file {0} {1}" -f $d.Name, ($fields -join ' ')) DarkGray
+}
+
+# 'Saved' line (line B) - the completed download. 'Downloaded' in grey, the [Sev] tag coloured, filename
+# white, size dark grey. When one name produced several distinct hashed files, show '[Multiple]' (coloured
+# by the highest severity) + combined size, then up to 3 indented per-file lines and an 'N more unique
+# files saved. [sev:count ...]' tail (same cap + colouring as the audit snippet 'more' line).
+function Write-DownloadSavedLine($d) {
+    if ($script:AuditVerbosity -lt 4) { return }
+    $files = @($d.Files)
+    if ($files.Count -le 1) {
+        $f = if ($files.Count -eq 1) { $files[0] } else { @{ Name=$d.BaseName; Size=-1; Sev='' } }
+        if ("$($f.Sev)") { Write-AuditColor ("[{0}] " -f $f.Sev) (Get-AuditSevConsoleColor $f.Sev) -NoNewline }
+        Write-AuditColor ([string]$f.Name) White -NoNewline
+        if ([long]$f.Size -ge 0) { Write-AuditColor (" ({0})" -f (Format-Size ([long]$f.Size))) DarkGray -NoNewline }
+        Write-Host ''
+        return
+    }
+    $totalSize = 0L; $haveSize = $true; $hi = ''; $hiRank = -1
+    foreach ($f in $files) {
+        if ([long]$f.Size -ge 0) { $totalSize += [long]$f.Size } else { $haveSize = $false }
+        $rk = Get-SevRank ([string]$f.Sev); if ($rk -gt $hiRank) { $hiRank = $rk; $hi = [string]$f.Sev }
+    }
+    Write-AuditColor '[Multiple]' (Get-AuditSevConsoleColor $hi) -NoNewline
+    Write-AuditColor (" {0}" -f $d.BaseName) White -NoNewline
+    if ($haveSize) { Write-AuditColor (" ({0})" -f (Format-Size $totalSize)) DarkGray -NoNewline }
+    Write-Host ''
+    $cap = [Math]::Min(3, $files.Count); $shown = @{}
+    for ($i = 0; $i -lt $cap; $i++) {
+        $f = $files[$i]
+        Write-AuditColor ("  [{0}]" -f $f.Sev) (Get-AuditSevConsoleColor $f.Sev) -NoNewline
+        Write-AuditColor (" {0}" -f $f.Name) White -NoNewline
+        if ([long]$f.Size -ge 0) { Write-AuditColor (" ({0})" -f (Format-Size ([long]$f.Size))) DarkGray -NoNewline }
+        Write-Host ''
+        $sv = [string]$f.Sev; $shown[$sv] = 1 + $(if ($shown.ContainsKey($sv)) { $shown[$sv] } else { 0 })
+    }
+    $more = $files.Count - $cap
+    if ($more -gt 0) {
+        $allsev = @{}; foreach ($f in $files) { $s = [string]$f.Sev; $allsev[$s] = 1 + $(if ($allsev.ContainsKey($s)) { $allsev[$s] } else { 0 }) }
+        $remain = @{}
+        foreach ($s in $script:AuditSevOrder) { $r = ([int]$(if ($allsev.ContainsKey($s)) { $allsev[$s] } else { 0 })) - ([int]$(if ($shown.ContainsKey($s)) { $shown[$s] } else { 0 })); if ($r -gt 0) { $remain[$s] = $r } }
+        Write-AuditColor ("  {0} more" -f $more) White -NoNewline
+        Write-AuditColor ' unique files saved.' Gray -NoNewline
+        $parts = @($script:AuditSevOrder | Where-Object { $remain.ContainsKey($_) })
+        if ($parts.Count -gt 0) {
+            Write-AuditColor ' [' Gray -NoNewline
+            for ($i = 0; $i -lt $parts.Count; $i++) {
+                $s = $parts[$i]
+                Write-AuditColor ("{0}:" -f $s) Gray -NoNewline
+                Write-AuditColor ([string]$remain[$s]) (Get-AuditSevConsoleColor $s) -NoNewline
+                if ($i -lt $parts.Count - 1) { Write-AuditColor ' ' Gray -NoNewline }
+            }
+            Write-AuditColor ']' Gray -NoNewline
+        }
+        Write-Host ''
+    }
+}
+
 # Parse a size string to bytes: plain number, or a binary suffix (K/M/G/T, optional B), e.g.
 # '100MB', '1.5g', '500000', '250 KB'. Empty/unset -> 0 (meaning no limit). Throws on garbage.
 function Convert-ToBytes([string]$s) {
@@ -154,7 +277,18 @@ function Select-WithinSize($items, [long]$maxBytes) {
 # routes the same hook to Show-Popup instead).
 $script:DownloadProgress = {
     param($lines)
-    Write-V 4 ('  ' + ((@($lines) | Where-Object { "$_" -ne '' }) -join '  '))
+    # Prefer the engine's structured sidecar (rich per-file Saving/Hashing line); fall back to the plain
+    # joined $lines if it isn't set (keeps any non-dedup caller working).
+    $d = $script:DownloadProgressData
+    if ($null -eq $d) {
+        Write-V 4 ('  ' + ((@($lines) | Where-Object { "$_" -ne '' }) -join '  '))
+        return
+    }
+    switch ($d.Kind) {
+        'Hashing' { if ($script:AuditVerbosity -ge 5) { Write-AuditColor ("...comparing hashes for {0} ({1}/{2}) [{3}]" -f $d.Name, $d.MemberIndex, $d.MemberCount, $d.Hash) DarkGray } }
+        'Saved'   { Write-DownloadSavedLine $d }
+        default   { Write-DownloadSavingLine $d }
+    }
 }
 
 # ── ARGV PARSING (unix-style CLI) ─────────────────────────────────────────────
@@ -191,6 +325,9 @@ function ConvertFrom-AuditArgv([string[]]$tokens) {
             '^(-x|--exclude)$'       { $p.Exclude      = $tokens[++$i] }
             '^(-s|--from-log)$'      { $p.FromLog      = $tokens[++$i] }
             '^--max-size$'           { $p.MaxSize      = $tokens[++$i] }
+            '^--preview-count$'      { $p.PreviewCount  = [int]$tokens[++$i] }
+            '^--preview-window$'     { $p.PreviewWindow = [int]$tokens[++$i] }
+            '^--no-?colou?r$'        { $p.NoColour      = $true }
             '^--index$'              { $p.IndexPath    = $tokens[++$i] }
             '^--no-index$'           { $p.NoIndex      = $true }
             '^--offline$'            { $p.Offline      = $tokens[++$i] }
@@ -255,6 +392,12 @@ Audit options (audit verb):
       --repo-types <list> indexed repo rclasses to audit (default: local). e.g. local,remote or
                           'all' (every non-virtual repo). --all-repos is shorthand for 'all'.
   -x, --exclude <globs>   comma/space globs to exclude from the set (e.g. "*.xml,*test*")
+      --preview-count <n> max content-match snippets stored per file in audit-log.csv's
+                          MatchedContentPreview column (JSON array). Default 10; 0 = no snippets
+                          (MatchCount still recorded). NOTE: previews contain matched content, which
+                          is often the secret itself - the log then holds live credential material.
+      --preview-window <n> TOTAL context characters captured around each match, split evenly each
+                          side (default 40 -> 20 left + match + 20 right)
       --index <dir>       local index directory to read (default ./output/<host>/index)
       --cap <bytes>       max file size to content-scan (default 2 MB)
       --workers <1-50>    parallel fetch workers (default 15)
@@ -277,6 +420,7 @@ Output / auth:
                           ./output/<host>/downloads). Audit catalogues (audit-log.csv,
                           tier2-pending.csv[.progress], <repo>-matches.csv) go to ./output/<host>/audit.
   -v, --verbose <0-5>     0 silent .. 5 debug (default 1)
+      --nocolour          disable coloured console output (severity-tinted tags, grey progress/snippets)
   -u, --base-url <url>    Artifactory base URL (required)
   -t, --token <tok>       bearer token        -k, --api-key <key>   JFrog API key
   -b, --basic <user:pw>   basic auth
@@ -294,6 +438,14 @@ function Resolve-RunOutput([hashtable]$O) {
         $script:OutDirExplicit = $false
     }
     Resolve-OutputPaths
+}
+
+# Content-match preview (snippet) settings, shared by every content-scanning path (the index audit
+# AND --tier2-resume). --preview-count 0 keeps MatchCount but stores no snippets; --preview-window is
+# the TOTAL context characters around each match (split evenly each side).
+function Set-AuditPreviewConfig([hashtable]$O) {
+    if ($O.ContainsKey('PreviewCount')  -and [int]$O['PreviewCount']  -ge 0) { $script:AuditPreviewMax    = [int]$O['PreviewCount'] }
+    if ($O.ContainsKey('PreviewWindow') -and [int]$O['PreviewWindow'] -ge 0) { $script:AuditPreviewWindow = [int]$O['PreviewWindow'] }
 }
 
 # Apply parsed options to script-scope config + engine settings. $O is the caller's
@@ -329,6 +481,7 @@ function Initialize-AuditRunConfig([hashtable]$O) {
     # never written to a CSV), so don't build them - at multi-million scale that's the difference
     # between holding one finding object per relay-eligible file and holding none.
     $script:AuditEmitSkipped  = $false
+    Set-AuditPreviewConfig $O
     if ($O.ContainsKey('Cap') -and [long]$O['Cap'] -gt 0)        { $script:AuditCap = [long]$O['Cap'] }
     # Headless throttle DEFAULTS: 15 workers, 0ms delay (more aggressive than the TUI's gentle 3/150).
     $script:AuditThrottle.MaxConcurrent =
@@ -346,6 +499,126 @@ function Update-AuditExcludedHeadless {
         if (Test-AuditExcluded ([string]$f.Name)) { $f.Included = $false }
     }
     $script:AuditSortDirty = $true
+}
+
+# Colourised console output for the verbose modes. On by default; turned off by --nocolour (sets
+# $AuditColour false), in which case every helper falls back to a plain Write-Host. Uses Write-Host
+# -ForegroundColor (not ANSI) so it needs no VT setup and is ignored cleanly when output is redirected.
+$script:AuditColour = $true
+
+# Severity -> ConsoleColor, mirroring the TUI's Get-AuditColor palette (critical=red, high=yellow,
+# medium=green, low=blue, informational=purple).
+function Get-AuditSevConsoleColor([string]$sev) {
+    switch ("$sev".ToLower()) {
+        'critical'      { 'Red' }
+        'high'          { 'Yellow' }
+        'medium'        { 'Green' }
+        'low'           { 'Cyan' }
+        'informational' { 'Magenta' }
+        default         { 'Gray' }
+    }
+}
+
+# Write-Host wrapper that honours $AuditColour: colourise when on (and a colour is given), else plain.
+function Write-AuditColor([string]$text, $color = $null, [switch]$NoNewline) {
+    if ($script:AuditColour -and $color) { Write-Host $text -ForegroundColor $color -NoNewline:$NoNewline }
+    else                                 { Write-Host $text -NoNewline:$NoNewline }
+}
+
+# Per-rule colouring: each rule label is coloured by ITS OWN severity (a file can carry rules of
+# differing severities, e.g. a High name rule + a Low one). Build a cached rule-name -> severity map
+# from the active ruleset (meta rule names + content rule names - the two kinds that appear in a
+# finding's rule list); unknown names fall back to Gray via Get-AuditSevConsoleColor's default.
+$script:AuditRuleSevMap = $null
+function Get-AuditRuleConsoleColor([string]$ruleName) {
+    if ($null -eq $script:AuditRuleSevMap) {
+        $map = @{}
+        $rs = Get-AuditRuleSet
+        foreach ($mr in $rs.Meta) { if ($mr.ContainsKey('Name') -and $mr.ContainsKey('Sev')) { $map[[string]$mr.Name] = [string]$mr.Sev } }
+        foreach ($k in $rs.Content.Keys) { $map[[string]$k] = [string]$rs.Content[$k].Sev }
+        $script:AuditRuleSevMap = $map
+    }
+    $sev = if ($script:AuditRuleSevMap.ContainsKey($ruleName)) { $script:AuditRuleSevMap[$ruleName] } else { '' }
+    return (Get-AuditSevConsoleColor $sev)
+}
+
+# Print one finding line (level 3+). At level 5, when the finding carries Tier-2 content-match preview
+# snippets, list up to 3 of them as 'Match: <snippet>' beneath it, then - if the file has more matched
+# instances than were shown - a 'N more matches found.' line (MatchCount counts every Tier-1 meta match
+# plus every Tier-2 content occurrence, so N is the count not surfaced as a snippet).
+$script:AuditSevOrder = @('Critical','High','Medium','Low','Informational')
+function Write-AuditFindingLine($f, [string]$tag) {
+    $loc = (@($f.Repo, $f.Path, $f.Name) | Where-Object { "$_" -ne '' }) -join '/'
+    # Filename leads; the path (in [..], light grey) and the containing archive (in (..), light grey) go
+    # at the END of the line, e.g.
+    #   [Low] credentials.jelly - NameContainsSecret [incrementals/org/.../ServiceAccountCredential/] (kubernetes-4435.jar)
+    $slash = $loc.LastIndexOf('/')
+    $path  = if ($slash -ge 0) { $loc.Substring(0, $slash + 1) } else { '' }
+    $fname = if ($slash -ge 0) { $loc.Substring($slash + 1) }   else { $loc }
+    $arc   = if ($f.InArchive -and "$($f.ArchiveName)") { " ($($f.ArchiveName))" } else { '' }
+    # Rules are single words, so the line shows them space-separated (no comma).
+    $rules = @($f.AllRules -split '\s*,\s*' | Where-Object { $_ })
+    if ($tag) {
+        # Re-print of a finding already reported in Tier-1: de-emphasised, whole line dark grey.
+        $pp = if ($path) { " [$path]" } else { '' }
+        Write-AuditColor ("[{0}] {1} - {2}{3}{4}{5}" -f $f.Sev, $fname, ($rules -join ' '), $pp, $arc, $tag) DarkGray
+        return
+    }
+    # Main finding line is NOT indented. -NoNewline segments terminated by Write-Host.
+    Write-AuditColor ("[{0}] " -f $f.Sev) (Get-AuditSevConsoleColor $f.Sev) -NoNewline
+    Write-AuditColor $fname White -NoNewline
+    Write-AuditColor ' - ' White -NoNewline
+    for ($i = 0; $i -lt $rules.Count; $i++) {
+        Write-AuditColor $rules[$i] (Get-AuditRuleConsoleColor $rules[$i]) -NoNewline
+        if ($i -lt $rules.Count - 1) { Write-AuditColor ' ' White -NoNewline }
+    }
+    if ($path) { Write-AuditColor (" [{0}]" -f $path) Gray -NoNewline }
+    if ($arc)  { Write-AuditColor $arc Gray -NoNewline }
+    Write-Host ''
+    if ($script:AuditVerbosity -ge 5 -and $f.PSObject.Properties['Snippets'] -and $f.Snippets.Count -gt 0) {
+        # Subsequent lines (indented 2). Each preview line: the producing rule in [..] coloured by ITS
+        # severity, then the snippet grey.
+        $cap = [Math]::Min(3, $f.Snippets.Count)
+        $shown = @{}
+        for ($i = 0; $i -lt $cap; $i++) {
+            $sn = $f.Snippets[$i]
+            Write-AuditColor ("  [{0}] " -f $sn.Rule) (Get-AuditSevConsoleColor $sn.Sev) -NoNewline
+            if ($sn.PSObject.Properties['Match']) {
+                # Context grey, the EXACT regex match white.
+                Write-AuditColor ([string]$sn.Pre) Gray -NoNewline
+                Write-AuditColor ([string]$sn.Match) White -NoNewline
+                Write-AuditColor ([string]$sn.Post) Gray
+            } else {
+                Write-AuditColor ([string]$sn.Text) Gray
+            }
+            $sv = [string]$sn.Sev; $shown[$sv] = 1 + $(if ($shown.ContainsKey($sv)) { $shown[$sv] } else { 0 })
+        }
+        $more = [int]$f.MatchCount - $cap
+        if ($more -gt 0) {
+            # 'N more' in white, 'matches found.' grey, then the remaining counts broken down by severity
+            # (each count in its colour). Remaining-by-sev = all matched instances minus the shown snippets.
+            Write-AuditColor ("  {0} more" -f $more) White -NoNewline
+            Write-AuditColor ' matches found.' Gray -NoNewline
+            $ms = if ($f.PSObject.Properties['MatchSev'] -and $f.MatchSev) { $f.MatchSev } else { @{} }
+            $remain = @{}
+            foreach ($s in $script:AuditSevOrder) {
+                $r = ([int]$(if ($ms.ContainsKey($s)) { $ms[$s] } else { 0 })) - ([int]$(if ($shown.ContainsKey($s)) { $shown[$s] } else { 0 }))
+                if ($r -gt 0) { $remain[$s] = $r }
+            }
+            $parts = @($script:AuditSevOrder | Where-Object { $remain.ContainsKey($_) })
+            if ($parts.Count -gt 0) {
+                Write-AuditColor ' [' Gray -NoNewline
+                for ($i = 0; $i -lt $parts.Count; $i++) {
+                    $s = $parts[$i]
+                    Write-AuditColor ("{0}:" -f $s) Gray -NoNewline
+                    Write-AuditColor ([string]$remain[$s]) (Get-AuditSevConsoleColor $s) -NoNewline
+                    if ($i -lt $parts.Count - 1) { Write-AuditColor ' ' Gray -NoNewline }
+                }
+                Write-AuditColor ']' Gray -NoNewline
+            }
+            Write-Host ''
+        }
+    }
 }
 
 # Drive the engine to completion, emitting progress per verbosity.
@@ -369,28 +642,11 @@ function Invoke-AuditPumpToDone {
                 $f = $script:AuditFindings[$printed]
                 $tag = if ($printed -lt $seenBaseline) { '  (Tier 1 - Seen)' } else { '' }
                 $printed++
-                $loc = (@($f.Repo, $f.Path, $f.Name) | Where-Object { "$_" -ne '' }) -join '/'
-                Write-Host ("  [{0}] {1} - {2}{3}" -f $f.Sev, $loc, $f.AllRules, $tag)
+                Write-AuditFindingLine $f $tag
             }
         }
         if ($script:AuditVerbosity -ge 2 -and ([DateTime]::UtcNow - $lastTick).TotalSeconds -ge 1) {
-            $walk = if ((Test-AuditWalkActive) -or (Test-AuditIndexWalkActive)) { ' (reading index)' } else { '' }
-            # Use the known total (Tier-2 worklist) as the denominator when set; otherwise $AuditEnq,
-            # which grows as the index walk discovers items.
-            $den = if ($script:AuditEnqTotal -gt 0) { $script:AuditEnqTotal } else { $script:AuditEnq }
-            # ETA only when the total is known (Tier-2 worklist). Use the AVERAGE rate this run
-            # (done/elapsed) - far steadier than the rolling FPS that drives the displayed rate.
-            $eta = ''
-            $rem = $den - $script:AuditDone
-            $elapsed = ([DateTime]::UtcNow - $script:AuditStartedAt).TotalSeconds
-            if ($script:AuditEnqTotal -gt 0 -and $rem -gt 0 -and $script:AuditDone -gt 0 -and $elapsed -ge 1) {
-                $avg = $script:AuditDone / $elapsed
-                if ($avg -gt 0) { $eta = "  ETA $(Format-Duration ([int][Math]::Ceiling($rem / $avg)))" }
-            }
-            Write-Host ("  ...audited $($script:AuditDone)/$den at $($script:AuditRate.FPS)/s, found $($script:AuditFindings.Count)$eta$walk")
-            if ($script:AuditVerbosity -ge 5) {
-                Write-Host ("    queue=$($script:AuditQueue.Count) jobs=$($script:AuditJobs.Count) pending=$($script:AuditPendingNodes.Count) launched=$($script:AuditLaunched)")
-            }
+            Write-AuditColor (Format-AuditProgressLine) DarkGray
             $lastTick = [DateTime]::UtcNow
         }
         Start-Sleep -Milliseconds 100
@@ -400,8 +656,7 @@ function Invoke-AuditPumpToDone {
             $f = $script:AuditFindings[$printed]
             $tag = if ($printed -lt $seenBaseline) { '  (Tier 1 - Seen)' } else { '' }
             $printed++
-            $loc = (@($f.Repo, $f.Path, $f.Name) | Where-Object { "$_" -ne '' }) -join '/'
-            Write-Host ("  [{0}] {1} - {2}{3}" -f $f.Sev, $loc, $f.AllRules, $tag)
+            Write-AuditFindingLine $f $tag
         }
     }
 }
@@ -414,13 +669,25 @@ function Write-AuditSummary {
         $s = [string]$f.Sev
         $counts[$s] = 1 + $(if ($counts.ContainsKey($s)) { $counts[$s] } else { 0 })
     }
-    $parts = @()
-    foreach ($s in 'Critical','High','Medium','Low','Informational') {
-        if ($counts.ContainsKey($s)) { $parts += "$s=$($counts[$s])" }
-    }
-    $brk = if ($parts.Count -gt 0) { ' [' + ($parts -join ' ') + ']' } else { '' }
+    $present = @(@('Critical','High','Medium','Low','Informational') | Where-Object { $counts.ContainsKey($_) })
+    # Compose the breakdown as -NoNewline segments so each severity's COUNT renders in its own colour
+    # (label text stays default), then a final Write-Host terminates the line. Colour-off / verbosity
+    # paths still produce the identical plain text via Write-AuditColor's fallback.
     Write-Host ''
-    Write-Host ("Audit complete: $($script:AuditFindings.Count) finding(s)$brk")
+    Write-AuditColor 'Audit complete: ' -NoNewline
+    Write-AuditColor ([string]$script:AuditFindings.Count) White -NoNewline
+    Write-AuditColor ' finding(s)' -NoNewline
+    if ($present.Count -gt 0) {
+        Write-AuditColor ' [' -NoNewline
+        for ($i = 0; $i -lt $present.Count; $i++) {
+            $s = $present[$i]
+            Write-AuditColor ("{0}:" -f $s) -NoNewline
+            Write-AuditColor ([string]$counts[$s]) (Get-AuditSevConsoleColor $s) -NoNewline
+            if ($i -lt $present.Count - 1) { Write-AuditColor ' ' -NoNewline }
+        }
+        Write-AuditColor ']' -NoNewline
+    }
+    Write-Host ''
 }
 
 # Phase A: a Tier-1 audit of the local index to completion, applying excludes. Sources work ONLY from
@@ -429,7 +696,6 @@ function Write-AuditSummary {
 # the worklist for a Tier-2 pass. Returns the worklist path (or '').
 function Invoke-HeadlessAudit([hashtable]$O, [bool]$emitList = $false) {
     Initialize-AuditRunConfig $O
-    Write-V 5 ("Settings: tier=1$(if ($emitList) { '+worklist' } else { '' }) cap=$script:AuditCap workers=$($script:AuditThrottle.MaxConcurrent) delay=$($script:AuditThrottle.MinIntervalMs)ms index=$script:IndexPath out=$script:OutDir")
 
     # Load the index (lightweight: migrations + the small re-walk skip-set; nothing bulk-loaded).
     Import-Index $script:IndexPath
@@ -451,7 +717,12 @@ function Invoke-HeadlessAudit([hashtable]$O, [bool]$emitList = $false) {
         }
     }
 
-    Write-V 1 'Auditing the local index...'
+    # Header (non-indented) + indented run details. The audit verb sources work ONLY from the local
+    # index, so it's always 'from local index'.
+    Write-V 1 'Auditing from local index'
+    Write-V 2 "  index dir: $script:IndexPath"
+    Write-V 2 ("  settings: tier=1$(if ($emitList) { '+worklist' } else { '' }) cap=$script:AuditCap workers=$($script:AuditThrottle.MaxConcurrent) delay=$($script:AuditThrottle.MinIntervalMs)ms")
+    Write-V 2 "  output dir: $script:AuditDir"
     if (-not (Start-AuditIndex)) {
         Write-V 1 'No in-scope indexed repos to audit.'
     }
@@ -494,6 +765,15 @@ function Resolve-AuditSevSet([string]$spec) {
     }
     return $set
 }
+# Header (non-indented) + indented run details shown before the 'Pending downloads:' section when an
+# actual download is about to start (not for the 'count' preview).
+function Write-DownloadStartHeader([string]$auditLog, [string]$settings, [string]$downloadDir) {
+    Write-V 1 'Starting downloads'
+    if ($auditLog) { Write-V 2 "  audit log: $auditLog" }
+    Write-V 2 "  settings: $settings"
+    Write-V 2 "  download dir: $downloadDir"
+}
+
 # Print a per-severity count + total size breakdown of a candidate set (the would-be download).
 function Write-AuditDownloadBreakdown($cands) {
     $order = 'Critical','High','Medium','Low','Informational'
@@ -505,16 +785,24 @@ function Write-AuditDownloadBreakdown($cands) {
         if ($f.Size -ge 0) { $bytes[$s] += [long]$f.Size } else { $unk[$s]++ }
     }
     Write-Host ''
-    Write-Host 'Download set (included, not yet downloaded):'
+    Write-AuditColor 'Pending downloads:' Gray
     $tc = 0; $tb = 0L; $tu = 0
     foreach ($s in $order) {
         if (-not $cnt.ContainsKey($s) -or $cnt[$s] -eq 0) { continue }
-        $u = if ($unk[$s] -gt 0) { " (+$($unk[$s]) unknown size)" } else { '' }
-        Write-Host ("  {0,-14} {1,7}   {2}{3}" -f $s, $cnt[$s], (Format-Size $bytes[$s]), $u)
+        # Label + size in default grey; the count coloured by its severity; '(+N unknown size)' dark grey.
+        Write-AuditColor ("  {0,-14} " -f $s) Gray -NoNewline
+        Write-AuditColor ("{0,7}" -f $cnt[$s]) (Get-AuditSevConsoleColor $s) -NoNewline
+        Write-AuditColor ("   {0}" -f (Format-Size $bytes[$s])) Gray -NoNewline
+        if ($unk[$s] -gt 0) { Write-AuditColor (" (+{0} unknown size)" -f $unk[$s]) DarkGray -NoNewline }
+        Write-Host ''
         $tc += $cnt[$s]; $tb += $bytes[$s]; $tu += $unk[$s]
     }
-    $u = if ($tu -gt 0) { " (+$tu unknown size)" } else { '' }
-    Write-Host ("  {0,-14} {1,7}   {2}{3}" -f 'Total', $tc, (Format-Size $tb), $u)
+    # Total row: count in white.
+    Write-AuditColor ("  {0,-14} " -f 'Total') Gray -NoNewline
+    Write-AuditColor ("{0,7}" -f $tc) White -NoNewline
+    Write-AuditColor ("   {0}" -f (Format-Size $tb)) Gray -NoNewline
+    if ($tu -gt 0) { Write-AuditColor (" (+{0} unknown size)" -f $tu) DarkGray -NoNewline }
+    Write-Host ''
 }
 # Write the run's output. ALWAYS (re)builds the single definitive audit-log.csv by consolidating the
 # cumulative per-repo <repo>-matches.csv (merged Tier-1+Tier-2 label, highest severity, one row per
@@ -531,7 +819,7 @@ function Complete-AuditOutput([string]$downloadSpec, [long]$maxBytes = 0) {
     # The definitive consolidated catalogue - always produced after any completed run.
     $logPath = Join-Path $script:AuditDir 'audit-log.csv'
     $n = Build-AuditLogFromMatches $logPath
-    Write-V 1 "Consolidated $n finding(s) -> $logPath"
+    if ($script:AuditVerbosity -ge 1) { Write-AuditColor "Consolidated $n finding(s) -> $logPath" DarkGray }
 
     $spec = "$downloadSpec".Trim().ToLower()
     if (-not $spec) { return }
@@ -543,8 +831,12 @@ function Complete-AuditOutput([string]$downloadSpec, [long]$maxBytes = 0) {
         $sel = @($cands | Where-Object { $set.Contains([string]$_.Sev) })
     }
     $sel = @(Select-WithinSize $sel $maxBytes)   # drop files over the per-file size limit (if any)
+    if ($sel.Count -eq 0) { Write-AuditDownloadBreakdown $sel; Write-V 1 'No findings to download.'; return }
+    $dlSettings = "severity=$(if ($spec) { $spec } else { 'all' })" + $(if ($maxBytes -gt 0) { " max-size=$(Format-Size $maxBytes)" } else { '' })
+    Write-DownloadStartHeader $logPath $dlSettings $script:OutDir
     Write-AuditDownloadBreakdown $sel
-    if ($sel.Count -eq 0) { Write-V 1 'No findings to download.'; return }
+    Write-Host ''
+    if ($script:AuditVerbosity -ge 1) { Write-AuditColor ("Downloading {0} file{1}." -f $sel.Count, $(if ($sel.Count -ne 1) { 's' } else { '' })) }
     $res = Invoke-AuditDownloadSet $sel
     Write-V 1 (Get-DedupDoneLine $res)
     Write-V 1 ('Logged to ' + (Join-Path $script:OutDir 'download-log.csv'))
@@ -577,8 +869,11 @@ function Invoke-DownloadFromLog([string]$file, [string]$downloadSpec = '', [long
     }
     $sel = @(Select-WithinSize $sel $maxBytes)   # drop rows over the per-file size limit (if any)
     if ($sel.Count -eq 0) { Write-V 1 "No rows in $file to download (after severity/size filters)."; return }
+    $dlSettings = "severity=$(if ($spec -and $spec -ne 'all') { $spec } else { 'all' })" + $(if ($maxBytes -gt 0) { " max-size=$(Format-Size $maxBytes)" } else { '' })
+    Write-DownloadStartHeader $file $dlSettings $script:OutDir
     Write-AuditDownloadBreakdown $sel
-    Write-V 1 "Downloading $($sel.Count) file(s) listed in $file ..."
+    Write-Host ''
+    if ($script:AuditVerbosity -ge 1) { Write-AuditColor ("Downloading {0} file{1}." -f $sel.Count, $(if ($sel.Count -ne 1) { 's' } else { '' })) }
     $res = Invoke-DedupDownload $sel
     Write-V 1 (Get-DedupDoneLine $res)
     Write-V 1 ('Logged to ' + (Join-Path $script:OutDir 'download-log.csv'))
@@ -596,6 +891,7 @@ function Initialize-AuditBaseConfig([hashtable]$O, [bool]$requireBaseUrl = $true
     if ($requireBaseUrl -and -not $script:BaseUrl) { throw 'A base URL is required (-u/--base-url).' }
     if ($script:BaseUrl) { $script:BaseUrl = $script:BaseUrl.TrimEnd('/') }
     Resolve-RunOutput $O
+    Set-AuditPreviewConfig $O
     if ($O.ContainsKey('Cap') -and [long]$O['Cap'] -gt 0)        { $script:AuditCap = [long]$O['Cap'] }
     if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { $script:AuditThrottle.MaxConcurrent = [Math]::Max(1, [Math]::Min(10, [int]$O['Workers'])) }
     if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { $script:AuditThrottle.MinIntervalMs = [int]$O['DelayMs'] }
@@ -619,9 +915,11 @@ function Invoke-AuditCore {
         [string]$IndexPath, [long]$Cap, [int]$Workers, [int]$DelayMs,
         [string]$OutDir, [int]$Verbosity,
         [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic,
-        [string]$FromLog, [switch]$DeferTier2, [string]$Tier2Resume, [string]$MaxSize, [switch]$PopulateIndex
+        [string]$FromLog, [switch]$DeferTier2, [string]$Tier2Resume, [string]$MaxSize, [switch]$PopulateIndex,
+        [int]$PreviewCount, [int]$PreviewWindow, [switch]$NoColour
     )
     $O = $PSBoundParameters
+    $script:AuditColour = -not ($O.ContainsKey('NoColour') -and $O['NoColour'])
     # Per-file download size limit (bytes, or a suffix like 100MB). 0 = no limit. Applied to the
     # download selection (and the count/breakdown) so files larger than this aren't fetched.
     $maxBytes = Convert-ToBytes $MaxSize
@@ -704,9 +1002,9 @@ function Invoke-ArcSearchPumpToDone {
         Invoke-ArcSearchPump
         if ($script:AuditVerbosity -ge 2 -and ([DateTime]::UtcNow - $lastTick).TotalSeconds -ge 1) {
             $walk = if (Test-ArcSearchWalkActive) { ' (walking)' } else { '' }
-            Write-Host ("  ...indexed $($script:ArcIndexedArchives.Count) archive(s), $($script:ArcSearchResults.Count) match(es)$walk")
+            Write-AuditColor ("  ...indexed $($script:ArcIndexedArchives.Count) archive(s), $($script:ArcSearchResults.Count) match(es)$walk") DarkGray
             if ($script:AuditVerbosity -ge 5) {
-                Write-Host ("    queue=$($script:ArcQueue.Count) jobs=$($script:ArcJobs.Count) indexed=$($script:ArcIndexedArchives.Count)")
+                Write-AuditColor ("    queue=$($script:ArcQueue.Count) jobs=$($script:ArcJobs.Count) indexed=$($script:ArcIndexedArchives.Count)") DarkGray
             }
             $lastTick = [DateTime]::UtcNow
         }
@@ -725,9 +1023,10 @@ function Invoke-SearchCore {
         [string]$IndexPath, [switch]$NoIndex, [string]$Offline,
         [long]$Cap, [int]$Workers, [int]$DelayMs,
         [string]$OutDir, [int]$Verbosity,
-        [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic
+        [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic, [switch]$NoColour
     )
     $O = $PSBoundParameters
+    $script:AuditColour = -not ($O.ContainsKey('NoColour') -and $O['NoColour'])
     if ($O.ContainsKey('Verbosity')) { $script:AuditVerbosity = [int]$O['Verbosity'] }
     # Offline: 'index'/'all' both skip the REST quick-search (Search-Artifacts self-gates to
     # empty); results come from the local index (Search-Index + indexed archive entries). 'all'

@@ -1685,6 +1685,55 @@ function Format-Eta([int]$seconds) {
     return ('{0}d {1}h' -f [int][Math]::Floor($seconds / 86400), [int][Math]::Floor(($seconds % 86400) / 3600))
 }
 
+# Coloured console output for the index builder's verbose modes (the whole progress line is one colour,
+# so no per-segment composition is needed). On by default; --nocolour sets $IndexColour false.
+$script:IndexColour = $true
+function Write-IdxColor([string]$text, $color = $null, [switch]$NoNewline) {
+    if ($script:IndexColour -and $color) { Write-Host $text -ForegroundColor $color -NoNewline:$NoNewline }
+    else                                 { Write-Host $text -NoNewline:$NoNewline }
+}
+
+# Print the single-line index-build progress, whole line dark grey. Each field is its own [bracket],
+# space-separated, after the unbracketed '...index populated with N files' (or '...metadata fetched ...')
+# prefix - no column padding, the brackets delimit. Verbosity 5 uses the richer 'index populated' form.
+function Write-IndexProgressLine([bool]$archives, [datetime]$start, [int]$arcBase) {
+    $done    = $script:IdxDone + $script:IdxSkipped
+    $denom   = $script:IdxSeen.Count
+    $walking = Test-IndexWalkActive
+    $elapsed = ([DateTime]::UtcNow - $start).TotalSeconds
+    $rate    = if ($elapsed -gt 0) { $done / $elapsed } else { 0 }
+    if ($script:IndexVerbosity -ge 5) {
+        $repos  = (Get-IndexManifest).ByRepo.Count
+        $fields = [Collections.Generic.List[string]]::new()
+        $fields.Add("[{0:0.0} files/s]" -f [double]$rate)
+        $fields.Add("[{0} repos indexed]" -f $repos)
+        $fields.Add("[{0} archives indexed]" -f $script:ArcIndexedArchives.Count)
+        $fields.Add(("[meta queue:{0} workers:{1}]" -f $script:IdxMetaQueue.Count, $script:IdxThrottle.MaxConcurrent))
+        if ($archives) { $fields.Add(("[arc queue:{0} workers:{1}]" -f $script:ArcQueue.Count, $script:ArcThrottle.MaxConcurrent)) }
+        Write-IdxColor ("...index populated with {0} files {1}" -f $script:IndexCount, ($fields -join ' ')) DarkGray
+        return
+    }
+    $pct  = if ($denom -gt 0) { [int][Math]::Floor($done * 100.0 / $denom) } else { 0 }
+    $arcBusy = $archives -and ($script:ArcQueue.Count -gt 0 -or $script:ArcJobs.Count -gt 0)
+    $status =
+        if ($walking)                              { 'walking - discovered total still rising' }
+        elseif ($done -lt $denom -and $rate -gt 0) { 'ETA ' + (Format-Eta ([int][Math]::Ceiling(($denom - $done) / $rate))) }
+        elseif ($arcBusy) {
+            $arcLeft  = $script:ArcQueue.Count + $script:ArcJobs.Count
+            $arcDone2 = $script:ArcIndexedArchives.Count - $arcBase
+            $arcRate  = if ($elapsed -gt 0) { $arcDone2 / $elapsed } else { 0 }
+            $arcEta   = if ($arcRate -gt 0) { ' ETA ' + (Format-Eta ([int][Math]::Ceiling($arcLeft / $arcRate))) } else { '' }
+            "expanding archives $arcDone2/$($arcDone2 + $arcLeft)$arcEta"
+        }
+        else { '' }
+    $fields = [Collections.Generic.List[string]]::new()
+    $fields.Add("[{0} index rows]" -f $script:IndexCount)
+    if ($rate -gt 0)             { $fields.Add("[{0:0.0} files/s]" -f $rate) }
+    if ($script:IdxSkipped -gt 0) { $fields.Add("[{0} already-indexed skipped]" -f $script:IdxSkipped) }
+    if ($status)                 { $fields.Add("[{0}]" -f $status) }
+    Write-IdxColor ("...metadata fetched for {0}/{1} discovered files ({2}%) {3}" -f $done, $denom, $pct, ($fields -join ' ')) DarkGray
+}
+
 # Drive a configured index build to completion. Preconditions the CALLER sets: $BaseUrl (trimmed) +
 # auth, $Repos / repo-type scope, $IndexPath (resolved), $IndexVerbosity. Applies the index throttle
 # DEFAULTS (workers 50, walkers 20, arc-workers 15, delay 0) when a value is <=0 (delay <0). Used by
@@ -1734,32 +1783,7 @@ function Invoke-IndexBuildRun {
         if (([DateTime]::UtcNow - $lastGc).TotalSeconds -ge 20) { [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers(); $lastGc = [DateTime]::UtcNow }
         if (([DateTime]::UtcNow - $lastFlush).TotalSeconds -ge 5) { Flush-IndexWrites; $lastFlush = [DateTime]::UtcNow }
         if ($script:IndexVerbosity -ge 2 -and ([DateTime]::UtcNow - $lastTick).TotalSeconds -ge 1) {
-            $done    = $script:IdxDone + $script:IdxSkipped
-            $denom   = $script:IdxSeen.Count
-            $walking = Test-IndexWalkActive
-            $arcBusy = $Archives -and ($script:ArcQueue.Count -gt 0 -or $script:ArcJobs.Count -gt 0)
-            $elapsed = ([DateTime]::UtcNow - $start).TotalSeconds
-            $rate    = if ($elapsed -gt 0) { $done / $elapsed } else { 0 }
-            $pct     = if ($denom -gt 0) { [int][Math]::Floor($done * 100.0 / $denom) } else { 0 }
-            $status =
-                if ($walking)                              { '(walking - discovered total still rising)' }
-                elseif ($done -lt $denom -and $rate -gt 0) { 'ETA ' + (Format-Eta ([int][Math]::Ceiling(($denom - $done) / $rate))) }
-                elseif ($arcBusy) {
-                    $arcLeft  = $script:ArcQueue.Count + $script:ArcJobs.Count
-                    $arcDone2 = $script:ArcIndexedArchives.Count - $arcBase
-                    $arcRate  = if ($elapsed -gt 0) { $arcDone2 / $elapsed } else { 0 }
-                    $arcEta   = if ($arcRate -gt 0) { ', ETA ' + (Format-Eta ([int][Math]::Ceiling($arcLeft / $arcRate))) } else { '' }
-                    "(expanding archives $arcDone2/$($arcDone2 + $arcLeft)$arcEta)"
-                }
-                else { '' }
-            $rateStr = if ($rate -gt 0) { ' | {0:0.0} files/s' -f $rate } else { '' }
-            $arc  = if ($Archives -and $script:IndexVerbosity -ge 4) { " | archives expanded=$($script:ArcIndexedArchives.Count)" } else { '' }
-            $dbg  = if ($script:IndexVerbosity -ge 5) {
-                $aq = if ($Archives) { " | arc-expand queued=$($script:ArcQueue.Count) active=$($script:ArcJobs.Count)" } else { '' }
-                "  [meta-fetch queued=$($script:IdxMetaQueue.Count) workers=$($script:IdxCtl.Target)/$($script:IdxWorkers.Count)$aq]"
-            } else { '' }
-            $skip = if ($script:IdxSkipped -gt 0) { " | $($script:IdxSkipped) already-indexed skipped" } else { '' }
-            Write-Host ("  ...metadata fetched for $done/$denom discovered files ($pct%), $($script:IndexCount) index rows$rateStr$skip $status$arc$dbg".TrimEnd())
+            Write-IndexProgressLine $Archives $start $arcBase
             $lastTick = [DateTime]::UtcNow
         }
         Start-Sleep -Milliseconds 100

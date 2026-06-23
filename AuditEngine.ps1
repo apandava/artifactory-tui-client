@@ -406,31 +406,133 @@ function Test-AuditMeta([string]$name, [string]$path) {
     return @{ Discard=$false; Findings=@($findings.ToArray()); ContentRules=@($crules) }
 }
 
-# Content pass: run the named content rules' regexes over decoded text. Returns an
-# array of @{Rule;Sev} for those that match.
+# Extract a single-line preview snippet centred on a regex match: $AuditPreviewWindow TOTAL context
+# chars split evenly each side of the match (40 -> 20 left + match + 20 right; odd windows put the
+# spare char on the right). The match itself sits between the context. Whitespace is collapsed to
+# single spaces (CR/LF/TAB -> space) so the snippet is one CSV record and readable, and the result is
+# hard-capped so one enormous match span can't bloat the row (truncation marked with '...').
+function Get-AuditSnippet([string]$text, [int]$idx, [int]$len, [int]$window) {
+    if ($window -lt 0) { $window = 0 }
+    if ($len -lt 0)    { $len = 0 }
+    $half   = [int][Math]::Floor($window / 2)
+    $start  = [Math]::Max(0, $idx - $half)
+    $mStart = [Math]::Min($text.Length, $idx)
+    $mEnd   = [Math]::Min($text.Length, $idx + $len)
+    $end    = [Math]::Min($text.Length, $mEnd + ($window - $half))
+    if ($mStart -lt $start) { $mStart = $start }
+    if ($end -lt $mEnd)     { $end = $mEnd }
+    # Keep the three parts separate so the renderer can show the EXACT match in white and the surrounding
+    # context grey. Whitespace is collapsed in each part (CR/LF/TAB -> space); only the outer edges trim.
+    $norm  = { param($x) ($x -replace '[\r\n\t]+', ' ') -replace ' {2,}', ' ' }
+    $pre   = (& $norm $text.Substring($start, $mStart - $start)).TrimStart()
+    $match =  & $norm $text.Substring($mStart, $mEnd - $mStart)
+    $post  = (& $norm $text.Substring($mEnd, $end - $mEnd)).TrimEnd()
+    $mMax = $window + 120
+    if ($match.Length -gt $mMax) { $match = $match.Substring(0, $mMax) + '...' }
+    return @{ Pre = $pre; Match = $match; Post = $post; Text = ($pre + $match + $post) }
+}
+
+# Encode an array of strings as a compact, single-line JSON array (no external dependency, so it's
+# deterministic and avoids ConvertTo-Json's formatting/unicode-escaping quirks). Only ", \, and control
+# chars need escaping; everything else (incl. UTF-8) passes through, which is safe in the no-BOM UTF-8
+# log. Stays one physical line, so the CSV record-per-line invariant holds.
+function ConvertTo-AuditJsonArray($items) {
+    # An empty @() unwraps to $null when passed positionally; @($null) would then become a 1-element
+    # array holding a blank string. Drop nulls so an empty input yields '[]', not '[""]'.
+    $items = @($items | Where-Object { $null -ne $_ })
+    $sb = [Text.StringBuilder]::new()
+    [void]$sb.Append('[')
+    $first = $true
+    foreach ($it in $items) {
+        # Snippets are {Text;Rule;Sev} objects in memory but persist as bare strings in the CSV; accept
+        # either (extract .Text from an object) so the match log stays unlabelled as before.
+        $s = if ($it -is [string]) { $it } elseif ($it.PSObject.Properties['Text']) { [string]$it.Text } else { [string]$it }
+        if (-not $first) { [void]$sb.Append(',') }
+        $first = $false
+        [void]$sb.Append('"')
+        foreach ($ch in $s.ToCharArray()) {
+            $code = [int]$ch
+            if     ($ch -eq '"')    { [void]$sb.Append('\"') }
+            elseif ($ch -eq '\')    { [void]$sb.Append('\\') }
+            elseif ($code -lt 0x20) { [void]$sb.Append('\u'); [void]$sb.Append($code.ToString('x4')) }
+            else                    { [void]$sb.Append($ch) }
+        }
+        [void]$sb.Append('"')
+    }
+    [void]$sb.Append(']')
+    return $sb.ToString()
+}
+
+# Parse a MatchedContentPreview cell back to a string array (for the consolidation merge). Empty / '[]'
+# / malformed -> empty array. @() wrapping normalises PS 5.1's single-element unwrap.
+function ConvertFrom-AuditJsonArray([string]$json) {
+    $t = "$json".Trim()
+    if ($t -eq '' -or $t -eq '[]') { return @() }
+    try { return @($t | ConvertFrom-Json) } catch { return @() }
+}
+
+# Content pass: run the named content rules' regexes over decoded text, enumerating EVERY occurrence
+# (not just the first) so we can report the true instance count and collect up to $AuditPreviewMax
+# preview snippets. Returns @{ Findings=@(@{Rule;Sev}...); Count=<total occurrences>; Snippets=@(...) }.
+# Counting removes the old IsMatch+break short-circuit, so a content rule now scans the whole file for
+# all hits - negligible for sparse secret patterns; $AuditPreviewCountCeil bounds the pathological tail.
 function Test-AuditContent([string]$text, [string[]]$contentRules) {
-    if (-not $text -or $null -eq $contentRules -or $contentRules.Count -eq 0) { return @() }
-    $rs = Get-AuditRuleSet
-    $out = [Collections.Generic.List[object]]::new()
+    if (-not $text -or $null -eq $contentRules -or $contentRules.Count -eq 0) {
+        return @{ Findings=@(); Count=0; Snippets=@(); SevCounts=@{} }
+    }
+    $rs    = Get-AuditRuleSet
+    $win   = [int]$script:AuditPreviewWindow
+    $capN  = [int]$script:AuditPreviewMax
+    $ceil  = [int]$script:AuditPreviewCountCeil
+    $out   = [Collections.Generic.List[object]]::new()
+    # Snippets carry the producing rule + its severity (known here, discarded otherwise) so the level-5
+    # output can colour each preview by its rule WITHOUT any later lookup or content re-read. SevCounts
+    # tallies occurrences per severity for the 'N more matches' breakdown.
+    $snips = [Collections.Generic.List[object]]::new()
+    $sevCounts = @{}
+    $total = 0
     foreach ($cn in $contentRules) {
         if (-not $rs.Content.ContainsKey($cn)) { continue }
         $c = $rs.Content[$cn]
+        $ruleHit = $false
         foreach ($rx in $c.Regexes) {
-            if ($rx.IsMatch($text)) { $out.Add(@{ Rule=$cn; Sev=$c.Sev }); break }
+            $m = $rx.Match($text)
+            $iter = 0
+            while ($m.Success) {
+                $ruleHit = $true
+                $total++
+                $sevCounts[$c.Sev] = 1 + $(if ($sevCounts.ContainsKey($c.Sev)) { $sevCounts[$c.Sev] } else { 0 })
+                if ($snips.Count -lt $capN) {
+                    $sp = Get-AuditSnippet $text $m.Index $m.Length $win
+                    [void]$snips.Add([PSCustomObject]@{ Pre=$sp.Pre; Match=$sp.Match; Post=$sp.Post; Text=$sp.Text; Rule=$cn; Sev=$c.Sev })
+                }
+                $iter++
+                if ($iter -ge $ceil) { break }   # safety ceiling: don't scan a regex-bomb forever
+                $m = $m.NextMatch()               # .NET guarantees forward progress (incl. zero-width)
+            }
         }
+        if ($ruleHit) { $out.Add(@{ Rule=$cn; Sev=$c.Sev }) }
     }
-    return @($out.ToArray())
+    return @{ Findings=@($out.ToArray()); Count=$total; Snippets=@($snips.ToArray()); SevCounts=$sevCounts }
 }
 
-# Reduce a set of @{Rule;Sev} findings to the single highest-severity finding (for
-# the marker) and a combined rule label. Returns $null when empty.
-function Resolve-AuditFindings($findings) {
+# Reduce a set of @{Rule;Sev} findings to the single highest-severity finding (for the marker) and a
+# combined rule label. Returns $null when empty. Count defaults to the number of matched rules (Tier-1
+# meta matches: N rules -> N) but a caller can override it with the true occurrence count (Tier-2
+# content: total regex hits), and pass the preview snippets to carry into the finding/match log.
+function Resolve-AuditFindings($findings, $snippets = @(), [int]$countOverride = -1, $sevCounts = $null) {
     $findings = @($findings)
     if ($findings.Count -eq 0) { return $null }
     $best = $findings[0]; $bestRank = Get-AuditRank $best.Sev
     foreach ($f in $findings) { $rk = Get-AuditRank $f.Sev; if ($rk -gt $bestRank) { $best = $f; $bestRank = $rk } }
     $rules = @($findings | ForEach-Object { $_.Rule } | Select-Object -Unique)
-    return @{ Sev=$best.Sev; Rule=$best.Rule; Rank=$bestRank; AllRules=($rules -join ', '); Count=$findings.Count }
+    $cnt   = if ($countOverride -ge 0) { $countOverride } else { $findings.Count }
+    # Per-severity counts: supplied by the caller (Tier-2 occurrence tally) or derived here (Tier-1:
+    # one count per matched meta rule, by its severity). Sum equals Count.
+    $sc = if ($null -ne $sevCounts) { $sevCounts } else {
+        $h = @{}; foreach ($f in $findings) { $s = [string]$f.Sev; $h[$s] = 1 + $(if ($h.ContainsKey($s)) { $h[$s] } else { 0 }) }; $h
+    }
+    return @{ Sev=$best.Sev; Rule=$best.Rule; Rank=$bestRank; AllRules=($rules -join ', '); Count=$cnt; Snippets=@($snippets); SevCounts=$sc }
 }
 
 # ── ENGINE STATE ──────────────────────────────────────────────────────────────
@@ -439,6 +541,16 @@ function Resolve-AuditFindings($findings) {
 # caller). Files of readable text type above the active cap are surfaced under the
 # synthetic oversize rule instead of being scanned.
 $script:AuditCap = 2097152   # 2 MB for automatic audits
+
+# Content-match preview (snippet) settings. AuditPreviewMax = max snippets stored per finding/file
+# (and merged into audit-log.csv's MatchedContentPreview JSON array); AuditPreviewWindow = TOTAL
+# context characters captured around each match, split evenly each side (40 -> 20 left + match + 20
+# right). AuditPreviewCountCeil bounds per-regex occurrence enumeration so a pathological pattern can't
+# wedge the main-thread scan (MatchCount saturates rather than scanning millions of hits). Set per run
+# by the headless launcher (--preview-count/--preview-window); NOT reset by Reset-AuditEngine.
+$script:AuditPreviewMax       = 10
+$script:AuditPreviewWindow    = 40
+$script:AuditPreviewCountCeil = 100000
 
 $script:AuditState   = 'idle'   # idle | passive | running | paused | done | cancelled
 $script:AuditMode    = ''       # passive | location | full
@@ -626,7 +738,7 @@ function Ensure-AuditMatchesLoaded {
 # Written through once per (identity, severity, rule-set) STATE - this session AND prior runs - so a
 # Tier-1 match and its later Tier-2 upgrade BOTH land on disk (consolidation merges them by identity),
 # while re-running the same audit re-logs nothing. Real matches only. Cheap no-op when no audit dir.
-function Save-AuditMatch($f) {
+function Save-AuditMatch($f, [int]$matchCount = 0, [string]$contentPreview = '[]') {
     if (-not $script:AuditDir -or $null -eq $f) { return }
     $rule = [string]$f.Rule
     if ($rule -eq $script:AuditOversizeRule -or $rule -eq $script:AuditSkippedRule) { return }
@@ -637,7 +749,8 @@ function Save-AuditMatch($f) {
     if (-not $script:AuditMatchesPersisted.Add($sig)) { return }
     $sz = if ($f.Size -ge 0) { [long]$f.Size } else { -1 }
     Write-DownloadLog $script:AuditDir ([string]$f.Name) $repo ([string]$f.Path) $arch `
-        $sz ([string]$f.Modified) ([string]$f.Url) ([string]$f.Sev) ([string]$f.AllRules) '' (Get-AuditMatchFile $repo) -Scrape
+        $sz ([string]$f.Modified) ([string]$f.Url) ([string]$f.Sev) ([string]$f.AllRules) '' (Get-AuditMatchFile $repo) -Scrape `
+        -matchCount $matchCount -contentPreview $contentPreview
 }
 
 # Build the single definitive audit-log.csv by consolidating EVERY per-repo <repo>-matches.csv: group
@@ -658,19 +771,33 @@ function Build-AuditLogFromMatches([string]$outFile) {
                 if (-not "$line".Trim()) { continue }
                 $r = Read-CsvRow $line
                 if ($r.Count -lt 11) { continue }
-                # cols: FileName=1 Repository=3 Path=4 Archive=5 SizeBytes=6 Modified=7 DownloadUrl=8 Severity=9 MatchedRule=10
+                # cols: FileName=1 Repository=3 Path=4 Archive=5 SizeBytes=6 Modified=7 DownloadUrl=8 Severity=9
+                #       MatchedRule=10  MatchCount=11  MatchedContentPreview=12  (11/12 absent on pre-feature rows)
                 $id   = Get-AuditMatchIdentity $r[3] $r[4] $r[1] $r[5]
                 $rank = Get-AuditRank $r[9]
                 $e = $byId[$id]
                 if ($null -eq $e) {
                     $e = @{ Repo=$r[3]; Path=$r[4]; Name=$r[1]; Archive=$r[5]; Url=$r[8]; Size=$r[6]; Modified=$r[7]
-                            Rank=$rank; Sev=$r[9]; Rules=(New-Object 'System.Collections.Generic.HashSet[string]') }
+                            Rank=$rank; Sev=$r[9]; Rules=(New-Object 'System.Collections.Generic.HashSet[string]')
+                            MatchCount=0; Snippets=(New-Object 'System.Collections.Generic.List[string]')
+                            SnipSeen=(New-Object 'System.Collections.Generic.HashSet[string]') }
                     $byId[$id] = $e
                 } elseif ($rank -gt $e.Rank) {
                     # Higher-severity row wins for severity + the representative size/modified/url.
                     $e.Rank = $rank; $e.Sev = $r[9]; $e.Url = $r[8]; $e.Size = $r[6]; $e.Modified = $r[7]
                 }
                 foreach ($t in (@("$($r[10])" -split '\s*,\s*') | Where-Object { $_ })) { [void]$e.Rules.Add($t) }
+                # MatchCount: SUM per-row contributions (each Tier-1 row + each Tier-2 upgrade row carries
+                # its own tier's instance count), so the total is correct across split/resumed runs.
+                if ($r.Count -ge 12 -and "$($r[11])" -match '^\d+$') { $e.MatchCount += [int]$r[11] }
+                # MatchedContentPreview: union the rows' snippet arrays (order-preserved, deduped), capped.
+                if ($r.Count -ge 13) {
+                    foreach ($sn in (ConvertFrom-AuditJsonArray ([string]$r[12]))) {
+                        if (-not "$sn") { continue }   # skip blanks (e.g. legacy/empty cells)
+                        if ($e.Snippets.Count -ge $script:AuditPreviewMax) { break }
+                        if ($e.SnipSeen.Add([string]$sn)) { [void]$e.Snippets.Add([string]$sn) }
+                    }
+                }
             }
         } catch { }
     }
@@ -683,7 +810,8 @@ function Build-AuditLogFromMatches([string]$outFile) {
         $rules = ((@($e.Rules) | Sort-Object) -join ', ')
         $sz = -1; if ("$($e.Size)" -match '^\d+$') { $sz = [long]$e.Size }
         Write-DownloadLog $dir ([string]$e.Name) ([string]$e.Repo) ([string]$e.Path) ([string]$e.Archive) `
-            $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) $rules '' $name -Scrape
+            $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) $rules '' $name -Scrape `
+            -matchCount ([int]$e.MatchCount) -contentPreview (ConvertTo-AuditJsonArray $e.Snippets)
         $n++
     }
     return $n
@@ -834,6 +962,13 @@ $script:AuditArcScript = {
 function Add-AuditFinding($rec, $resolved, [long]$size = -1, [string]$modified = '') {
     if ($null -eq $resolved) { return }
     $key = $rec.Key
+    # This resolution's own contribution: the instance count (Tier-1 meta rules matched, or Tier-2
+    # content occurrences) and its preview snippets. Accumulated into the live finding for display, but
+    # written to the match log PER ROW (not accumulated) so the additive consolidation stays correct
+    # across split/resumed runs - see Save-AuditMatch / Build-AuditLogFromMatches.
+    $rCount = if ($resolved.ContainsKey('Count')) { [int]$resolved.Count } else { 1 }
+    $rSnips = if ($resolved.ContainsKey('Snippets')) { @($resolved.Snippets) } else { @() }
+    $rSevC  = if ($resolved.ContainsKey('SevCounts') -and $resolved.SevCounts) { $resolved.SevCounts } else { @{} }
     if ($script:AuditFindingIdx.ContainsKey($key)) {
         $f = $script:AuditFindingIdx[$key]
         if ($resolved.Rank -gt $f.Rank) { $f.Sev = $resolved.Sev; $f.Rank = $resolved.Rank; $f.Rule = $resolved.Rule }
@@ -844,6 +979,7 @@ function Add-AuditFinding($rec, $resolved, [long]$size = -1, [string]$modified =
             if ($modified)          { $f.Modified = $modified }
             elseif ($rec.KnownModified) { $f.Modified = [string]$rec.KnownModified }
         }
+        $f.MatchCount += $rCount
     } else {
         $f = [PSCustomObject]@{
             Key=$key; Name=$rec.Name; Repo=$rec.Repo; Path=$rec.Path; Uri=$rec.Uri; Url=$rec.Url
@@ -855,15 +991,27 @@ function Add-AuditFinding($rec, $resolved, [long]$size = -1, [string]$modified =
             # active exclude filter (e.g. '*.xml'). Manual [x]/[i] still override per row.
             Included=(($resolved.Rule -ne $script:AuditOversizeRule) -and ($resolved.Rule -ne $script:AuditSkippedRule) -and -not (Test-AuditExcluded ([string]$rec.Name)))
             InArchive=[bool]$rec.IsArchiveEntry; ArchiveName=$rec.ArchiveName
+            # Snippets are {Text;Rule;Sev} objects; MatchSev tallies all matched instances per severity
+            # (Tier-1 meta + Tier-2 content) for the 'N more matches' breakdown.
+            MatchCount=$rCount; Snippets=(New-Object 'System.Collections.Generic.List[object]'); MatchSev=@{}
         }
         $script:AuditFindings.Add($f)
         $script:AuditFindingIdx[$key] = $f
     }
+    # Accumulate this resolution's per-severity instance counts onto the finding.
+    foreach ($sk in $rSevC.Keys) { $f.MatchSev[$sk] = [int]$rSevC[$sk] + $(if ($f.MatchSev.ContainsKey($sk)) { [int]$f.MatchSev[$sk] } else { 0 }) }
+    # Accumulate preview snippets on the live finding, bounded by $AuditPreviewMax.
+    foreach ($sn in $rSnips) {
+        if ($f.Snippets.Count -ge $script:AuditPreviewMax) { break }
+        [void]$f.Snippets.Add($sn)
+    }
     # Marker = highest raw severity seen for this key.
     $cur = if ($script:AuditFlags.ContainsKey($key)) { $script:AuditFlags[$key] } else { '' }
     if ((Get-AuditRank $resolved.Sev) -ge (Get-AuditRank $cur)) { $script:AuditFlags[$key] = $f.Sev }
-    # Write-through to audit/<repo>-matches.csv (real matches only; deduped per identity).
-    Save-AuditMatch $f
+    # Write-through to audit/<repo>-matches.csv (real matches only; deduped per identity). The row carries
+    # THIS resolution's instance count + snippets (not the finding's running total), so Tier-1 and the
+    # later Tier-2 upgrade each contribute a distinct row that the consolidation SUMs / unions.
+    Save-AuditMatch $f $rCount (ConvertTo-AuditJsonArray $rSnips)
     $script:AuditDirty = $true
 }
 
@@ -1073,8 +1221,8 @@ function Complete-AuditJob($rec) {
     if ($null -eq $res) { return }
     if ($res.Ok -and $res.Text) {
         $cf = Test-AuditContent $res.Text $rec.ContentRules
-        if (@($cf).Count -gt 0) {
-            Add-AuditFinding $rec (Resolve-AuditFindings $cf) $res.Size $res.Modified
+        if (@($cf.Findings).Count -gt 0) {
+            Add-AuditFinding $rec (Resolve-AuditFindings $cf.Findings $cf.Snippets $cf.Count $cf.SevCounts) $res.Size $res.Modified
             $script:AuditBytes += [long]$res.Text.Length
             return
         }
@@ -1626,6 +1774,25 @@ function Start-AuditFull {
     $script:AuditState = 'paused'
 }
 
+# Best-effort total-rows estimate for an index audit: the sum of line counts across each in-scope repo's
+# artifact shard + archive buckets (the same files Step-AuditIndexWalk streams). No server queries (the
+# index is on disk), counted in .NET via Linq over ReadLines (no PowerShell-level per-byte loop), so it
+# stays fast at scale. Slightly OVER the audited count because the walk dedupes repeats - good enough
+# for a progress denominator. Returns 0 if nothing is countable.
+function Get-AuditIndexRowCount($repos) {
+    $total = 0L
+    foreach ($repo in @($repos)) {
+        $files = [Collections.Generic.List[string]]::new()
+        $files.Add((Get-ArtifactShardPath $repo))
+        foreach ($ap in (Get-ArchiveBucketFiles $repo)) { $files.Add($ap) }
+        foreach ($path in $files) {
+            if (-not (Test-Path -LiteralPath $path)) { continue }
+            try { $total += [long][System.Linq.Enumerable]::Count([System.IO.File]::ReadLines($path)) } catch { }
+        }
+    }
+    return [long]$total
+}
+
 # Index-backed audit: source work ONLY from the local index (no discovery). Scope is the indexed
 # repos narrowed to the active repo-type scope (default LOCAL only), or an explicit -Repos list.
 # Starts paused like the other automatic modes (the headless pump resumes immediately); the feeder
@@ -1646,6 +1813,10 @@ function Start-AuditIndex {
     $list = [Collections.Generic.List[object]]::new()
     foreach ($rk in $repos) { $list.Add($rk) }
     $script:AuditIdxRepos     = $list
+    # Known total up front: the index is already on disk, so count the rows we're about to stream (no
+    # server queries). Drives a (mostly) correct done/total + ETA from the first tick; slightly over the
+    # audited count because the walk dedupes repeats. Tier-2 later overrides this with its worklist size.
+    $script:AuditEnqTotal     = Get-AuditIndexRowCount $repos
     $script:AuditIdxRepoPos   = 0
     $script:AuditIdxRepo      = ''
     $script:AuditIdxFiles     = $null
