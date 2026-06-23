@@ -3163,6 +3163,7 @@ function Receive-AuditJobs {
             try { [void]$j.PS.EndInvoke($j.Handle) } catch { }
             try { $j.PS.Dispose() } catch { }
             if ($j.Kind -eq 'archive') { Complete-ArchiveJob $j.Rec } else { Complete-AuditJob $j.Rec }
+            if ($script:AuditT2Active -and $null -ne $j.Rec -and $j.Rec.ContainsKey('T2Seq')) { Mark-AuditT2Done ([int]$j.Rec.T2Seq) }
         } else { $still.Add($j) }
     }
     $script:AuditJobs = $still
@@ -3506,9 +3507,13 @@ function Stop-AuditIndexWalk {
 $script:AuditT2Active    = $false
 $script:AuditT2Enum      = $null     # ReadLines enumerator over the worklist (positioned past header + cursor)
 $script:AuditT2Path      = ''        # worklist path
-$script:AuditT2Cursor    = 0         # rows committed (persisted to the sidecar)
-$script:AuditT2Batch     = 0         # rows read into the current in-flight batch (not yet committed)
-$script:AuditT2BatchSize = 1000
+$script:AuditT2Cursor    = 0         # rows committed, persisted to the sidecar (= AuditT2CommitSeq at save)
+$script:AuditT2CommitSeq = 0         # contiguous-completed prefix length (next uncommitted absolute index)
+$script:AuditT2SeqNext   = 0         # next absolute row index to read
+$script:AuditT2Total     = 0         # total data rows (file rows - header)
+$script:AuditT2Saved     = 0         # AuditT2CommitSeq last persisted (write-throttle)
+$script:AuditT2Done      = $null     # HashSet[int] of completed seqs ahead of the commit point
+$script:AuditT2MaxAhead  = 8000      # cap read-ahead beyond the commit point (bounds AuditT2Done + re-scan)
 
 function Get-AuditT2CursorPath([string]$path) { return "$path.progress" }
 function Read-AuditT2Cursor([string]$path) {
@@ -3560,15 +3565,20 @@ function Start-AuditTier2List([string]$path, [switch]$KeepFindings) {
         Reset-AuditEngine
     }
     $script:AuditTier2 = $true
+    $script:AuditWalkArchives = $false
     $script:AuditMode = 'tier2-list'; $script:AuditScope = "worklist: $path"
     $script:AuditCapActive = $script:AuditCap
     $script:AuditStartedAt = [DateTime]::UtcNow
-    $script:AuditT2Path   = $path
-    $script:AuditT2Cursor = Read-AuditT2Cursor $path
-    $script:AuditT2Batch  = 0
+    $script:AuditT2Path      = $path
+    $script:AuditT2Cursor    = Read-AuditT2Cursor $path
+    $script:AuditT2CommitSeq = $script:AuditT2Cursor
+    $script:AuditT2SeqNext   = $script:AuditT2Cursor
+    $script:AuditT2Saved     = $script:AuditT2Cursor
+    $script:AuditT2Done      = New-Object 'System.Collections.Generic.HashSet[int]'
     $rows = 0
     try { foreach ($ln in [System.IO.File]::ReadLines($path)) { $rows++ } } catch { }
-    $script:AuditEnqTotal = [Math]::Max(0, ($rows - 1) - $script:AuditT2Cursor)   # minus the header, minus committed
+    $script:AuditT2Total  = [Math]::Max(0, $rows - 1)   # minus the header
+    $script:AuditEnqTotal = [Math]::Max(0, $script:AuditT2Total - $script:AuditT2Cursor)
     $script:AuditT2Enum = [System.IO.File]::ReadLines($path).GetEnumerator()
     $skip = 1 + $script:AuditT2Cursor   # header + committed data rows
     $n = 0
@@ -3578,24 +3588,36 @@ function Start-AuditTier2List([string]$path, [switch]$KeepFindings) {
     return $true
 }
 
+function Mark-AuditT2Done([int]$seq) {
+    if (-not $script:AuditT2Active -or $seq -lt $script:AuditT2CommitSeq) { return }
+    [void]$script:AuditT2Done.Add($seq)
+    while ($script:AuditT2Done.Remove($script:AuditT2CommitSeq)) { $script:AuditT2CommitSeq++ }
+}
+
 function Step-AuditTier2List {
     if (-not $script:AuditT2Active) { return }
-    if (($script:AuditQueue.Count + $script:AuditJobs.Count) -gt 0) { return }
-    if ($script:AuditT2Batch -gt 0) {
-        $script:AuditT2Cursor += $script:AuditT2Batch
-        $script:AuditT2Batch = 0
-        Save-AuditT2Cursor
-    }
-    $read = 0
-    while ($read -lt $script:AuditT2BatchSize) {
-        if (-not $script:AuditT2Enum.MoveNext()) { break }
+    $maxc   = [Math]::Max(1, [Math]::Min($script:AuditMaxWorkers, [int]$script:AuditThrottle.MaxConcurrent))
+    $target = [Math]::Max(64, 2 * $maxc)
+    while ($script:AuditQueue.Count -lt $target -and
+           $script:AuditT2SeqNext -lt $script:AuditT2Total -and
+           ($script:AuditT2SeqNext - $script:AuditT2CommitSeq) -lt $script:AuditT2MaxAhead) {
+        if (-not $script:AuditT2Enum.MoveNext()) { $script:AuditT2Total = $script:AuditT2SeqNext; break }
+        $seq = $script:AuditT2SeqNext; $script:AuditT2SeqNext++
         $line = $script:AuditT2Enum.Current
-        $read++
-        if (-not "$line".Trim()) { continue }
+        if (-not "$line".Trim()) { Mark-AuditT2Done $seq; continue }
         $rec = New-AuditWorkFromListRow (Read-CsvRow $line)
-        if ($rec) { Add-AuditRecord $rec }
+        if (-not $rec) { Mark-AuditT2Done $seq; continue }
+        $rec.T2Seq = $seq
+        $before = $script:AuditQueue.Count
+        Add-AuditRecord $rec
+        if ($script:AuditQueue.Count -eq $before) { Mark-AuditT2Done $seq }
     }
-    if ($read -eq 0) {
+    if (($script:AuditT2CommitSeq - $script:AuditT2Saved) -ge 500) {
+        $script:AuditT2Cursor = $script:AuditT2CommitSeq; Save-AuditT2Cursor; $script:AuditT2Saved = $script:AuditT2CommitSeq
+    }
+    if ($script:AuditT2SeqNext -ge $script:AuditT2Total -and
+        $script:AuditT2CommitSeq -ge $script:AuditT2Total -and
+        $script:AuditQueue.Count -eq 0 -and $script:AuditJobs.Count -eq 0) {
         $script:AuditT2Active = $false
         $p = $script:AuditT2Path
         Stop-AuditTier2List
@@ -3605,20 +3627,23 @@ function Step-AuditTier2List {
         }
         return
     }
-    $script:AuditT2Batch = $read
     $script:AuditDirty = $true
 }
 
 function Test-AuditTier2ListActive { return [bool]$script:AuditT2Active }
 
 function Stop-AuditTier2List {
+    if ($script:AuditT2Active -and $script:AuditT2Path) {
+        $script:AuditT2Cursor = $script:AuditT2CommitSeq
+        Save-AuditT2Cursor
+    }
     if ($null -ne $script:AuditT2Enum) {
         try { $script:AuditT2Enum.Dispose() } catch { }
         $script:AuditT2Enum = $null
     }
     $script:AuditT2Active = $false
     $script:AuditT2Path   = ''
-    $script:AuditT2Batch  = 0
+    $script:AuditT2Done   = $null
 }
 
 function Start-AuditPassive {
