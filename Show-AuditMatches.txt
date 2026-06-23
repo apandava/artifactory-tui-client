@@ -1,0 +1,167 @@
+# ============================================================================
+# Show-AuditMatches  --  page through every <repo>-matches.csv in an audit
+# directory, one file at a time, printing each matched artifact with its
+# severity, matched rules (each coloured by severity) and content snippets.
+#
+# Paste this whole block into a VT-capable terminal (Windows Terminal, pwsh,
+# or the VS Code terminal -- colours need virtual-terminal support), then run:
+#
+#   Show-AuditMatches .\output\<host>\audit
+#
+# It prompts "Showing match file i/N [repo] - Next?" before each file; press
+# Enter to show that file's entries, or type q to stop. Rows are grouped per
+# artifact (so a file's Tier-1 + Tier-2 matches merge into one entry): the
+# [Severity] tag is the highest severity seen, and each rule is coloured by the
+# severity of the row it matched in. Snippets are capped at 10 per artifact.
+# ============================================================================
+
+# Minimal RFC-4180 reader: parse one fully-quoted CSV line into a string list.
+function Read-CsvRowLite {
+    param([string]$line)
+    $out = New-Object System.Collections.Generic.List[string]
+    $n = $line.Length; $i = 0; $sb = [Text.StringBuilder]::new()
+    while ($i -lt $n) {
+        while ($i -lt $n -and $line[$i] -ne '"') { $i++ }
+        if ($i -ge $n) { break }
+        $i++
+        [void]$sb.Clear()
+        while ($i -lt $n) {
+            $ch = $line[$i]
+            if ($ch -eq '"') {
+                if ($i + 1 -lt $n -and $line[$i + 1] -eq '"') { [void]$sb.Append('"'); $i += 2; continue }
+                $i++; break
+            }
+            [void]$sb.Append($ch); $i++
+        }
+        $out.Add($sb.ToString())
+        if ($i -lt $n -and $line[$i] -eq ',') { $i++ }
+    }
+    return $out
+}
+
+# Parse a MatchedContentPreview cell (a JSON array of strings) back to an array.
+function ConvertFrom-JsonArrayLite {
+    param([string]$json)
+    $t = "$json".Trim()
+    if ($t -eq '' -or $t -eq '[]') { return @() }
+    try { return @($t | ConvertFrom-Json) } catch { return @() }
+}
+
+# Severity rank (matches the audit engine: critical highest .. informational lowest).
+function Get-SevRankLite {
+    param([string]$s)
+    switch ("$s".ToLower()) { 'critical' { 5 } 'high' { 4 } 'medium' { 3 } 'low' { 2 } 'informational' { 1 } default { 0 } }
+}
+
+# Severity colour (the exact 256-colour codes the TUI uses).
+function Get-SevColorLite {
+    param([string]$s)
+    $e = [char]27
+    switch ("$s".ToLower()) {
+        'critical'      { "$e[38;5;203m" }   # red
+        'high'          { "$e[38;5;221m" }   # yellow
+        'medium'        { "$e[38;5;113m" }   # green
+        'low'           { "$e[38;5;75m"  }   # blue
+        'informational' { "$e[38;5;135m" }   # purple
+        default         { '' }
+    }
+}
+
+# Human-readable byte size, e.g. 125952 -> "123 KB".
+function Format-SizeLite {
+    param([long]$bytes)
+    if ($bytes -lt 0) { return '?' }
+    $u = @('B', 'KB', 'MB', 'GB', 'TB'); $i = 0; $s = [double]$bytes
+    while ($s -ge 1024 -and $i -lt ($u.Count - 1)) { $s /= 1024; $i++ }
+    if ($i -eq 0) { return "$([long]$s) $($u[$i])" }
+    return ('{0:0.#} {1}' -f $s, $u[$i])
+}
+
+function Show-AuditMatches {
+    param([string]$Dir = '.\output')
+
+    $e  = [char]27
+    $R  = "$e[0m"
+    $WH = "$e[38;5;231m"   # white       - filename
+    $LG = "$e[38;5;250m"   # light grey  - path / snippets / size+date
+    $DG = "$e[38;5;240m"   # dark grey   - repo + archive
+
+    if (-not (Test-Path -LiteralPath $Dir)) { Write-Host "Directory not found: $Dir" -ForegroundColor Red; return }
+    $files = @(Get-ChildItem -LiteralPath $Dir -Filter '*-matches.csv' -File | Sort-Object Name)
+    if ($files.Count -eq 0) { Write-Host "No *-matches.csv files in $Dir" -ForegroundColor Yellow; return }
+
+    $enc   = New-Object System.Text.UTF8Encoding($false)
+    $total = $files.Count
+    $cap   = 10
+
+    for ($fi = 0; $fi -lt $total; $fi++) {
+        $lines = [System.IO.File]::ReadAllLines($files[$fi].FullName, $enc)
+        $data  = if ($lines.Count -gt 1) { $lines[1..($lines.Count - 1)] } else { @() }
+
+        # Repo name for the prompt: from the first data row's Repository column, else the filename.
+        $repo = ''
+        foreach ($l in $data) { if ($l.Trim()) { $repo = (Read-CsvRowLite $l)[1]; break } }
+        if (-not $repo) { $repo = $files[$fi].Name -replace '-matches\.csv$', '' }
+
+        $ans = Read-Host "Showing match file $($fi + 1)/$total [$repo] - Next?"
+        if ($ans -eq 'q') { Write-Host 'Stopped.' -ForegroundColor Yellow; return }
+
+        # Group rows by artifact identity (repo|path|name|archive), preserving first-seen order.
+        $order  = New-Object System.Collections.Generic.List[string]
+        $groups = @{}
+        foreach ($l in $data) {
+            if (-not $l.Trim()) { continue }
+            $f = Read-CsvRowLite $l
+            if ($f.Count -lt 9) { continue }
+            $name = $f[0]; $rp = $f[1]; $pth = $f[2]; $arc = $f[3]; $sz = $f[4]; $mod = $f[5]
+            $sev  = $f[7]; $rules = $f[8]
+            $prev = if ($f.Count -gt 10) { $f[10] } else { '[]' }
+            $key  = "$rp|$pth|$name|$arc"
+            if (-not $groups.ContainsKey($key)) {
+                $order.Add($key)
+                $groups[$key] = @{
+                    Name = $name; Repo = $rp; Path = $pth; Arch = $arc; Size = $sz; Mod = $mod
+                    MaxSev = $sev; Rules = [ordered]@{}
+                    Snips = New-Object System.Collections.Generic.List[string]
+                    SnipSeen = New-Object System.Collections.Generic.HashSet[string]
+                }
+            }
+            $g = $groups[$key]
+            if ((Get-SevRankLite $sev) -gt (Get-SevRankLite $g.MaxSev)) { $g.MaxSev = $sev }
+            if (-not $g.Size -and $sz)  { $g.Size = $sz }
+            if (-not $g.Mod  -and $mod) { $g.Mod  = $mod }
+            foreach ($rn in ($rules -split ',\s*')) {
+                $rn = $rn.Trim(); if (-not $rn) { continue }
+                if (-not $g.Rules.Contains($rn) -or (Get-SevRankLite $sev) -gt (Get-SevRankLite $g.Rules[$rn])) {
+                    $g.Rules[$rn] = $sev
+                }
+            }
+            foreach ($sn in (ConvertFrom-JsonArrayLite $prev)) {
+                if ($g.SnipSeen.Add([string]$sn)) { [void]$g.Snips.Add([string]$sn) }
+            }
+        }
+
+        if ($order.Count -eq 0) { Write-Host '  (no entries)' -ForegroundColor DarkGray; Write-Host ''; continue }
+
+        foreach ($key in $order) {
+            $g   = $groups[$key]
+            $tag = "$(Get-SevColorLite $g.MaxSev)[$($g.MaxSev)]$R"
+            $pathPart = if ($g.Path) { "$LG$($g.Path)/$R" } else { '' }
+            $archPart = if ($g.Arch) { " $DG($($g.Arch))$R" } else { '' }
+            $ident    = "$DG$($g.Repo):$R$pathPart$WH$($g.Name)$R$archPart"
+            $ruleStr  = (@($g.Rules.Keys | ForEach-Object { "$(Get-SevColorLite $g.Rules[$_])$_$R" }) -join ' ')
+            $szTxt = if ("$($g.Size)" -match '^\d+$') { Format-SizeLite ([long]$g.Size) } else { '?' }
+            $dtTxt = $g.Mod
+            try { if ($g.Mod) { $dtTxt = ([DateTime]$g.Mod).ToString('M/d/yyyy') } } catch { }
+            $meta = "$LG($szTxt)$R $LG($dtTxt)$R"
+            Write-Host "$tag $ident - $ruleStr $meta"
+
+            $shown = [Math]::Min($cap, $g.Snips.Count)
+            for ($si = 0; $si -lt $shown; $si++) { Write-Host "    $LG$($g.Snips[$si])$R" }
+            if ($g.Snips.Count -gt $cap) {
+                Write-Host "    $LG$($g.Snips.Count - $cap) more snippet(s) not shown$R"
+            }
+        }
+        Write-Host ''
+    }
+}

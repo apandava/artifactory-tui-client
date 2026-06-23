@@ -1,0 +1,142 @@
+# ============================================================================
+# Invoke-CSVPrune  --  interactively prune rows from a Tier-2 worklist
+# (tier2-pending.csv) by regex, with a coloured preview, a confirmation step,
+# and a backup of everything removed. It also fixes the .progress resume cursor
+# so a later `audit --tier2-resume` / `-2` still starts in the right place.
+#
+# Paste this whole block into a VT-capable terminal (Windows Terminal, pwsh,
+# or the VS Code terminal -- colours need virtual-terminal support), then run:
+#
+#   Invoke-CSVPrune --file .\output\<host>\audit\tier2-pending.csv `
+#                   --prune '<regex>' '<regex>' ... `
+#                   --preserve '<regex>' '<regex>' ...
+#
+# A row is removed when it matches ANY --prune regex and NONE of the (optional)
+# --preserve regexes. Matching is done on the RAW CSV line (so a regex can hit
+# the repo, path, name, archive or url field). Order is preserved and untouched
+# rows are written back byte-for-byte (no Excel-style reformatting).
+#
+# Cursor note: pruning ALREADY-scanned rows is safe (their results live in
+# <repo>-matches.csv); pruning not-yet-scanned rows just drops them from the
+# remaining scan. Either way the .progress cursor is recomputed for you.
+# ============================================================================
+
+# Minimal RFC-4180 reader: parse one fully-quoted CSV line into a string list.
+function Read-CsvRowLite {
+    param([string]$line)
+    $out = New-Object System.Collections.Generic.List[string]
+    $n = $line.Length; $i = 0; $sb = [Text.StringBuilder]::new()
+    while ($i -lt $n) {
+        while ($i -lt $n -and $line[$i] -ne '"') { $i++ }   # skip to opening quote
+        if ($i -ge $n) { break }
+        $i++                                                 # past opening quote
+        [void]$sb.Clear()
+        while ($i -lt $n) {
+            $ch = $line[$i]
+            if ($ch -eq '"') {
+                if ($i + 1 -lt $n -and $line[$i + 1] -eq '"') { [void]$sb.Append('"'); $i += 2; continue }
+                $i++; break                                  # closing quote
+            }
+            [void]$sb.Append($ch); $i++
+        }
+        $out.Add($sb.ToString())
+        if ($i -lt $n -and $line[$i] -eq ',') { $i++ }
+    }
+    return $out
+}
+
+function Invoke-CSVPrune {
+    $e  = [char]27
+    $R  = "$e[0m"
+    $WH = "$e[38;5;231m"   # white       - filename
+    $LG = "$e[38;5;250m"   # light grey  - path
+    $DG = "$e[38;5;240m"   # dark grey   - repo + archive
+
+    # ---- parse unix-style flags from $args -------------------------------
+    $file = ''; $prune = @(); $preserve = @(); $mode = ''
+    foreach ($a in $args) {
+        if     ($a -eq '--file')     { $mode = 'file' }
+        elseif ($a -eq '--prune')    { $mode = 'prune' }
+        elseif ($a -eq '--preserve') { $mode = 'preserve' }
+        elseif ($mode -eq 'file')     { $file = $a }
+        elseif ($mode -eq 'prune')    { $prune    += $a }
+        elseif ($mode -eq 'preserve') { $preserve += $a }
+        else { Write-Host "Ignoring stray argument: $a" -ForegroundColor DarkYellow }
+    }
+    if (-not $file)                          { Write-Host 'ERROR: --file <path> is required.' -ForegroundColor Red; return }
+    if (-not (Test-Path -LiteralPath $file)) { Write-Host "ERROR: file not found: $file"     -ForegroundColor Red; return }
+    if ($prune.Count -eq 0)                  { Write-Host 'ERROR: at least one --prune <regex> is required.' -ForegroundColor Red; return }
+
+    $enc   = New-Object System.Text.UTF8Encoding($false)
+    $lines = [System.IO.File]::ReadAllLines($file, $enc)
+    if ($lines.Count -lt 1) { Write-Host 'File is empty.' -ForegroundColor Yellow; return }
+    $header = $lines[0]
+    $data   = if ($lines.Count -gt 1) { $lines[1..($lines.Count - 1)] } else { @() }
+
+    # ---- current resume cursor (count of rows already content-scanned) ---
+    $progPath = "$file.progress"
+    $cursor = 0
+    if (Test-Path -LiteralPath $progPath) {
+        try { $t = (Get-Content -LiteralPath $progPath -Raw).Trim(); if ($t -match '^\d+$') { $cursor = [int]$t } } catch { }
+    }
+
+    # ---- classify each data row + print the ones to prune ----------------
+    $kept   = New-Object System.Collections.Generic.List[string]
+    $pruned = New-Object System.Collections.Generic.List[string]
+    $keptDoneCount = 0          # survivors that were already scanned (orig position < cursor)
+    $idx = 0
+    foreach ($line in $data) {
+        $isPrune = $false
+        foreach ($re in $prune) { if ($line -match $re) { $isPrune = $true; break } }
+        if ($isPrune -and $preserve.Count -gt 0) {
+            foreach ($re in $preserve) { if ($line -match $re) { $isPrune = $false; break } }
+        }
+        if ($isPrune) {
+            $pruned.Add($line)
+            $f    = Read-CsvRowLite $line
+            $repo = if ($f.Count -gt 0) { $f[0] } else { '' }
+            $path = if ($f.Count -gt 1) { $f[1] } else { '' }
+            $name = if ($f.Count -gt 2) { $f[2] } else { '' }
+            $arch = if ($f.Count -gt 3) { $f[3] } else { '' }
+            $pathPart = if ($path) { "$LG$path/$R" } else { '' }
+            $archPart = if ($arch) { " $DG($arch)$R" } else { '' }
+            Write-Host "$DG[$repo]$R $pathPart$WH$name$R$archPart"
+        } else {
+            $kept.Add($line)
+            if ($idx -lt $cursor) { $keptDoneCount++ }
+        }
+        $idx++
+    }
+
+    Write-Host ''
+    Write-Host "Matched $($pruned.Count) row(s) to prune; $($kept.Count) would remain."
+    if ($pruned.Count -eq 0) { Write-Host 'Nothing to do.' -ForegroundColor Yellow; return }
+
+    $ans = Read-Host "Delete these $($pruned.Count) row(s) from `"$file`"? Type 'yes' to confirm"
+    if ($ans -ne 'yes') { Write-Host 'Aborted - no changes made.' -ForegroundColor Yellow; return }
+
+    # ---- back up the removed rows ----------------------------------------
+    $backupDir = Join-Path (Get-Location).Path 'backup'
+    if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
+    $backupFile = Join-Path $backupDir 'pruned_entries-tier2_pending.csv'
+    $bsb = [Text.StringBuilder]::new()
+    [void]$bsb.Append($header).Append("`n")
+    foreach ($l in $pruned) { [void]$bsb.Append($l).Append("`n") }
+    [System.IO.File]::WriteAllText($backupFile, $bsb.ToString(), $enc)
+
+    # ---- rewrite the worklist (header + survivors, order preserved) ------
+    $nsb = [Text.StringBuilder]::new()
+    [void]$nsb.Append($header).Append("`n")
+    foreach ($l in $kept) { [void]$nsb.Append($l).Append("`n") }
+    [System.IO.File]::WriteAllText($file, $nsb.ToString(), $enc)
+
+    # ---- fix the positional resume cursor --------------------------------
+    if (Test-Path -LiteralPath $progPath) {
+        [System.IO.File]::WriteAllText($progPath, "$keptDoneCount", $enc)
+        Write-Host "Resume cursor adjusted: $cursor -> $keptDoneCount (already-scanned rows that survived)." -ForegroundColor DarkGray
+    }
+
+    Write-Host "Pruned $($pruned.Count) row(s)."                       -ForegroundColor Green
+    Write-Host "Backup written to: $backupFile"                        -ForegroundColor Green
+    Write-Host "Worklist now has $($kept.Count) row(s): $file"         -ForegroundColor Green
+}
