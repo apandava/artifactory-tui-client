@@ -2619,25 +2619,6 @@ function Test-AuditMeta([string]$name, [string]$path) {
     return @{ Discard=$false; Findings=@($findings.ToArray()); ContentRules=@($crules) }
 }
 
-function Get-AuditSnippet([string]$text, [int]$idx, [int]$len, [int]$window) {
-    if ($window -lt 0) { $window = 0 }
-    if ($len -lt 0)    { $len = 0 }
-    $half   = [int][Math]::Floor($window / 2)
-    $start  = [Math]::Max(0, $idx - $half)
-    $mStart = [Math]::Min($text.Length, $idx)
-    $mEnd   = [Math]::Min($text.Length, $idx + $len)
-    $end    = [Math]::Min($text.Length, $mEnd + ($window - $half))
-    if ($mStart -lt $start) { $mStart = $start }
-    if ($end -lt $mEnd)     { $end = $mEnd }
-    $norm  = { param($x) ($x -replace '[\r\n\t]+', ' ') -replace ' {2,}', ' ' }
-    $pre   = (& $norm $text.Substring($start, $mStart - $start)).TrimStart()
-    $match =  & $norm $text.Substring($mStart, $mEnd - $mStart)
-    $post  = (& $norm $text.Substring($mEnd, $end - $mEnd)).TrimEnd()
-    $mMax = $window + 120
-    if ($match.Length -gt $mMax) { $match = $match.Substring(0, $mMax) + '...' }
-    return @{ Pre = $pre; Match = $match; Post = $post; Text = ($pre + $match + $post) }
-}
-
 function ConvertTo-AuditJsonArray($items) {
     $items = @($items | Where-Object { $null -ne $_ })
     $sb = [Text.StringBuilder]::new()
@@ -2667,21 +2648,45 @@ function ConvertFrom-AuditJsonArray([string]$json) {
     try { return @($t | ConvertFrom-Json) } catch { return @() }
 }
 
-function Test-AuditContent([string]$text, [string[]]$contentRules) {
-    if (-not $text -or $null -eq $contentRules -or $contentRules.Count -eq 0) {
+$script:AuditScanFn = @'
+# Single-line preview snippet centred on a regex match: $window TOTAL context chars split evenly each
+# side (40 -> 20 left + match + 20 right; odd -> spare char on the right). Whitespace is collapsed to
+# single spaces so the snippet is one CSV record; the match span is hard-capped so it can't bloat the row.
+function Get-AuditSnippet([string]$text, [int]$idx, [int]$len, [int]$window) {
+    if ($window -lt 0) { $window = 0 }
+    if ($len -lt 0)    { $len = 0 }
+    $half   = [int][Math]::Floor($window / 2)
+    $start  = [Math]::Max(0, $idx - $half)
+    $mStart = [Math]::Min($text.Length, $idx)
+    $mEnd   = [Math]::Min($text.Length, $idx + $len)
+    $end    = [Math]::Min($text.Length, $mEnd + ($window - $half))
+    if ($mStart -lt $start) { $mStart = $start }
+    if ($end -lt $mEnd)     { $end = $mEnd }
+    $norm  = { param($x) ($x -replace '[\r\n\t]+', ' ') -replace ' {2,}', ' ' }
+    $pre   = (& $norm $text.Substring($start, $mStart - $start)).TrimStart()
+    $match =  & $norm $text.Substring($mStart, $mEnd - $mStart)
+    $post  = (& $norm $text.Substring($mEnd, $end - $mEnd)).TrimEnd()
+    $mMax = $window + 120
+    if ($match.Length -gt $mMax) { $match = $match.Substring(0, $mMax) + '...' }
+    return @{ Pre = $pre; Match = $match; Post = $post; Text = ($pre + $match + $post) }
+}
+
+# Content pass: run the named content rules' regexes over decoded text, enumerating EVERY occurrence so
+# we report the true instance count and collect up to $capN preview snippets (each carrying its producing
+# rule + severity for level-5 colouring; SevCounts tallies occurrences per severity). $contentMap is the
+# shared ruleset's Content dict (name -> {Sev; Regexes}); $win/$capN/$ceil are the preview settings.
+# Returns @{ Findings=@(@{Rule;Sev}...); Count=<total occurrences>; Snippets=@(...); SevCounts=@{} }.
+function Test-AuditContent([string]$text, $contentRules, $contentMap, [int]$win, [int]$capN, [int]$ceil) {
+    if (-not $text -or $null -eq $contentRules -or @($contentRules).Count -eq 0) {
         return @{ Findings=@(); Count=0; Snippets=@(); SevCounts=@{} }
     }
-    $rs    = Get-AuditRuleSet
-    $win   = [int]$script:AuditPreviewWindow
-    $capN  = [int]$script:AuditPreviewMax
-    $ceil  = [int]$script:AuditPreviewCountCeil
     $out   = [Collections.Generic.List[object]]::new()
     $snips = [Collections.Generic.List[object]]::new()
     $sevCounts = @{}
     $total = 0
     foreach ($cn in $contentRules) {
-        if (-not $rs.Content.ContainsKey($cn)) { continue }
-        $c = $rs.Content[$cn]
+        if (-not $contentMap.ContainsKey($cn)) { continue }
+        $c = $contentMap[$cn]
         $ruleHit = $false
         foreach ($rx in $c.Regexes) {
             $m = $rx.Match($text)
@@ -2703,6 +2708,7 @@ function Test-AuditContent([string]$text, [string[]]$contentRules) {
     }
     return @{ Findings=@($out.ToArray()); Count=$total; Snippets=@($snips.ToArray()); SevCounts=$sevCounts }
 }
+'@
 
 function Resolve-AuditFindings($findings, $snippets = @(), [int]$countOverride = -1, $sevCounts = $null) {
     $findings = @($findings)
@@ -2931,7 +2937,7 @@ $script:AuditRateSnap = @{ At = [DateTime]::UtcNow; Done = 0; Launched = 0; Byte
 $script:AuditStartedAt = [DateTime]::UtcNow
 
 $script:AuditWkScript = {
-    param($key, $storageUri, $downloadUrl, $headers, $cap, $knownSize, $cache, $alert)
+    param($key, $storageUri, $downloadUrl, $headers, $cap, $knownSize, $cache, $alert, $contentRules, $contentMap, $win, $capN, $ceil)
     $old = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
     try {
         $size = [int64]$knownSize
@@ -2945,13 +2951,13 @@ $script:AuditWkScript = {
                 $we = Get-WkError $_
                 if ($we.Code -eq 429 -or $we.Code -eq 503) { $alert.Message = "Server rate-limited an audit request (HTTP $($we.Code))."; $alert.At = [DateTime]::UtcNow }
                 if ($size -lt 0) {
-                    $cache[$key] = [PSCustomObject]@{ Ok=$false; Size=-1; Modified=''; Text=$null; TooBig=$false; Error=$we.Message }
+                    $cache[$key] = [PSCustomObject]@{ Ok=$false; Size=-1; Modified=''; TooBig=$false; Error=$we.Message; TextLen=0; Scan=$null }
                     return
                 }
             }
         }
         if ($size -ge 0 -and $size -gt $cap) {
-            $cache[$key] = [PSCustomObject]@{ Ok=$true; Size=$size; Modified=$modified; Text=$null; TooBig=$true; Error='' }
+            $cache[$key] = [PSCustomObject]@{ Ok=$true; Size=$size; Modified=$modified; TooBig=$true; Error=''; TextLen=0; Scan=$null }
             return
         }
         $req = [System.Net.WebRequest]::Create($downloadUrl)
@@ -2979,11 +2985,12 @@ $script:AuditWkScript = {
         if ($len -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $start = 3 }
         $text = [Text.Encoding]::UTF8.GetString($bytes, $start, $len - $start)
         if ($size -lt 0) { $size = $full }   # unknown size: best-effort (the scanned amount, capped at $cap)
-        $cache[$key] = [PSCustomObject]@{ Ok=$true; Size=$size; Modified=$modified; Text=$text; TooBig=$false; Error='' }
+        $scan = Test-AuditContent $text $contentRules $contentMap $win $capN $ceil
+        $cache[$key] = [PSCustomObject]@{ Ok=$true; Size=$size; Modified=$modified; TooBig=$false; Error=''; TextLen=[long]$text.Length; Scan=$scan }
     } catch {
         $we = Get-WkError $_
         if ($we.Code -eq 429 -or $we.Code -eq 503) { $alert.Message = "Server rate-limited an audit request (HTTP $($we.Code))."; $alert.At = [DateTime]::UtcNow }
-        $cache[$key] = [PSCustomObject]@{ Ok=$false; Size=-1; Modified=''; Text=$null; TooBig=$false; Error=$we.Message }
+        $cache[$key] = [PSCustomObject]@{ Ok=$false; Size=-1; Modified=''; TooBig=$false; Error=$we.Message; TextLen=0; Scan=$null }
     } finally { $ProgressPreference = $old }
 }
 
@@ -3200,14 +3207,14 @@ function Complete-AuditJob($rec) {
     $script:AuditDone++
     [void]$script:AuditDecided.Add((Get-AuditKeyHash $key))
     if ($null -eq $res) { return }
-    if ($res.Ok -and $res.Text) {
-        $cf = Test-AuditContent $res.Text $rec.ContentRules
+    if ($res.Ok -and $null -ne $res.Scan) {
+        $cf = $res.Scan
         if (@($cf.Findings).Count -gt 0) {
             Add-AuditFinding $rec (Resolve-AuditFindings $cf.Findings $cf.Snippets $cf.Count $cf.SevCounts) $res.Size $res.Modified
-            $script:AuditBytes += [long]$res.Text.Length
+            $script:AuditBytes += [long]$res.TextLen
             return
         }
-        $script:AuditBytes += [long]$res.Text.Length
+        $script:AuditBytes += [long]$res.TextLen
     }
     if ($script:AuditEmitSkipped -and $res.Ok -and $res.TooBig -and $rec.Previewable -and -not $script:AuditFindingIdx.ContainsKey($key)) {
         Add-AuditFinding $rec @{ Sev='Informational'; Rank=1; Rule=$script:AuditOversizeRule; AllRules=$script:AuditOversizeRule; Count=1 } $res.Size $res.Modified
@@ -3218,6 +3225,10 @@ function Dispatch-AuditWork {
     $maxc  = [Math]::Max(1, [Math]::Min($script:AuditMaxWorkers, [int]$script:AuditThrottle.MaxConcurrent))
     $iv    = [int]$script:AuditThrottle.MinIntervalMs
     $headers = Get-AuthHeaders
+    $contentMap = (Get-AuditRuleSet).Content
+    $scanWin    = [int]$script:AuditPreviewWindow
+    $scanCap    = [int]$script:AuditPreviewMax
+    $scanCeil   = [int]$script:AuditPreviewCountCeil
     while ($script:AuditJobs.Count -lt $maxc -and $script:AuditQueue.Count -gt 0) {
         if ($iv -gt 0 -and ([DateTime]::UtcNow - $script:AuditLastLaunch).TotalMilliseconds -lt $iv) { break }
         $rec = $script:AuditQueue.Dequeue()
@@ -3235,10 +3246,13 @@ function Dispatch-AuditWork {
                 AddArgument($rec.Headers).AddArgument($rec.Ua).AddArgument($script:AuditFetch).AddArgument($script:Alert)
         } else {
             $cap = if ($rec.ContainsKey('Cap')) { [long]$rec.Cap } else { [long]$script:AuditCapActive }
+            [void]$ps.AddScript($script:AuditScanFn)   # define Test-AuditContent/Get-AuditSnippet in the worker scope
             [void]$ps.AddScript($script:AuditWkScript).
                 AddArgument($rec.Key).AddArgument($rec.Uri).AddArgument($rec.Url).
                 AddArgument($headers).AddArgument($cap).
-                AddArgument([long]$rec.KnownSize).AddArgument($script:AuditFetch).AddArgument($script:Alert)
+                AddArgument([long]$rec.KnownSize).AddArgument($script:AuditFetch).AddArgument($script:Alert).
+                AddArgument(@($rec.ContentRules)).AddArgument($contentMap).
+                AddArgument($scanWin).AddArgument($scanCap).AddArgument($scanCeil)
         }
         $script:AuditJobs.Add([PSCustomObject]@{ PS=$ps; Handle=$ps.BeginInvoke(); Key=$rec.Key; Rec=$rec; Kind=$kind })
         $script:AuditLastLaunch = [DateTime]::UtcNow
