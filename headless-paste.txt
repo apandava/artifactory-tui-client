@@ -812,6 +812,50 @@ $script:ArcAttempted       = New-Object 'System.Collections.Generic.HashSet[stri
 $script:ArcSkipVersions  = $true
 $script:ArcVersionSeen   = New-Object 'System.Collections.Generic.HashSet[string]'
 
+$script:SkipRecommended = $true
+$script:RxIc = ([Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant')
+$script:SkipRecBuiltin = @(
+    [regex]::new('(^|/)builds/\d+/workflow/\d+\.xml$', $script:RxIc)
+)
+$script:SkipRecProtect = @(
+    [regex]::new('(^|/)credentials\.xml$',             $script:RxIc)
+    [regex]::new('(^|/)config\.xml$',                  $script:RxIc)
+    [regex]::new('(^|/)build\.xml$',                   $script:RxIc)
+    [regex]::new('(^|/)secrets/master\.key$',          $script:RxIc)
+    [regex]::new('(^|/)secrets/hudson\.util\.secret$', $script:RxIc)
+    [regex]::new('(^|/)injectedenvvars\.txt$',         $script:RxIc)
+    [regex]::new('(^|/)log$',                          $script:RxIc)
+    [regex]::new('\.log$',                             $script:RxIc)
+)
+$script:SkipRecGlobs = @()
+
+function Set-SkipRecommendedGlobs([string]$terms) {
+    foreach ($t in @("$terms" -split '[,\s]+')) {
+        if (-not $t) { continue }
+        $sb = [Text.StringBuilder]::new(); [void]$sb.Append('^')
+        foreach ($ch in $t.ToCharArray()) {
+            switch ($ch) {
+                '*'     { [void]$sb.Append('.*') }
+                '?'     { [void]$sb.Append('.') }
+                default { [void]$sb.Append([regex]::Escape([string]$ch)) }
+            }
+        }
+        [void]$sb.Append('$')
+        $script:SkipRecGlobs += [regex]::new($sb.ToString(), $script:RxIc)
+    }
+}
+
+function Test-RecommendedSkipFile([string]$repo, [string]$path, [string]$name) {
+    if (-not $script:SkipRecommended) { return $false }
+    $rel = if ($path) { "$path/$name" } else { [string]$name }
+    if (-not $rel) { return $false }
+    $rl = $rel.ToLowerInvariant()
+    foreach ($rx in $script:SkipRecGlobs)   { if ($rx.IsMatch($rl)) { return $true } }    # user globs win (explicit)
+    foreach ($rx in $script:SkipRecProtect) { if ($rx.IsMatch($rl)) { return $false } }   # never drop a protected file
+    foreach ($rx in $script:SkipRecBuiltin) { if ($rx.IsMatch($rl)) { return $true } }
+    return $false
+}
+
 $script:ArcWalkPS     = $null
 $script:ArcWalkHandle = $null
 $script:ArcWalkCancel = $null
@@ -1242,6 +1286,7 @@ function Save-IndexArchive([string]$arcRepo, [string]$arcDir, [string]$arcName, 
         $cnt = 0
         foreach ($e in @($entries)) {
             if ($null -eq $e) { continue }   # $entries may be $null (empty-list unroll) -> @($null) yields one null
+            if ($script:SkipRecommended -and (Test-RecommendedSkipFile $arcRepo '' ([string]$e.InternalPath))) { $script:IdxSkipRec++; continue }
             $sz = $(if ($e.Size -ge 0) { [long]$e.Size } else { -1 })
             [void]$sb.Append((Format-CsvRow @($arcDir, $arcName, [string]$e.InternalPath, $sz, [string]$e.Modified))).Append("`n")
             $cnt++
@@ -1264,6 +1309,7 @@ function Update-IndexFromMeta($items) {
         if (Get-ItemArchiveName $it) { continue }
         $u = [string]$it.Uri
         if (-not $u -or $script:IndexPersisted.Contains($u) -or -not $script:MetaCache.ContainsKey($u)) { continue }
+        if (Test-RecommendedSkipFile ([string]$it.Repo) ([string]$it.Path) ([string]$it.Name)) { continue }   # skip-recommended: don't write it through
         $m = $script:MetaCache[$u]
         $hasSize = ("$($m.Size)" -ne '' -and "$($m.Size)" -ne '?')
         $hasMod  = ($m.PSObject.Properties['Modified'] -and "$($m.Modified)" -ne '')
@@ -1521,7 +1567,7 @@ function Add-ArcExpandJob([string]$arcUri) {
     $archPath = Get-ArcArchivePath ([string]$item.Path) ([string]$item.Name)
     $canon = Get-ArcArchiveUri $repo $archPath
     if ($script:ArcIndexedArchives.Contains($canon) -or -not $script:ArcAttempted.Add($canon)) { return }
-    if ($script:ArcSkipVersions) {
+    if ($script:SkipRecommended -and $script:ArcSkipVersions) {
         $vk = Get-ArcVersionKey $repo ([string]$item.Path) ([string]$item.Name)
         if (-not $script:ArcVersionSeen.Add($vk)) { return }   # a version of this artifact already taken
     }
@@ -1823,6 +1869,7 @@ $script:IdxDone = 0               # files persisted (or failed)
 $script:IdxSeen = New-Object 'System.Collections.Generic.HashSet[string]'  # uris dispatched this run (intra-run dedupe)
 $script:IdxResume  = $false       # (F) --resume: skip the metadata GET for files already in the shards
 $script:IdxSkipped = 0            # files skipped this run because they were already indexed (resume)
+$script:IdxSkipRec = 0            # files NOT indexed this run because skip-recommended matched them
 
 $script:IdxWalkConcurrency = 8    # aggressive default; overridden by --walkers
 $script:IdxWalkPool   = $null
@@ -1871,9 +1918,13 @@ function Start-IndexWalk {
 
 function Add-IndexFile([string]$uri) {
     if (-not $uri -or -not $script:IdxSeen.Add($uri)) { return }
+    $it = $null
+    if ($script:SkipRecommended -or $script:IdxResume) { $it = Convert-UriToItem $uri }
+    if ($script:SkipRecommended -and (Test-RecommendedSkipFile ([string]$it.Repo) ([string]$it.Path) ([string]$it.Name))) {
+        $script:IdxSkipRec++; return
+    }
     $skipMeta = $false
     if ($script:IdxResume) {
-        $it = Convert-UriToItem $uri
         $rk = Get-IndexRelKey ([string]$it.Path) ([string]$it.Name)
         if ((Get-RepoIndexTable ([string]$it.Repo)).ContainsKey($rk)) { $skipMeta = $true; $script:IdxSkipped++ }
     }
@@ -2018,7 +2069,7 @@ function Invoke-IndexBuildPump {
 function Start-IndexBuild([bool]$full, [bool]$archives, $items) {
     Stop-IndexBuild
     $script:IdxBuildArchives = $archives
-    $script:IdxEnq = 0; $script:IdxDone = 0; $script:IdxSkipped = 0
+    $script:IdxEnq = 0; $script:IdxDone = 0; $script:IdxSkipped = 0; $script:IdxSkipRec = 0
     $script:IdxSeen = New-Object 'System.Collections.Generic.HashSet[string]'
     $script:IdxMetaQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
     $script:IdxOutQueue  = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
@@ -2105,13 +2156,15 @@ function Write-IndexProgressLine([bool]$archives, [datetime]$start, [int]$arcBas
     $fields.Add("[{0} index rows]" -f $script:IndexCount)
     if ($rate -gt 0)             { $fields.Add("[{0:0.0} files/s]" -f $rate) }
     if ($script:IdxSkipped -gt 0) { $fields.Add("[{0} already-indexed skipped]" -f $script:IdxSkipped) }
+    if ($script:IdxSkipRec -gt 0) { $fields.Add("[{0} skip-recommended]" -f $script:IdxSkipRec) }
     if ($status)                 { $fields.Add("[{0}]" -f $status) }
     Write-IdxColor ("...metadata fetched for {0}/{1} discovered files ({2}%) {3}" -f $done, $denom, $pct, ($fields -join ' ')) DarkGray
 }
 
 function Invoke-IndexBuildRun {
     param([bool]$Full, [bool]$Archives, [string]$Query = '', [bool]$AllVersions = $false, [bool]$Resume = $false,
-          [int]$Workers = 0, [int]$Walkers = 0, [int]$ArcWorkers = 0, [int]$DelayMs = -1)
+          [int]$Workers = 0, [int]$Walkers = 0, [int]$ArcWorkers = 0, [int]$DelayMs = -1,
+          [bool]$ScanAll = $false, [string]$SkipGlobs = '')
 
     $script:IndexEnabled = $true
     $script:IdxThrottle.MaxConcurrent = if ($Workers -gt 0)    { [Math]::Max(1, [Math]::Min(100, $Workers)) }    else { 50 }
@@ -2119,14 +2172,16 @@ function Invoke-IndexBuildRun {
     $script:ArcThrottle.MaxConcurrent = if ($ArcWorkers -gt 0) { [Math]::Max(1, [Math]::Min(20,  $ArcWorkers)) } else { 15 }
     $d = if ($DelayMs -ge 0) { $DelayMs } else { 0 }
     $script:IdxThrottle.MinIntervalMs = $d; $script:ArcThrottle.MinIntervalMs = $d
+    $script:SkipRecommended = -not $ScanAll
     $script:ArcSkipVersions = -not $AllVersions
+    if ($SkipGlobs) { Set-SkipRecommendedGlobs $SkipGlobs }
     $script:IdxResume = $Resume
 
     $scopeLabel = if ($Full) { 'entire instance' } else { "search: $Query" }
     $arcLabel   = if ($Archives) { ' (+ listable archives)' } else { '' }
     Write-IdxV 1 "Building index for $scopeLabel$arcLabel"
     Write-IdxV 2 "  index dir: $($script:IndexPath)"
-    Write-IdxV 5 ("  settings: archives=$Archives skip-versions=$($script:ArcSkipVersions) resume=$($script:IdxResume) workers=$($script:IdxThrottle.MaxConcurrent) walkers=$($script:IdxWalkConcurrency) arc-workers=$($script:ArcThrottle.MaxConcurrent) delay=$($script:IdxThrottle.MinIntervalMs)ms queue-cap=$($script:IdxQueueCap) repos='$($script:Repos)' repo-types='$($script:RepoTypeScope -join ",")'")
+    Write-IdxV 5 ("  settings: archives=$Archives skip-recommended=$($script:SkipRecommended) skip-versions=$($script:ArcSkipVersions) skip-globs=$(@($script:SkipRecGlobs).Count) resume=$($script:IdxResume) workers=$($script:IdxThrottle.MaxConcurrent) walkers=$($script:IdxWalkConcurrency) arc-workers=$($script:ArcThrottle.MaxConcurrent) delay=$($script:IdxThrottle.MinIntervalMs)ms queue-cap=$($script:IdxQueueCap) repos='$($script:Repos)' repo-types='$($script:RepoTypeScope -join ",")'")
 
     if ($Full) {
         $walkRepos = @(Get-ArcSearchWalkRepos)
@@ -2162,8 +2217,9 @@ function Invoke-IndexBuildRun {
 
     $secs = [int]([DateTime]::UtcNow - $start).TotalSeconds
     $skipNote = if ($script:IdxSkipped -gt 0) { " ($($script:IdxSkipped) already-indexed file(s) skipped via --resume)" } else { '' }
+    $recNote  = if ($script:IdxSkipRec -gt 0) { " ($($script:IdxSkipRec) file(s)/entry(ies) skipped via skip-recommended)" } else { '' }
     Write-IdxV 1 ''
-    Write-IdxV 1 ("Index build complete in ${secs}s: metadata fetched for $($script:IdxDone) file(s)$skipNote, $($script:IndexCount) index row(s) written this run (top-level + archive entries).")
+    Write-IdxV 1 ("Index build complete in ${secs}s: metadata fetched for $($script:IdxDone) file(s)$skipNote$recNote, $($script:IndexCount) index row(s) written this run (top-level + archive entries).")
     if ($Archives) { Write-IdxV 1 ("  archives expanded (incl. prior runs): $($script:ArcIndexedArchives.Count)") }
     Write-IdxV 2 "  index: $($script:IndexPath)"
 }
@@ -3034,7 +3090,8 @@ function Add-AuditRecord($rec) {
     $script:AuditEnq++
     if ($m.Findings.Count -gt 0) { Add-AuditFinding $rec (Resolve-AuditFindings $m.Findings) }
     $expand = ($rec.IsArchive -and -not $rec.IsArchiveEntry -and $script:AuditWalkArchives)
-    $doContent = ($m.ContentRules.Count -gt 0 -and $script:AuditTier2)
+    $skipRec = (Test-RecommendedSkipFile ([string]$rec.Repo) ([string]$rec.Path) ([string]$rec.Name))
+    $doContent = ($m.ContentRules.Count -gt 0 -and $script:AuditTier2 -and -not $skipRec)
     if ($doContent) {
         $rec.Kind          = 'file'
         $rec.ContentRules  = $m.ContentRules
@@ -3042,7 +3099,7 @@ function Add-AuditRecord($rec) {
         $rec.Previewable    = (Get-IsPreviewable $rec.Name)
         $script:AuditQueue.Enqueue($rec)   # decided once its content fetch completes
     } elseif (-not $expand) {
-        if ($script:AuditTier2ListPath -and $m.ContentRules.Count -gt 0) { Write-AuditTier2ListRow $rec }
+        if ($script:AuditTier2ListPath -and $m.ContentRules.Count -gt 0 -and -not $skipRec) { Write-AuditTier2ListRow $rec }
         elseif ($script:AuditEmitSkipped -and $m.ContentRules.Count -gt 0 -and $m.Findings.Count -eq 0) {
             Add-AuditFinding $rec @{ Sev='Informational'; Rank=1; Rule=$script:AuditSkippedRule; AllRules=$script:AuditSkippedRule; Count=1 }
         }
@@ -3759,6 +3816,8 @@ function ConvertFrom-IndexArgv([string[]]$tokens) {
             '^--no-archives$'    { $p.NoArchives = $true }
             '^--all-versions$'   { $p.AllVersions = $true }
             '^--skip-versions$'  { $p.AllVersions = $false }   # affirms the default (no-op)
+            '^--scan-all$'       { $p.ScanAll   = $true }      # disable ALL skip-recommended (versions + files)
+            '^--skip$'           { $p.SkipGlobs = $tokens[++$i] }   # add user skip globs to skip-recommended
             '^--resume$'         { $p.Resume    = $true }
             '^(-r|--repos)$'     { $p.Repos     = $tokens[++$i] }
             '^--repo-types$'     { $p.RepoTypes = $tokens[++$i] }
@@ -3803,6 +3862,13 @@ Options:
       --no-archives       do NOT expand archives (top-level metadata only)
       --all-versions      expand EVERY version of an archive (default: skip - index only the
                           first version of each artifact, by version-normalized filename)
+      --scan-all          disable ALL skip-recommended heuristics (index every version AND every
+                          curated-noise file, e.g. Jenkins builds/<n>/workflow/<n>.xml). Default:
+                          skip-recommended is ON.
+      --skip <globs>      add your own skip-recommended globs (comma/space separated, '*'/'?';
+                          matched on the repo-relative path/name, e.g. '*/javadoc/*,*.md5'). The
+                          high-value carve-outs (credentials.xml, config.xml, build.xml, secrets/*,
+                          *.log, injectedEnvVars.txt) are NOT protected from your own --skip.
       --resume            skip files already present in the shards (finish/extend an interrupted
                           build). NOTE: does NOT refresh stale rows - the index is a point-in-time
                           snapshot; --resume only adds what's missing.
@@ -3825,7 +3891,8 @@ Auth:
 
 function Invoke-IndexBuildCore {
     param(
-        [switch]$Full, [string]$Query, [switch]$Archives, [switch]$NoArchives, [switch]$AllVersions, [switch]$Resume, [string]$Repos,
+        [switch]$Full, [string]$Query, [switch]$Archives, [switch]$NoArchives, [switch]$AllVersions, [switch]$ScanAll, [string]$SkipGlobs,
+        [switch]$Resume, [string]$Repos,
         [string]$RepoTypes, [string]$IndexPath, [int]$Workers, [int]$Walkers, [int]$ArcWorkers, [int]$DelayMs, [int]$Verbosity,
         [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic, [switch]$NoColour
     )
@@ -3859,9 +3926,11 @@ function Invoke-IndexBuildCore {
     $arcWorkers = if ($O.ContainsKey('ArcWorkers')) { [int]$O['ArcWorkers'] } else { 0 }
     $delay      = if ($O.ContainsKey('DelayMs'))    { [int]$O['DelayMs'] }    else { -1 }
     $allVers    = [bool]($O.ContainsKey('AllVersions') -and $O['AllVersions'])
+    $scanAll    = [bool]($O.ContainsKey('ScanAll') -and $O['ScanAll'])
+    $skipGlobs  = if ($O.ContainsKey('SkipGlobs')) { [string]$O['SkipGlobs'] } else { '' }
     $resume     = [bool]($O.ContainsKey('Resume') -and $O['Resume'])
     Invoke-IndexBuildRun -Full $full -Archives $archives -Query $query -AllVersions $allVers -Resume $resume `
-        -Workers $workers -Walkers $walkers -ArcWorkers $arcWorkers -DelayMs $delay
+        -Workers $workers -Walkers $walkers -ArcWorkers $arcWorkers -DelayMs $delay -ScanAll $scanAll -SkipGlobs $skipGlobs
 }
 
 function Invoke-IndexBuild {
@@ -4087,6 +4156,8 @@ function ConvertFrom-AuditArgv([string[]]$tokens) {
             '^(-w|--walk-archives)$' { $p.WalkArchives = $true }
             '^--all-versions$'       { $p.AllVersions  = $true }
             '^--skip-versions$'      { $p.AllVersions  = $false }   # affirms the default (no-op)
+            '^--scan-all$'           { $p.ScanAll      = $true }    # disable ALL skip-recommended (versions + files)
+            '^--skip$'               { $p.SkipGlobs    = $tokens[++$i] }   # add user skip globs to skip-recommended
             '^(-x|--exclude)$'       { $p.Exclude      = $tokens[++$i] }
             '^(-s|--from-log)$'      { $p.FromLog      = $tokens[++$i] }
             '^--max-size$'           { $p.MaxSize      = $tokens[++$i] }
@@ -4156,7 +4227,17 @@ Audit options (audit verb):
   -r, --repos <a,b>       restrict to these indexed repositories (bypasses the type filter)
       --repo-types <list> indexed repo rclasses to audit (default: local). e.g. local,remote or
                           'all' (every non-virtual repo). --all-repos is shorthand for 'all'.
-  -x, --exclude <globs>   comma/space globs to exclude from the set (e.g. "*.xml,*test*")
+  -x, --exclude <globs>   comma/space globs to exclude from the DOWNLOAD set (e.g. "*.xml,*test*";
+                          matched on the filename - the file is still audited/catalogued, just not
+                          downloaded). Distinct from --skip below, which skips the SCAN itself.
+      --scan-all          disable skip-recommended: Tier-2 content-scan EVERY file, including
+                          curated noise like Jenkins builds/<n>/workflow/<n>.xml (and, with
+                          --populate-index, index every archive version too). Default: ON.
+      --skip <globs>      add your own skip-recommended globs (comma/space, '*'/'?'; matched on the
+                          repo-relative path/name, e.g. '*/workflow/*,*/javadoc/*'). These files are
+                          NOT content-scanned. The high-value carve-outs (credentials.xml, config.xml,
+                          build.xml, secrets/*, *.log, injectedEnvVars.txt) are skipped only if YOUR
+                          --skip glob names them (the curated set never touches them).
       --preview-count <n> max content-match snippets stored per file in audit-log.csv's
                           MatchedContentPreview column (JSON array). Default 10; 0 = no snippets
                           (MatchCount still recorded). NOTE: previews contain matched content, which
@@ -4173,6 +4254,8 @@ Search options (search verb):
   -w, --walk-archives     also walk listable archives and add matching internal entries
       --all-versions      walk EVERY version of an archive (default: skip - walk only the
                           first version of each artifact, by version-normalized filename)
+      --scan-all          disable ALL skip-recommended (index every version AND every curated-noise
+                          file). --skip <globs> adds your own skip patterns. Default: ON.
       --offline <mode>    don't query the server for search; use the local index as the catalogue.
                           'index' still fetches archive listings on demand; 'all' makes no
                           requests at all (matches come only from the index).
@@ -4206,6 +4289,14 @@ function Set-AuditPreviewConfig([hashtable]$O) {
     if ($O.ContainsKey('PreviewWindow') -and [int]$O['PreviewWindow'] -ge 0) { $script:AuditPreviewWindow = [int]$O['PreviewWindow'] }
 }
 
+function Set-AuditHeadlessThrottle([hashtable]$O) {
+    $script:AuditThrottle.MaxConcurrent =
+        if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { [Math]::Max(1, [Math]::Min($script:AuditMaxWorkers, [int]$O['Workers'])) }
+        else { [Math]::Min($script:AuditMaxWorkers, 15) }
+    $script:AuditThrottle.MinIntervalMs =
+        if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { [int]$O['DelayMs'] } else { 0 }
+}
+
 function Initialize-AuditRunConfig([hashtable]$O) {
     if ($O.ContainsKey('Verbosity')) { $script:AuditVerbosity = [int]$O['Verbosity'] }
     if ($O.ContainsKey('BaseUrl'))   { $script:BaseUrl = [string]$O['BaseUrl'] }
@@ -4227,11 +4318,7 @@ function Initialize-AuditRunConfig([hashtable]$O) {
     $script:AuditEmitSkipped  = $false
     Set-AuditPreviewConfig $O
     if ($O.ContainsKey('Cap') -and [long]$O['Cap'] -gt 0)        { $script:AuditCap = [long]$O['Cap'] }
-    $script:AuditThrottle.MaxConcurrent =
-        if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { [Math]::Max(1, [Math]::Min($script:AuditMaxWorkers, [int]$O['Workers'])) }
-        else { [Math]::Min($script:AuditMaxWorkers, 15) }
-    $script:AuditThrottle.MinIntervalMs =
-        if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { [int]$O['DelayMs'] } else { 0 }
+    Set-AuditHeadlessThrottle $O
 }
 
 function Update-AuditExcludedHeadless {
@@ -4406,7 +4493,9 @@ function Invoke-HeadlessAudit([hashtable]$O, [bool]$emitList = $false) {
         }
         Write-V 1 'No local index found - building one first (--populate-index)...'
         $script:IndexVerbosity = $script:AuditVerbosity
-        Invoke-IndexBuildRun -Full $true -Archives $true
+        Invoke-IndexBuildRun -Full $true -Archives $true `
+            -ScanAll ([bool]($O.ContainsKey('ScanAll') -and $O['ScanAll'])) `
+            -AllVersions ([bool]($O.ContainsKey('AllVersions') -and $O['AllVersions']))
         $script:IndexManifest = $null; Import-Index $script:IndexPath
         if (-not ([bool]$script:Repos -or @(Get-IndexedRepos).Count -gt 0)) {
             throw "Index build produced nothing to audit at $($script:IndexPath): $(Get-RepoScopeDiagnostic)"
@@ -4563,8 +4652,9 @@ function Initialize-AuditBaseConfig([hashtable]$O, [bool]$requireBaseUrl = $true
     Resolve-RunOutput $O
     Set-AuditPreviewConfig $O
     if ($O.ContainsKey('Cap') -and [long]$O['Cap'] -gt 0)        { $script:AuditCap = [long]$O['Cap'] }
-    if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { $script:AuditThrottle.MaxConcurrent = [Math]::Max(1, [Math]::Min(10, [int]$O['Workers'])) }
-    if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { $script:AuditThrottle.MinIntervalMs = [int]$O['DelayMs'] }
+    Set-AuditHeadlessThrottle $O
+    if ($O.ContainsKey('ScanAll')) { $script:SkipRecommended = -not [bool]$O['ScanAll'] }
+    if ($O.ContainsKey('SkipGlobs') -and $O['SkipGlobs']) { Set-SkipRecommendedGlobs ([string]$O['SkipGlobs']) }
 }
 
 function Invoke-AuditCore {
@@ -4575,6 +4665,7 @@ function Invoke-AuditCore {
         [string]$OutDir, [int]$Verbosity,
         [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic,
         [string]$FromLog, [switch]$DeferTier2, [string]$Tier2Resume, [string]$MaxSize, [switch]$PopulateIndex,
+        [switch]$ScanAll, [string]$SkipGlobs, [switch]$AllVersions,
         [int]$PreviewCount, [int]$PreviewWindow, [switch]$NoColour
     )
     $O = $PSBoundParameters
@@ -4660,6 +4751,7 @@ function Invoke-ArcSearchPumpToDone {
 function Invoke-SearchCore {
     param(
         [string]$Query, [string]$Repos, [string]$RepoTypes, [switch]$WalkArchives, [switch]$AllVersions,
+        [switch]$ScanAll, [string]$SkipGlobs,
         [string]$IndexPath, [switch]$NoIndex, [string]$Offline,
         [long]$Cap, [int]$Workers, [int]$DelayMs,
         [string]$OutDir, [int]$Verbosity,
@@ -4684,7 +4776,9 @@ function Invoke-SearchCore {
     Resolve-IndexPath
     if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { $script:ArcThrottle.MaxConcurrent = [Math]::Max(1, [Math]::Min(10, [int]$O['Workers'])) }
     if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { $script:ArcThrottle.MinIntervalMs = [int]$O['DelayMs'] }
+    if ($O.ContainsKey('ScanAll'))     { $script:SkipRecommended = -not [bool]$O['ScanAll'] }
     if ($O.ContainsKey('AllVersions')) { $script:ArcSkipVersions = -not [bool]$O['AllVersions'] }
+    if ($O.ContainsKey('SkipGlobs') -and $O['SkipGlobs']) { Set-SkipRecommendedGlobs ([string]$O['SkipGlobs']) }
     $walk = [bool]($O.ContainsKey('WalkArchives') -and $O['WalkArchives'])
 
     if ($script:IndexEnabled) {
