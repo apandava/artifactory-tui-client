@@ -322,6 +322,8 @@ function ConvertFrom-AuditArgv([string[]]$tokens) {
             '^(-w|--walk-archives)$' { $p.WalkArchives = $true }
             '^--all-versions$'       { $p.AllVersions  = $true }
             '^--skip-versions$'      { $p.AllVersions  = $false }   # affirms the default (no-op)
+            '^--scan-all$'           { $p.ScanAll      = $true }    # disable ALL skip-recommended (versions + files)
+            '^--skip$'               { $p.SkipGlobs    = $tokens[++$i] }   # add user skip globs to skip-recommended
             '^(-x|--exclude)$'       { $p.Exclude      = $tokens[++$i] }
             '^(-s|--from-log)$'      { $p.FromLog      = $tokens[++$i] }
             '^--max-size$'           { $p.MaxSize      = $tokens[++$i] }
@@ -391,7 +393,17 @@ Audit options (audit verb):
   -r, --repos <a,b>       restrict to these indexed repositories (bypasses the type filter)
       --repo-types <list> indexed repo rclasses to audit (default: local). e.g. local,remote or
                           'all' (every non-virtual repo). --all-repos is shorthand for 'all'.
-  -x, --exclude <globs>   comma/space globs to exclude from the set (e.g. "*.xml,*test*")
+  -x, --exclude <globs>   comma/space globs to exclude from the DOWNLOAD set (e.g. "*.xml,*test*";
+                          matched on the filename - the file is still audited/catalogued, just not
+                          downloaded). Distinct from --skip below, which skips the SCAN itself.
+      --scan-all          disable skip-recommended: Tier-2 content-scan EVERY file, including
+                          curated noise like Jenkins builds/<n>/workflow/<n>.xml (and, with
+                          --populate-index, index every archive version too). Default: ON.
+      --skip <globs>      add your own skip-recommended globs (comma/space, '*'/'?'; matched on the
+                          repo-relative path/name, e.g. '*/workflow/*,*/javadoc/*'). These files are
+                          NOT content-scanned. The high-value carve-outs (credentials.xml, config.xml,
+                          build.xml, secrets/*, *.log, injectedEnvVars.txt) are skipped only if YOUR
+                          --skip glob names them (the curated set never touches them).
       --preview-count <n> max content-match snippets stored per file in audit-log.csv's
                           MatchedContentPreview column (JSON array). Default 10; 0 = no snippets
                           (MatchCount still recorded). NOTE: previews contain matched content, which
@@ -408,6 +420,8 @@ Search options (search verb):
   -w, --walk-archives     also walk listable archives and add matching internal entries
       --all-versions      walk EVERY version of an archive (default: skip - walk only the
                           first version of each artifact, by version-normalized filename)
+      --scan-all          disable ALL skip-recommended (index every version AND every curated-noise
+                          file). --skip <globs> adds your own skip patterns. Default: ON.
       --offline <mode>    don't query the server for search; use the local index as the catalogue.
                           'index' still fetches archive listings on demand; 'all' makes no
                           requests at all (matches come only from the index).
@@ -450,6 +464,20 @@ function Set-AuditPreviewConfig([hashtable]$O) {
 
 # Apply parsed options to script-scope config + engine settings. $O is the caller's
 # bound parameters (only keys actually supplied are present).
+# Headless content-fetch throttle: 15 workers / 0ms delay by default (far more aggressive than the
+# TUI's gentle 3/150), capped at $AuditMaxWorkers (50). Shared by BOTH config entry points so the
+# resume / --tier2-resume / --from-log paths get the same speed as a fresh run. (They used to diverge:
+# Initialize-AuditBaseConfig capped at 10 and left the bare 3-worker / 150ms module default, which -
+# combined with the single-launch pacing Dispatch-AuditWork applies whenever delay>0 - made a resumed
+# Tier-2 scan needlessly slow.)
+function Set-AuditHeadlessThrottle([hashtable]$O) {
+    $script:AuditThrottle.MaxConcurrent =
+        if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { [Math]::Max(1, [Math]::Min($script:AuditMaxWorkers, [int]$O['Workers'])) }
+        else { [Math]::Min($script:AuditMaxWorkers, 15) }
+    $script:AuditThrottle.MinIntervalMs =
+        if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { [int]$O['DelayMs'] } else { 0 }
+}
+
 function Initialize-AuditRunConfig([hashtable]$O) {
     if ($O.ContainsKey('Verbosity')) { $script:AuditVerbosity = [int]$O['Verbosity'] }
     if ($O.ContainsKey('BaseUrl'))   { $script:BaseUrl = [string]$O['BaseUrl'] }
@@ -483,12 +511,7 @@ function Initialize-AuditRunConfig([hashtable]$O) {
     $script:AuditEmitSkipped  = $false
     Set-AuditPreviewConfig $O
     if ($O.ContainsKey('Cap') -and [long]$O['Cap'] -gt 0)        { $script:AuditCap = [long]$O['Cap'] }
-    # Headless throttle DEFAULTS: 15 workers, 0ms delay (more aggressive than the TUI's gentle 3/150).
-    $script:AuditThrottle.MaxConcurrent =
-        if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { [Math]::Max(1, [Math]::Min($script:AuditMaxWorkers, [int]$O['Workers'])) }
-        else { [Math]::Min($script:AuditMaxWorkers, 15) }
-    $script:AuditThrottle.MinIntervalMs =
-        if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { [int]$O['DelayMs'] } else { 0 }
+    Set-AuditHeadlessThrottle $O
 }
 
 # Re-apply the exclude filter to every finding's Included flag (headless equivalent of
@@ -710,7 +733,13 @@ function Invoke-HeadlessAudit([hashtable]$O, [bool]$emitList = $false) {
         # defaults (workers 50 / walkers 20 / arc-workers 15 / delay 0), not the audit ones.
         Write-V 1 'No local index found - building one first (--populate-index)...'
         $script:IndexVerbosity = $script:AuditVerbosity
-        Invoke-IndexBuildRun -Full $true -Archives $true
+        # Forward the skip-recommended scope so the auto-build matches the audit (Invoke-IndexBuildRun
+        # re-derives $SkipRecommended/$ArcSkipVersions from its params; omit -SkipGlobs - Initialize-
+        # AuditBaseConfig already appended the user globs and the build-run only appends, so re-passing
+        # them would double-add).
+        Invoke-IndexBuildRun -Full $true -Archives $true `
+            -ScanAll ([bool]($O.ContainsKey('ScanAll') -and $O['ScanAll'])) `
+            -AllVersions ([bool]($O.ContainsKey('AllVersions') -and $O['AllVersions']))
         $script:IndexManifest = $null; Import-Index $script:IndexPath
         if (-not ([bool]$script:Repos -or @(Get-IndexedRepos).Count -gt 0)) {
             throw "Index build produced nothing to audit at $($script:IndexPath): $(Get-RepoScopeDiagnostic)"
@@ -896,8 +925,15 @@ function Initialize-AuditBaseConfig([hashtable]$O, [bool]$requireBaseUrl = $true
     Resolve-RunOutput $O
     Set-AuditPreviewConfig $O
     if ($O.ContainsKey('Cap') -and [long]$O['Cap'] -gt 0)        { $script:AuditCap = [long]$O['Cap'] }
-    if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { $script:AuditThrottle.MaxConcurrent = [Math]::Max(1, [Math]::Min(10, [int]$O['Workers'])) }
-    if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { $script:AuditThrottle.MinIntervalMs = [int]$O['DelayMs'] }
+    # Same headless throttle as a fresh run (15/0, cap 50) so resume / --tier2-resume / --from-log are
+    # NOT slower than Phase B of an inline -2 (they previously capped at 10 and defaulted to 3/150).
+    Set-AuditHeadlessThrottle $O
+    # Skip-recommended (umbrella, default on - set in Index.ps1): --scan-all turns it off so the audit
+    # Tier-2 pass content-scans every file (including curated-noise like builds/<n>/workflow/<n>.xml);
+    # --skip adds user globs. Applied at audit time too, so a full (--scan-all-built) index is still
+    # filtered here. --populate-index forwards these to the build (see the populate path).
+    if ($O.ContainsKey('ScanAll')) { $script:SkipRecommended = -not [bool]$O['ScanAll'] }
+    if ($O.ContainsKey('SkipGlobs') -and $O['SkipGlobs']) { Set-SkipRecommendedGlobs ([string]$O['SkipGlobs']) }
 }
 
 # ── ENTRY FUNCTION ────────────────────────────────────────────────────────────
@@ -909,6 +945,17 @@ function Initialize-AuditBaseConfig([hashtable]$O, [bool]$requireBaseUrl = $true
 #   -Tier2Resume <f>   Phase B only: content-scan an existing worklist, resumable via its .progress cursor.
 #   -PopulateIndex     if no index exists, build a full+archives index first, then audit.
 #   -FromLog <f>       skip auditing; just download the rows of a prior audit-log.csv.
+# Resolve a user-supplied CLI file path (--tier2-resume, --from-log) to an ABSOLUTE path against the
+# caller's location. Needed because the worklist/log readers mix path resolvers: Test-Path/Get-Content
+# resolve a RELATIVE path against $PWD, but [System.IO.File]::ReadLines resolves against .NET's
+# CurrentDirectory - which does NOT track Set-Location/cd. If the shell's location changed after launch
+# they disagree (the file is "found" by one and missing/duplicated by the other). Expanding once here
+# makes every reader agree. A blank or already-absolute path is returned unchanged.
+function Resolve-AuditInputPath([string]$path) {
+    if (-not $path) { return $path }
+    try { return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($path) } catch { return $path }
+}
+
 # Native-parameter implementation (splat-callable). The public Invoke-Audit front-end below accepts
 # the unix-style flags instead, so paste-mode and the .ps1 share one flag vocabulary.
 function Invoke-AuditCore {
@@ -919,6 +966,7 @@ function Invoke-AuditCore {
         [string]$OutDir, [int]$Verbosity,
         [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic,
         [string]$FromLog, [switch]$DeferTier2, [string]$Tier2Resume, [string]$MaxSize, [switch]$PopulateIndex,
+        [switch]$ScanAll, [string]$SkipGlobs, [switch]$AllVersions,
         [int]$PreviewCount, [int]$PreviewWindow, [switch]$NoColour
     )
     $O = $PSBoundParameters
@@ -931,7 +979,7 @@ function Invoke-AuditCore {
     # previewed via --download <sev,...>|count).
     if ($O.ContainsKey('FromLog') -and $O['FromLog']) {
         Initialize-AuditBaseConfig $O $true
-        Invoke-DownloadFromLog ([string]$O['FromLog']) ([string]$Download) $maxBytes
+        Invoke-DownloadFromLog (Resolve-AuditInputPath ([string]$O['FromLog'])) ([string]$Download) $maxBytes
         return
     }
 
@@ -939,9 +987,10 @@ function Invoke-AuditCore {
     if ($O.ContainsKey('Tier2Resume') -and $O['Tier2Resume']) {
         Initialize-AuditBaseConfig $O $true
         $script:AuditEmitSkipped = $false
-        Write-V 1 "Resuming Tier-2 over worklist $($O['Tier2Resume'])..."
-        if (-not (Start-AuditTier2List ([string]$O['Tier2Resume']))) {
-            throw "Worklist not found or empty: $($O['Tier2Resume'])"
+        $resumePath = Resolve-AuditInputPath ([string]$O['Tier2Resume'])
+        Write-V 1 "Resuming Tier-2 over worklist $resumePath..."
+        if (-not (Start-AuditTier2List $resumePath)) {
+            throw "Worklist not found or empty: $resumePath"
         }
         if ($O.ContainsKey('Exclude')) { Set-AuditExcludes ([string]$O['Exclude']) }
         Invoke-AuditPumpToDone
@@ -1023,6 +1072,7 @@ function Invoke-ArcSearchPumpToDone {
 function Invoke-SearchCore {
     param(
         [string]$Query, [string]$Repos, [string]$RepoTypes, [switch]$WalkArchives, [switch]$AllVersions,
+        [switch]$ScanAll, [string]$SkipGlobs,
         [string]$IndexPath, [switch]$NoIndex, [string]$Offline,
         [long]$Cap, [int]$Workers, [int]$DelayMs,
         [string]$OutDir, [int]$Verbosity,
@@ -1052,9 +1102,12 @@ function Invoke-SearchCore {
     Resolve-IndexPath
     if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { $script:ArcThrottle.MaxConcurrent = [Math]::Max(1, [Math]::Min(10, [int]$O['Workers'])) }
     if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { $script:ArcThrottle.MinIntervalMs = [int]$O['DelayMs'] }
-    # Skip-versions defaults on (set in Index.ps1); --all-versions/-AllVersions walks every
-    # version of each archive. (--skip-versions passes AllVersions=$false, affirming the default.)
+    # Skip-recommended (umbrella, default on - set in Index.ps1): --scan-all disables it entirely
+    # (every version AND every curated-noise file); --all-versions disables only the version part;
+    # --skip adds user globs. (--skip-versions passes AllVersions=$false, affirming the default.)
+    if ($O.ContainsKey('ScanAll'))     { $script:SkipRecommended = -not [bool]$O['ScanAll'] }
     if ($O.ContainsKey('AllVersions')) { $script:ArcSkipVersions = -not [bool]$O['AllVersions'] }
+    if ($O.ContainsKey('SkipGlobs') -and $O['SkipGlobs']) { Set-SkipRecommendedGlobs ([string]$O['SkipGlobs']) }
     $walk = [bool]($O.ContainsKey('WalkArchives') -and $O['WalkArchives'])
 
     # Reuse any prior index for this instance (serves local name-matches + skips re-walking

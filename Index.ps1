@@ -92,6 +92,72 @@ $script:ArcAttempted       = New-Object 'System.Collections.Generic.HashSet[stri
 $script:ArcSkipVersions  = $true
 $script:ArcVersionSeen   = New-Object 'System.Collections.Generic.HashSet[string]'
 
+# ── SKIP-RECOMMENDED (umbrella) ───────────────────────────────────────────────
+# "Skip recommended" is the umbrella, default-on heuristic that omits known-low-value work from
+# the index build AND the audit's Tier-2 content scan. It covers two things:
+#   (1) skip-versions  - expand only the first version of each artifact (the ArcSkipVersions
+#                        machinery above), and
+#   (2) skip-files     - a curated set of low-value file patterns (e.g. Jenkins pipeline flow-node
+#                        files builds/<n>/workflow/<n>.xml - pure scan noise), plus any user globs
+#                        ($SkipRecGlobs, added via --skip).
+# Disable the WHOLE thing with --scan-all ($SkipRecommended=$false); --all-versions disables only
+# (1). The CURATED skips never drop a small PROTECT set of high-value files (credentials.xml,
+# config.xml, build.xml, secrets/master.key, secrets/hudson.util.Secret, build console logs /
+# *.log, injectedEnvVars.txt) - so those stay covered even though they sit beside the skipped
+# noise. A user's OWN --skip glob is honoured verbatim and is NOT protected (explicit intent wins).
+$script:SkipRecommended = $true
+$script:RxIc = ([Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant')
+# Curated built-in skip patterns, matched against a file's lowercased repo-relative path 'path/name'
+# (or an archive entry's internal path). Keep these NARROW so they can't catch a protected file.
+$script:SkipRecBuiltin = @(
+    [regex]::new('(^|/)builds/\d+/workflow/\d+\.xml$', $script:RxIc)
+)
+# High-value files the curated skips must never drop (matched the same way). Not applied to --skip.
+$script:SkipRecProtect = @(
+    [regex]::new('(^|/)credentials\.xml$',             $script:RxIc)
+    [regex]::new('(^|/)config\.xml$',                  $script:RxIc)
+    [regex]::new('(^|/)build\.xml$',                   $script:RxIc)
+    [regex]::new('(^|/)secrets/master\.key$',          $script:RxIc)
+    [regex]::new('(^|/)secrets/hudson\.util\.secret$', $script:RxIc)
+    [regex]::new('(^|/)injectedenvvars\.txt$',         $script:RxIc)
+    [regex]::new('(^|/)log$',                          $script:RxIc)
+    [regex]::new('\.log$',                             $script:RxIc)
+)
+# User-added skip globs (--skip '<glob,glob>'), compiled to whole-path-anchored regexes.
+$script:SkipRecGlobs = @()
+
+# Compile comma/whitespace-separated globs into path-anchored regexes ('*'=any run incl '/',
+# '?'=one char) and APPEND them to the user skip set. Matched against the lowercased 'path/name'.
+function Set-SkipRecommendedGlobs([string]$terms) {
+    foreach ($t in @("$terms" -split '[,\s]+')) {
+        if (-not $t) { continue }
+        $sb = [Text.StringBuilder]::new(); [void]$sb.Append('^')
+        foreach ($ch in $t.ToCharArray()) {
+            switch ($ch) {
+                '*'     { [void]$sb.Append('.*') }
+                '?'     { [void]$sb.Append('.') }
+                default { [void]$sb.Append([regex]::Escape([string]$ch)) }
+            }
+        }
+        [void]$sb.Append('$')
+        $script:SkipRecGlobs += [regex]::new($sb.ToString(), $script:RxIc)
+    }
+}
+
+# True when a file should be skipped by skip-recommended. For a top-level file pass its repo-relative
+# ($path,$name); for an archive entry pass the whole internal path as $name with $path ''. Always
+# $false when --scan-all turned the umbrella off.
+function Test-RecommendedSkipFile([string]$repo, [string]$path, [string]$name) {
+    if (-not $script:SkipRecommended) { return $false }
+    $rel = if ($path) { "$path/$name" } else { [string]$name }
+    if (-not $rel) { return $false }
+    $rl = $rel.ToLowerInvariant()
+    foreach ($rx in $script:SkipRecGlobs)   { if ($rx.IsMatch($rl)) { return $true } }    # user globs win (explicit)
+    foreach ($rx in $script:SkipRecProtect) { if ($rx.IsMatch($rl)) { return $false } }   # never drop a protected file
+    foreach ($rx in $script:SkipRecBuiltin) { if ($rx.IsMatch($rl)) { return $true } }
+    return $false
+}
+
 # Background storage walker (finds archive files) - same runspace pattern the audit
 # full-walk uses, but emits ONLY archive files.
 $script:ArcWalkPS     = $null
@@ -646,6 +712,9 @@ function Save-IndexArchive([string]$arcRepo, [string]$arcDir, [string]$arcName, 
         $cnt = 0
         foreach ($e in @($entries)) {
             if ($null -eq $e) { continue }   # $entries may be $null (empty-list unroll) -> @($null) yields one null
+            # Skip-recommended: drop a curated low-value internal entry from the index (matched on its
+            # whole internal path). $SkipRecGlobs/protect/builtin apply exactly as for top-level files.
+            if ($script:SkipRecommended -and (Test-RecommendedSkipFile $arcRepo '' ([string]$e.InternalPath))) { $script:IdxSkipRec++; continue }
             $sz = $(if ($e.Size -ge 0) { [long]$e.Size } else { -1 })
             [void]$sb.Append((Format-CsvRow @($arcDir, $arcName, [string]$e.InternalPath, $sz, [string]$e.Modified))).Append("`n")
             $cnt++
@@ -672,6 +741,7 @@ function Update-IndexFromMeta($items) {
         if (Get-ItemArchiveName $it) { continue }
         $u = [string]$it.Uri
         if (-not $u -or $script:IndexPersisted.Contains($u) -or -not $script:MetaCache.ContainsKey($u)) { continue }
+        if (Test-RecommendedSkipFile ([string]$it.Repo) ([string]$it.Path) ([string]$it.Name)) { continue }   # skip-recommended: don't write it through
         $m = $script:MetaCache[$u]
         $hasSize = ("$($m.Size)" -ne '' -and "$($m.Size)" -ne '?')
         $hasMod  = ($m.PSObject.Properties['Modified'] -and "$($m.Modified)" -ne '')
@@ -995,7 +1065,7 @@ function Add-ArcExpandJob([string]$arcUri) {
     # Skip-versions: only expand the first version of each artifact seen this session (the
     # seen-set is also seeded from prior runs via Ensure-ArcIndexedLoaded). Placed after the
     # indexed/attempted guard so an already-attempted archive can't consume a version slot twice.
-    if ($script:ArcSkipVersions) {
+    if ($script:SkipRecommended -and $script:ArcSkipVersions) {
         $vk = Get-ArcVersionKey $repo ([string]$item.Path) ([string]$item.Name)
         if (-not $script:ArcVersionSeen.Add($vk)) { return }   # a version of this artifact already taken
     }
@@ -1386,6 +1456,7 @@ $script:IdxDone = 0               # files persisted (or failed)
 $script:IdxSeen = New-Object 'System.Collections.Generic.HashSet[string]'  # uris dispatched this run (intra-run dedupe)
 $script:IdxResume  = $false       # (F) --resume: skip the metadata GET for files already in the shards
 $script:IdxSkipped = 0            # files skipped this run because they were already indexed (resume)
+$script:IdxSkipRec = 0            # files NOT indexed this run because skip-recommended matched them
 
 # Parallel discovery walk (A): a pool of $IdxWalkConcurrency walker runspaces share $IdxWalkFolderStack
 # (a ConcurrentStack of {Repo;Rel} folders, seeded with repo roots - LIFO for depth-first descent)
@@ -1462,12 +1533,19 @@ function Start-IndexWalk {
 # archive-indexing is on, ALSO enqueue an arc expansion (the reused engine indexes its entries).
 function Add-IndexFile([string]$uri) {
     if (-not $uri -or -not $script:IdxSeen.Add($uri)) { return }
+    # Skip-recommended: don't index a curated low-value file at all (and so it never reaches the
+    # worklist/audit either). Cheap path-parse only when the umbrella is on.
+    # Parse once (reused by the skip-recommended check + the resume check below).
+    $it = $null
+    if ($script:SkipRecommended -or $script:IdxResume) { $it = Convert-UriToItem $uri }
+    if ($script:SkipRecommended -and (Test-RecommendedSkipFile ([string]$it.Repo) ([string]$it.Path) ([string]$it.Name))) {
+        $script:IdxSkipRec++; return
+    }
     # Resume (F): if this file's row is already in its repo shard (from a prior run), skip the
     # metadata GET - the expensive part. We still fall through to archive routing below, because the
     # archive's INTERNAL entries may not have been expanded yet (Add-ArcExpandJob has its own skip-set).
     $skipMeta = $false
     if ($script:IdxResume) {
-        $it = Convert-UriToItem $uri
         $rk = Get-IndexRelKey ([string]$it.Path) ([string]$it.Name)
         if ((Get-RepoIndexTable ([string]$it.Repo)).ContainsKey($rk)) { $skipMeta = $true; $script:IdxSkipped++ }
     }
@@ -1631,7 +1709,7 @@ function Invoke-IndexBuildPump {
 function Start-IndexBuild([bool]$full, [bool]$archives, $items) {
     Stop-IndexBuild
     $script:IdxBuildArchives = $archives
-    $script:IdxEnq = 0; $script:IdxDone = 0; $script:IdxSkipped = 0
+    $script:IdxEnq = 0; $script:IdxDone = 0; $script:IdxSkipped = 0; $script:IdxSkipRec = 0
     $script:IdxSeen = New-Object 'System.Collections.Generic.HashSet[string]'
     $script:IdxMetaQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
     $script:IdxOutQueue  = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
@@ -1730,6 +1808,7 @@ function Write-IndexProgressLine([bool]$archives, [datetime]$start, [int]$arcBas
     $fields.Add("[{0} index rows]" -f $script:IndexCount)
     if ($rate -gt 0)             { $fields.Add("[{0:0.0} files/s]" -f $rate) }
     if ($script:IdxSkipped -gt 0) { $fields.Add("[{0} already-indexed skipped]" -f $script:IdxSkipped) }
+    if ($script:IdxSkipRec -gt 0) { $fields.Add("[{0} skip-recommended]" -f $script:IdxSkipRec) }
     if ($status)                 { $fields.Add("[{0}]" -f $status) }
     Write-IdxColor ("...metadata fetched for {0}/{1} discovered files ({2}%) {3}" -f $done, $denom, $pct, ($fields -join ' ')) DarkGray
 }
@@ -1741,7 +1820,8 @@ function Write-IndexProgressLine([bool]$archives, [datetime]$start, [int]$arcBas
 # defaults + drive logic live in exactly one place.
 function Invoke-IndexBuildRun {
     param([bool]$Full, [bool]$Archives, [string]$Query = '', [bool]$AllVersions = $false, [bool]$Resume = $false,
-          [int]$Workers = 0, [int]$Walkers = 0, [int]$ArcWorkers = 0, [int]$DelayMs = -1)
+          [int]$Workers = 0, [int]$Walkers = 0, [int]$ArcWorkers = 0, [int]$DelayMs = -1,
+          [bool]$ScanAll = $false, [string]$SkipGlobs = '')
 
     $script:IndexEnabled = $true
     $script:IdxThrottle.MaxConcurrent = if ($Workers -gt 0)    { [Math]::Max(1, [Math]::Min(100, $Workers)) }    else { 50 }
@@ -1749,14 +1829,16 @@ function Invoke-IndexBuildRun {
     $script:ArcThrottle.MaxConcurrent = if ($ArcWorkers -gt 0) { [Math]::Max(1, [Math]::Min(20,  $ArcWorkers)) } else { 15 }
     $d = if ($DelayMs -ge 0) { $DelayMs } else { 0 }
     $script:IdxThrottle.MinIntervalMs = $d; $script:ArcThrottle.MinIntervalMs = $d
+    $script:SkipRecommended = -not $ScanAll
     $script:ArcSkipVersions = -not $AllVersions
+    if ($SkipGlobs) { Set-SkipRecommendedGlobs $SkipGlobs }
     $script:IdxResume = $Resume
 
     $scopeLabel = if ($Full) { 'entire instance' } else { "search: $Query" }
     $arcLabel   = if ($Archives) { ' (+ listable archives)' } else { '' }
     Write-IdxV 1 "Building index for $scopeLabel$arcLabel"
     Write-IdxV 2 "  index dir: $($script:IndexPath)"
-    Write-IdxV 5 ("  settings: archives=$Archives skip-versions=$($script:ArcSkipVersions) resume=$($script:IdxResume) workers=$($script:IdxThrottle.MaxConcurrent) walkers=$($script:IdxWalkConcurrency) arc-workers=$($script:ArcThrottle.MaxConcurrent) delay=$($script:IdxThrottle.MinIntervalMs)ms queue-cap=$($script:IdxQueueCap) repos='$($script:Repos)' repo-types='$($script:RepoTypeScope -join ",")'")
+    Write-IdxV 5 ("  settings: archives=$Archives skip-recommended=$($script:SkipRecommended) skip-versions=$($script:ArcSkipVersions) skip-globs=$(@($script:SkipRecGlobs).Count) resume=$($script:IdxResume) workers=$($script:IdxThrottle.MaxConcurrent) walkers=$($script:IdxWalkConcurrency) arc-workers=$($script:ArcThrottle.MaxConcurrent) delay=$($script:IdxThrottle.MinIntervalMs)ms queue-cap=$($script:IdxQueueCap) repos='$($script:Repos)' repo-types='$($script:RepoTypeScope -join ",")'")
 
     if ($Full) {
         $walkRepos = @(Get-ArcSearchWalkRepos)
@@ -1792,8 +1874,9 @@ function Invoke-IndexBuildRun {
 
     $secs = [int]([DateTime]::UtcNow - $start).TotalSeconds
     $skipNote = if ($script:IdxSkipped -gt 0) { " ($($script:IdxSkipped) already-indexed file(s) skipped via --resume)" } else { '' }
+    $recNote  = if ($script:IdxSkipRec -gt 0) { " ($($script:IdxSkipRec) file(s)/entry(ies) skipped via skip-recommended)" } else { '' }
     Write-IdxV 1 ''
-    Write-IdxV 1 ("Index build complete in ${secs}s: metadata fetched for $($script:IdxDone) file(s)$skipNote, $($script:IndexCount) index row(s) written this run (top-level + archive entries).")
+    Write-IdxV 1 ("Index build complete in ${secs}s: metadata fetched for $($script:IdxDone) file(s)$skipNote$recNote, $($script:IndexCount) index row(s) written this run (top-level + archive entries).")
     if ($Archives) { Write-IdxV 1 ("  archives expanded (incl. prior runs): $($script:ArcIndexedArchives.Count)") }
     Write-IdxV 2 "  index: $($script:IndexPath)"
 }

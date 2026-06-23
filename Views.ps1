@@ -816,8 +816,9 @@ function Show-Page([string]$Query, [object[]]$Items, [int]$Page,
         if ($script:ArcSearchEnabled) {
             $wLbl = if ($script:ArcSearchState -eq 'walking') { "${YL}archive search: on (walking)${R}${DM}" } else { "${YL}archive search: on${R}${DM}" }
             $nav.Add("${BD}${LB}w${RB}${R}${DM} $wLbl${R}")
-            # Skip-versions toggle: only meaningful while the archive walk is active.
-            $vLbl = if ($script:ArcSkipVersions) { 'skip-versions: on' } else { 'skip-versions: off' }
+            # Skip-versions toggle: only meaningful while the archive walk is active. Version-skip is
+            # under the skip-recommended umbrella, so it's effectively off when --scan-all turned that off.
+            $vLbl = if ($script:SkipRecommended -and $script:ArcSkipVersions) { 'skip-versions: on' } else { 'skip-versions: off' }
             $nav.Add("${BD}${LB}V${RB}${R}${DM} $vLbl${R}")
         } else {
             $nav.Add("${BD}${LB}w${RB}${R}${DM} archive search${R}")

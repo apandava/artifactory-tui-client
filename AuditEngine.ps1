@@ -900,7 +900,7 @@ $script:AuditWkScript = {
         # download then); if the size is known we proceed and just leave Modified blank.
         if ($storageUri) {
             try {
-                $info = Invoke-RestMethod -Uri $storageUri -Headers $headers -ErrorAction Stop
+                $info = Invoke-RestMethod -Uri $storageUri -Headers $headers -TimeoutSec 60 -ErrorAction Stop
                 if ($size -lt 0 -and $info.PSObject.Properties['size']) { $size = [int64]$info.size }
                 if ($info.PSObject.Properties['lastModified'])           { $modified = "$($info.lastModified)" }
             } catch {
@@ -916,16 +916,39 @@ $script:AuditWkScript = {
             $cache[$key] = [PSCustomObject]@{ Ok=$true; Size=$size; Modified=$modified; Text=$null; TooBig=$true; Error='' }
             return
         }
-        $resp  = Invoke-WebRequest -Uri $downloadUrl -Headers $headers -UseBasicParsing -ErrorAction Stop
-        $bytes = if ($resp.RawContentStream) { $resp.RawContentStream.ToArray() }
-                 elseif ($resp.Content -is [byte[]]) { [byte[]]$resp.Content }
-                 else { [Text.Encoding]::UTF8.GetBytes([string]$resp.Content) }
+        # BOUNDED content fetch: read AT MOST $cap bytes. We only ever scan the first $cap, so there is
+        # no reason to transfer more - and transferring more is exactly what wedged the run: a file whose
+        # size is UNKNOWN (-1, so the >cap pre-check above can't skip it) skips straight here, and
+        # Invoke-WebRequest buffers the WHOLE body before returning, so a multi-GB / unknown-size / slow
+        # file downloads in full - one such job sits as jobs:1 and the Tier-2 drain barrier freezes the
+        # rest (the "999/1000" stall; -TimeoutSec only bounds the response HEADERS, not the body). Use a
+        # raw HttpWebRequest: Range-limit the request AND hard-cap the stream read (in case the server
+        # ignores Range), with connect (Timeout) and per-read (ReadWriteTimeout) limits.
+        $req = [System.Net.WebRequest]::Create($downloadUrl)
+        $req.Method = 'GET'
+        $req.Timeout = 60000; $req.ReadWriteTimeout = 60000
+        if ($headers) { foreach ($hk in $headers.Keys) { try { $req.Headers[[string]$hk] = [string]$headers[$hk] } catch { } } }
+        try { $req.AddRange(0, [long]$cap) } catch { }   # ask for the first cap+1 bytes (best-effort)
+        $ms = New-Object System.IO.MemoryStream
+        $resp = $req.GetResponse()
+        try {
+            $rs  = $resp.GetResponseStream()
+            $buf = New-Object byte[] 65536
+            $tot = 0L
+            while ($tot -lt $cap) {
+                $want = [int][Math]::Min([long]$buf.Length, ($cap - $tot))
+                $n = $rs.Read($buf, 0, $want)
+                if ($n -le 0) { break }
+                $ms.Write($buf, 0, $n); $tot += $n
+            }
+        } finally { try { $resp.Close() } catch { } }
+        $bytes = $ms.ToArray()
         $full = $bytes.Length
         $len  = if ($full -gt $cap) { $cap } else { $full }
         $start = 0
         if ($len -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $start = 3 }
         $text = [Text.Encoding]::UTF8.GetString($bytes, $start, $len - $start)
-        if ($size -lt 0) { $size = $full }
+        if ($size -lt 0) { $size = $full }   # unknown size: best-effort (the scanned amount, capped at $cap)
         # NOTE: Modified comes only from the storage API ($info.lastModified, ISO 8601)
         # so it always renders in the same yyyy-MM-dd form as the search view. We do NOT
         # read the HTTP Last-Modified header here — that's RFC 1123 ("Fri, 28 Aug ...")
@@ -945,7 +968,7 @@ $script:AuditArcScript = {
     param($key, $uri, $body, $headers, $ua, $cache, $alert)
     try {
         $resp = Invoke-RestMethod -Uri $uri -Method Post -Body $body `
-                    -ContentType 'application/json' -Headers $headers -UserAgent $ua -ErrorAction Stop
+                    -ContentType 'application/json' -Headers $headers -UserAgent $ua -TimeoutSec 60 -ErrorAction Stop
         $data = if ($resp.PSObject.Properties['data'] -and $resp.data) { @(@($resp.data) | Where-Object { $null -ne $_ }) } else { @() }
         $cache[$key] = [PSCustomObject]@{ Ok=$true; Nodes=$data; Error='' }
     } catch {
@@ -1102,9 +1125,14 @@ function Add-AuditRecord($rec) {
     # "decided" only once that expansion completes. Disabled when the user has turned
     # off "Walk through listable archives" — then it's classified as a plain file.
     $expand = ($rec.IsArchive -and -not $rec.IsArchiveEntry -and $script:AuditWalkArchives)
+    # Skip-recommended: a curated low-value file (e.g. a Jenkins workflow flow-node) keeps its cheap
+    # Tier-1 name/path finding (above) but is NOT content-scanned and never reaches the worklist.
+    # Honours the same umbrella/PROTECT/--skip rules as the index build (Test-RecommendedSkipFile),
+    # so an index built WITHOUT skip-recommended (--scan-all) is still filtered at audit time.
+    $skipRec = (Test-RecommendedSkipFile ([string]$rec.Repo) ([string]$rec.Path) ([string]$rec.Name))
     # Content (Tier 2) fetch only when enabled; Tier-1-only audits skip it and decide
     # the file on its metadata findings alone.
-    $doContent = ($m.ContentRules.Count -gt 0 -and $script:AuditTier2)
+    $doContent = ($m.ContentRules.Count -gt 0 -and $script:AuditTier2 -and -not $skipRec)
     if ($doContent) {
         $rec.Kind          = 'file'
         $rec.ContentRules  = $m.ContentRules
@@ -1117,7 +1145,7 @@ function Add-AuditRecord($rec) {
         # Tier-2 flow) write it through to disk for a later/continued Tier-2 pass - EVERY relay file,
         # including ones that already earned a Tier-1 finding (so Phase B can still content-enrich
         # them). Streamed, not retained.
-        if ($script:AuditTier2ListPath -and $m.ContentRules.Count -gt 0) { Write-AuditTier2ListRow $rec }
+        if ($script:AuditTier2ListPath -and $m.ContentRules.Count -gt 0 -and -not $skipRec) { Write-AuditTier2ListRow $rec }
         # Otherwise (no worklist), optionally surface the synthetic skipped finding so the TUI can
         # show what Tier-2 would cover. Default-excluded, never written to a CSV; suppressed headless
         # ($AuditEmitSkipped off) since at multi-million scale one per relay file is pure memory waste.
@@ -1175,6 +1203,8 @@ function Receive-AuditJobs {
             try { [void]$j.PS.EndInvoke($j.Handle) } catch { }
             try { $j.PS.Dispose() } catch { }
             if ($j.Kind -eq 'archive') { Complete-ArchiveJob $j.Rec } else { Complete-AuditJob $j.Rec }
+            # Tier-2 worklist feeder: this row's async work is done -> advance the contiguous cursor.
+            if ($script:AuditT2Active -and $null -ne $j.Rec -and $j.Rec.ContainsKey('T2Seq')) { Mark-AuditT2Done ([int]$j.Rec.T2Seq) }
         } else { $still.Add($j) }
     }
     $script:AuditJobs = $still
@@ -1590,17 +1620,27 @@ function Stop-AuditIndexWalk {
 # ── TIER-2 WORKLIST FEEDER (Phase B, resumable) ───────────────────────────────
 # Stream a Phase-A worklist (repo,path,name,archive,size,modified,url) back in, building a work record
 # per row and feeding it to Add-AuditRecord with Tier-2 ON so the existing fetch pool content-scans it.
-# Resumable via a progress cursor: a sidecar (<worklist>.progress) holds the count of fully-committed
-# rows. Batch-drain keeps the cursor correct despite out-of-order worker completion - a batch is only
-# committed once the queue + in-flight jobs have fully drained, then the next batch is read. On EOF the
-# worklist + sidecar are deleted. Memory: one batch of records + in-flight fetch content (dropped by
-# Complete-AuditJob) + findings (matches only).
+# CONTINUOUS REFILL (no batch barrier): each tick tops the queue back up to ~2x the worker cap, so one
+# slow straggler can never drain + starve the pool (the old fixed-batch drain barrier did - it idled the
+# whole pool at every 1000-row boundary while the slowest item finished). Resumable via a progress
+# cursor (<worklist>.progress = count of fully-committed rows). Correctness despite OUT-OF-ORDER worker
+# completion: every row gets its absolute index (T2Seq); a sync-decided row (Add-AuditRecord enqueued no
+# job) is marked done at once, an async row when its job is reaped (Receive-AuditJobs -> Mark-AuditT2Done).
+# The cursor only advances over the CONTIGUOUS completed prefix (AuditT2Done holds the out-of-order
+# stragglers' indices until the gap fills). Read-ahead is bounded ($AuditT2MaxAhead beyond the commit
+# point) so AuditT2Done + the re-scan-on-crash window stay small; on a clean pause Stop flushes the exact
+# cursor, so re-scan is ~0. On full completion the worklist + sidecar are deleted. Memory: ~queue (<=
+# target) + in-flight content (dropped by Complete-AuditJob) + AuditT2Done ints + findings (matches).
 $script:AuditT2Active    = $false
 $script:AuditT2Enum      = $null     # ReadLines enumerator over the worklist (positioned past header + cursor)
 $script:AuditT2Path      = ''        # worklist path
-$script:AuditT2Cursor    = 0         # rows committed (persisted to the sidecar)
-$script:AuditT2Batch     = 0         # rows read into the current in-flight batch (not yet committed)
-$script:AuditT2BatchSize = 1000
+$script:AuditT2Cursor    = 0         # rows committed, persisted to the sidecar (= AuditT2CommitSeq at save)
+$script:AuditT2CommitSeq = 0         # contiguous-completed prefix length (next uncommitted absolute index)
+$script:AuditT2SeqNext   = 0         # next absolute row index to read
+$script:AuditT2Total     = 0         # total data rows (file rows - header)
+$script:AuditT2Saved     = 0         # AuditT2CommitSeq last persisted (write-throttle)
+$script:AuditT2Done      = $null     # HashSet[int] of completed seqs ahead of the commit point
+$script:AuditT2MaxAhead  = 8000      # cap read-ahead beyond the commit point (bounds AuditT2Done + re-scan)
 
 function Get-AuditT2CursorPath([string]$path) { return "$path.progress" }
 function Read-AuditT2Cursor([string]$path) {
@@ -1660,18 +1700,25 @@ function Start-AuditTier2List([string]$path, [switch]$KeepFindings) {
         Reset-AuditEngine
     }
     $script:AuditTier2 = $true
+    # Worklist entries are pre-expanded (archive contents are already in the index), so NEVER live-expand
+    # here: it keeps every worklist row a single content/sync decision, so T2Seq maps 1:1 to one
+    # completion (an archive job wouldn't carry the seq and would stall the contiguous cursor forever).
+    $script:AuditWalkArchives = $false
     $script:AuditMode = 'tier2-list'; $script:AuditScope = "worklist: $path"
     $script:AuditCapActive = $script:AuditCap
     $script:AuditStartedAt = [DateTime]::UtcNow
-    $script:AuditT2Path   = $path
-    $script:AuditT2Cursor = Read-AuditT2Cursor $path
-    $script:AuditT2Batch  = 0
-    # Known progress total: the worklist row count is known up front (unlike the streaming index
-    # walk), so count it once (cheap sequential pass, no parse) and expose the rows still to do this
-    # run as the progress denominator instead of letting it grow a batch at a time.
+    $script:AuditT2Path      = $path
+    $script:AuditT2Cursor    = Read-AuditT2Cursor $path
+    $script:AuditT2CommitSeq = $script:AuditT2Cursor
+    $script:AuditT2SeqNext   = $script:AuditT2Cursor
+    $script:AuditT2Saved     = $script:AuditT2Cursor
+    $script:AuditT2Done      = New-Object 'System.Collections.Generic.HashSet[int]'
+    # Known progress total: the worklist row count is known up front (cheap sequential pass, no parse),
+    # so expose the rows still to do this run as the progress denominator.
     $rows = 0
     try { foreach ($ln in [System.IO.File]::ReadLines($path)) { $rows++ } } catch { }
-    $script:AuditEnqTotal = [Math]::Max(0, ($rows - 1) - $script:AuditT2Cursor)   # minus the header, minus committed
+    $script:AuditT2Total  = [Math]::Max(0, $rows - 1)   # minus the header
+    $script:AuditEnqTotal = [Math]::Max(0, $script:AuditT2Total - $script:AuditT2Cursor)
     # Open the reader, skip the header + already-committed rows.
     $script:AuditT2Enum = [System.IO.File]::ReadLines($path).GetEnumerator()
     $skip = 1 + $script:AuditT2Cursor   # header + committed data rows
@@ -1682,27 +1729,49 @@ function Start-AuditTier2List([string]$path, [switch]$KeepFindings) {
     return $true
 }
 
-# One feeder tick: commit the drained batch (advance + persist the cursor), then read + enqueue the next.
+# Mark worklist row $seq as fully processed and advance the cursor over the now-contiguous completed
+# prefix (HashSet.Remove returns $true while the next index is present). Out-of-order completions wait
+# in AuditT2Done until the gap before them fills.
+function Mark-AuditT2Done([int]$seq) {
+    if (-not $script:AuditT2Active -or $seq -lt $script:AuditT2CommitSeq) { return }
+    [void]$script:AuditT2Done.Add($seq)
+    while ($script:AuditT2Done.Remove($script:AuditT2CommitSeq)) { $script:AuditT2CommitSeq++ }
+}
+
+# One feeder tick: top the queue up to ~2x the worker cap (bounded by the read-ahead window + EOF),
+# persist the contiguous-committed cursor (throttled), and finish when everything has drained.
 function Step-AuditTier2List {
     if (-not $script:AuditT2Active) { return }
-    # Wait until the current batch has fully drained so the cursor only advances past completed rows.
-    if (($script:AuditQueue.Count + $script:AuditJobs.Count) -gt 0) { return }
-    if ($script:AuditT2Batch -gt 0) {
-        $script:AuditT2Cursor += $script:AuditT2Batch
-        $script:AuditT2Batch = 0
-        Save-AuditT2Cursor
-    }
-    $read = 0
-    while ($read -lt $script:AuditT2BatchSize) {
-        if (-not $script:AuditT2Enum.MoveNext()) { break }
+    $maxc   = [Math]::Max(1, [Math]::Min($script:AuditMaxWorkers, [int]$script:AuditThrottle.MaxConcurrent))
+    $target = [Math]::Max(64, 2 * $maxc)
+    # Continuous refill: keep the pool fed. Stop at the queue target (don't over-read), at EOF, or once
+    # we're $AuditT2MaxAhead rows ahead of the commit point (a stalled straggler holds the cursor; we
+    # keep dispatching past it up to this window so the pool stays busy without unbounded look-ahead).
+    while ($script:AuditQueue.Count -lt $target -and
+           $script:AuditT2SeqNext -lt $script:AuditT2Total -and
+           ($script:AuditT2SeqNext - $script:AuditT2CommitSeq) -lt $script:AuditT2MaxAhead) {
+        if (-not $script:AuditT2Enum.MoveNext()) { $script:AuditT2Total = $script:AuditT2SeqNext; break }
+        $seq = $script:AuditT2SeqNext; $script:AuditT2SeqNext++
         $line = $script:AuditT2Enum.Current
-        $read++
-        if (-not "$line".Trim()) { continue }
+        if (-not "$line".Trim()) { Mark-AuditT2Done $seq; continue }
         $rec = New-AuditWorkFromListRow (Read-CsvRow $line)
-        if ($rec) { Add-AuditRecord $rec }
+        if (-not $rec) { Mark-AuditT2Done $seq; continue }
+        $rec.T2Seq = $seq
+        $before = $script:AuditQueue.Count
+        Add-AuditRecord $rec
+        # No job enqueued (queue unchanged) => the row was decided synchronously (dedup/discard/no
+        # content rule/skip-recommended) => done now. Otherwise its job carries T2Seq and is marked on reap.
+        if ($script:AuditQueue.Count -eq $before) { Mark-AuditT2Done $seq }
     }
-    if ($read -eq 0) {
-        # EOF: nothing left and the last batch already committed above -> done. Drop the files.
+    # Persist the committed cursor when it has advanced enough (atomic sidecar write).
+    if (($script:AuditT2CommitSeq - $script:AuditT2Saved) -ge 500) {
+        $script:AuditT2Cursor = $script:AuditT2CommitSeq; Save-AuditT2Cursor; $script:AuditT2Saved = $script:AuditT2CommitSeq
+    }
+    # Completion: all rows read, all committed, nothing in flight. Persist final cursor implicitly by
+    # deleting the sidecar. (Active is cleared BEFORE Stop so Stop won't re-persist a deleted sidecar.)
+    if ($script:AuditT2SeqNext -ge $script:AuditT2Total -and
+        $script:AuditT2CommitSeq -ge $script:AuditT2Total -and
+        $script:AuditQueue.Count -eq 0 -and $script:AuditJobs.Count -eq 0) {
         $script:AuditT2Active = $false
         $p = $script:AuditT2Path
         Stop-AuditTier2List
@@ -1712,22 +1781,26 @@ function Step-AuditTier2List {
         }
         return
     }
-    $script:AuditT2Batch = $read
     $script:AuditDirty = $true
 }
 
 function Test-AuditTier2ListActive { return [bool]$script:AuditT2Active }
 
-# Tear down the feeder (dispose the reader). Does NOT delete the worklist/cursor - only full completion
-# (the EOF path in Step-AuditTier2List) does, so an interrupted run stays resumable.
+# Tear down the feeder (dispose the reader). On an INTERRUPT (pause/cancel - Active still set) it flushes
+# the exact committed cursor so the resume restarts at the first not-yet-completed row; it never deletes
+# the worklist/cursor (only Step's completion path does, and it clears Active first so we skip the flush).
 function Stop-AuditTier2List {
+    if ($script:AuditT2Active -and $script:AuditT2Path) {
+        $script:AuditT2Cursor = $script:AuditT2CommitSeq
+        Save-AuditT2Cursor
+    }
     if ($null -ne $script:AuditT2Enum) {
         try { $script:AuditT2Enum.Dispose() } catch { }
         $script:AuditT2Enum = $null
     }
     $script:AuditT2Active = $false
     $script:AuditT2Path   = ''
-    $script:AuditT2Batch  = 0
+    $script:AuditT2Done   = $null
 }
 
 # ── MODE LAUNCHERS ────────────────────────────────────────────────────────────

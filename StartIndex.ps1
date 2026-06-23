@@ -115,6 +115,8 @@ function ConvertFrom-IndexArgv([string[]]$tokens) {
             '^--no-archives$'    { $p.NoArchives = $true }
             '^--all-versions$'   { $p.AllVersions = $true }
             '^--skip-versions$'  { $p.AllVersions = $false }   # affirms the default (no-op)
+            '^--scan-all$'       { $p.ScanAll   = $true }      # disable ALL skip-recommended (versions + files)
+            '^--skip$'           { $p.SkipGlobs = $tokens[++$i] }   # add user skip globs to skip-recommended
             '^--resume$'         { $p.Resume    = $true }
             '^(-r|--repos)$'     { $p.Repos     = $tokens[++$i] }
             '^--repo-types$'     { $p.RepoTypes = $tokens[++$i] }
@@ -159,6 +161,13 @@ Options:
       --no-archives       do NOT expand archives (top-level metadata only)
       --all-versions      expand EVERY version of an archive (default: skip - index only the
                           first version of each artifact, by version-normalized filename)
+      --scan-all          disable ALL skip-recommended heuristics (index every version AND every
+                          curated-noise file, e.g. Jenkins builds/<n>/workflow/<n>.xml). Default:
+                          skip-recommended is ON.
+      --skip <globs>      add your own skip-recommended globs (comma/space separated, '*'/'?';
+                          matched on the repo-relative path/name, e.g. '*/javadoc/*,*.md5'). The
+                          high-value carve-outs (credentials.xml, config.xml, build.xml, secrets/*,
+                          *.log, injectedEnvVars.txt) are NOT protected from your own --skip.
       --resume            skip files already present in the shards (finish/extend an interrupted
                           build). NOTE: does NOT refresh stale rows - the index is a point-in-time
                           snapshot; --resume only adds what's missing.
@@ -184,7 +193,8 @@ Auth:
 # accepts the unix-style flags instead, so paste-mode and the .ps1 share one flag vocabulary.
 function Invoke-IndexBuildCore {
     param(
-        [switch]$Full, [string]$Query, [switch]$Archives, [switch]$NoArchives, [switch]$AllVersions, [switch]$Resume, [string]$Repos,
+        [switch]$Full, [string]$Query, [switch]$Archives, [switch]$NoArchives, [switch]$AllVersions, [switch]$ScanAll, [string]$SkipGlobs,
+        [switch]$Resume, [string]$Repos,
         [string]$RepoTypes, [string]$IndexPath, [int]$Workers, [int]$Walkers, [int]$ArcWorkers, [int]$DelayMs, [int]$Verbosity,
         [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic, [switch]$NoColour
     )
@@ -224,9 +234,11 @@ function Invoke-IndexBuildCore {
     $arcWorkers = if ($O.ContainsKey('ArcWorkers')) { [int]$O['ArcWorkers'] } else { 0 }
     $delay      = if ($O.ContainsKey('DelayMs'))    { [int]$O['DelayMs'] }    else { -1 }
     $allVers    = [bool]($O.ContainsKey('AllVersions') -and $O['AllVersions'])
+    $scanAll    = [bool]($O.ContainsKey('ScanAll') -and $O['ScanAll'])
+    $skipGlobs  = if ($O.ContainsKey('SkipGlobs')) { [string]$O['SkipGlobs'] } else { '' }
     $resume     = [bool]($O.ContainsKey('Resume') -and $O['Resume'])
     Invoke-IndexBuildRun -Full $full -Archives $archives -Query $query -AllVersions $allVers -Resume $resume `
-        -Workers $workers -Walkers $walkers -ArcWorkers $arcWorkers -DelayMs $delay
+        -Workers $workers -Walkers $walkers -ArcWorkers $arcWorkers -DelayMs $delay -ScanAll $scanAll -SkipGlobs $skipGlobs
 }
 
 # Console/paste front-end: takes the SAME unix-style flags as the script (e.g.

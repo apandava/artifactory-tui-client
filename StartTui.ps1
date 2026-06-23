@@ -58,7 +58,9 @@ param(
     [string] $OutDir   = '',
     [string] $IndexPath = '',
     [ValidateSet('', 'index', 'all')]
-    [string] $Offline  = ''
+    [string] $Offline  = '',
+    [switch] $ScanAll,
+    [string] $Skip     = ''
 )
 
 Set-StrictMode -Version Latest
@@ -192,6 +194,11 @@ Resolve-OutputPaths
 if ($script:IndexAvailable) {
     if ($PSBoundParameters.ContainsKey('IndexPath') -and $IndexPath) { Set-IndexPath $IndexPath }
     Resolve-IndexPath
+    # Skip-recommended (umbrella, default on): -ScanAll disables it (index every version + every
+    # curated-noise file as you browse); -Skip adds user globs. Applies to the [w] archive walk +
+    # browse write-through (Save-IndexArchive / Update-IndexFromMeta).
+    if ($ScanAll) { $script:SkipRecommended = $false }
+    if ($Skip)    { Set-SkipRecommendedGlobs $Skip }
     if ($script:IndexEnabled) { Import-Index $script:IndexPath }
     # Route index-scan progress (the offline initial search streams the shards, blocking the UI)
     # through the popup overlay, mirroring $DownloadProgress. Index.ps1 only fires it when offline.
