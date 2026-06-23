@@ -170,7 +170,7 @@ function Get-DownloadLogIndex {
         if (Test-Path -LiteralPath $csv) {
             foreach ($row in (Import-Csv -LiteralPath $csv)) {
                 $u = "$($row.DownloadUrl)"
-                if ($u -and $row.Timestamp) { $map[$u] = @{ FileName = "$($row.FileName)"; Hash = "$($row.Hash)" } }
+                if ($u -and $row.Timestamp) { $map[$u] = @{ FileName = "$($row.FileName)"; Hash = "$($row.Hash)"; HashFileName = "$($row.HashFileName)" } }
             }
         }
     } catch { }   # missing/locked/headless-no-OutDir: just yields an empty map (nothing on disk)
@@ -186,6 +186,9 @@ function Get-DownloadedBytes([string]$url) {
     $rec = $idx[$url]
     $cands = [Collections.Generic.List[string]]::new()
     try {
+        # The log now records the exact disambiguated save name (HashFileName) when one was used,
+        # so prefer it; fall back to the original name and the recomputed dedup tag for older logs.
+        if ($rec.HashFileName) { $cands.Add((Join-Path $script:OutDir $rec.HashFileName)) }
         if ($rec.FileName) {
             $cands.Add((Join-Path $script:OutDir $rec.FileName))
             if ($rec.Hash) { $cands.Add((Join-Path $script:OutDir (Add-NameTag $rec.FileName (Get-DedupTag $rec.Hash $url)))) }
@@ -541,36 +544,64 @@ function Resolve-OutputPaths {
     $script:AuditDir = Join-Path $root 'audit'
 }
 
+# Normalize a content hash for a log's Hash column: keep the '<algo>:' prefix verbatim and
+# UPPERCASE the hex digest (e.g. 'sha256:f04e8a9' -> 'sha256:F04E8A9'). A prefix-less value is
+# uppercased whole; blank stays blank.
+function Format-LogHash([string]$hash) {
+    if (-not $hash) { return '' }
+    $i = $hash.IndexOf(':')
+    if ($i -lt 0) { return $hash.ToUpper() }
+    return $hash.Substring(0, $i + 1) + $hash.Substring($i + 1).ToUpper()
+}
+
 # Append one row to a download/scrape log CSV in the folder the file was saved to
 # (created with a header on first write). Every download — audit or not — is logged;
 # non-audit downloads pass 'N/A' for severity/rule. Quoting is RFC-4180; the file is
 # UTF-8 no-BOM. Failures are swallowed so logging never blocks a download.
-#   -FileName  target csv name (default 'download-log.csv'; 'scrape-log.csv' for scrapes)
-#   -Scrape    write the row with BLANK Timestamp and Hash (a scrape didn't download)
+# Two column layouts share this writer:
+#   download log (-Scrape OFF): Timestamp, FileName, HashFileName, Hash, Repository, Path, Archive,
+#                               SizeBytes, Modified, DownloadUrl, Severity, MatchedRule,
+#                               MatchCount, MatchedContentPreview
+#   scrape log   (-Scrape ON):  FileName, Repository, Path, Archive, SizeBytes, Modified, DownloadUrl,
+#                               Severity, MatchedRule [, MatchCount, MatchedContentPreview]
+# A scrape didn't download anything, so it carries NO Timestamp / Hash / HashFileName columns.
+#   -FileName      target csv name (default 'download-log.csv')
+#   -hashFileName  the disambiguated on-disk name a name-collision was saved under (e.g.
+#                  '5CDAE52.report.html'); blank when saved under the original FileName
 function Write-DownloadLog([string]$dir, [string]$name, [string]$repo, [string]$path, [string]$archive,
                            [long]$sizeBytes, [string]$modified, [string]$url,
                            [string]$severity, [string]$rule, [string]$hash = '',
                            [string]$fileName = 'download-log.csv', [switch]$Scrape,
-                           [int]$matchCount = -1, [string]$contentPreview = '') {
+                           [int]$matchCount = -1, [string]$contentPreview = '', [string]$hashFileName = '') {
     try {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $csv  = Join-Path $dir $fileName
         $q    = { param($v) '"' + ("$v" -replace '"','""') + '"' }
-        # FileName is always the original Artifactory filename; Hash (its sha256) follows
-        # so a bulk download saved under a disambiguated name can still be traced back.
-        $cols = @('Timestamp','FileName','Hash','Repository','Path','Archive','SizeBytes','Modified','DownloadUrl','Severity','MatchedRule')
         $sz   = if ($sizeBytes -ge 0) { "$sizeBytes" } else { '' }
-        $ts   = if ($Scrape) { '' } else { (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') }
-        $hsh  = if ($Scrape) { '' } else { $hash }
-        $row  = @($ts, $name, $hsh, $repo, $path, $archive, $sz, $modified, $url,
-                  $(if ($severity) { $severity } else { 'N/A' }), $(if ($rule) { $rule } else { 'N/A' }))
-        # Optional audit columns (appended at the END so existing index-based readers are unaffected):
-        # the secret-audit match log passes a non-negative count to carry the per-row instance count +
-        # a JSON array of content-match previews. The plain download log leaves matchCount at -1, so its
-        # schema is untouched. Within a file the header + every row agree because the caller is consistent.
-        if ($matchCount -ge 0) {
+        $sevV = if ($severity) { $severity } else { 'N/A' }
+        $rulV = if ($rule) { $rule } else { 'N/A' }
+        if ($Scrape) {
+            # Scrape catalogue (audit-log.csv / <repo>-matches.csv): no file was saved, so no
+            # Timestamp / Hash / HashFileName.
+            $cols = @('FileName','Repository','Path','Archive','SizeBytes','Modified','DownloadUrl','Severity','MatchedRule')
+            $row  = @($name, $repo, $path, $archive, $sz, $modified, $url, $sevV, $rulV)
+        } else {
+            # FileName is always the original Artifactory filename; HashFileName records the
+            # hash-prepended name it was actually saved as when a collision forced one (blank
+            # otherwise); Hash (its uppercase sha256) lets a disambiguated save be traced back.
+            $cols = @('Timestamp','FileName','HashFileName','Hash','Repository','Path','Archive','SizeBytes','Modified','DownloadUrl','Severity','MatchedRule')
+            $row  = @((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $name, $hashFileName, (Format-LogHash $hash),
+                      $repo, $path, $archive, $sz, $modified, $url, $sevV, $rulV)
+        }
+        # MatchCount + MatchedContentPreview close every row. The download log ALWAYS carries them
+        # (a plain non-audit download writes 0 / '[]'); the scrape log carries them whenever the
+        # audit caller supplies a count (it always does). Within a file the header + every row agree.
+        $mc = $matchCount
+        if (-not $Scrape -and $mc -lt 0) { $mc = 0 }
+        if ($mc -ge 0) {
+            $cp = if ($contentPreview) { $contentPreview } else { '[]' }
             $cols += @('MatchCount','MatchedContentPreview')
-            $row  += @("$matchCount", $contentPreview)
+            $row  += @("$mc", $cp)
         }
         $new = -not (Test-Path -LiteralPath $csv)
         $sb  = [Text.StringBuilder]::new()
@@ -628,11 +659,17 @@ function Save-DedupFile([string]$dest, [byte[]]$bytes) {
 }
 
 # Log a download-log.csv row for $e (its original name + the content $hash) and mark it
-# downloaded. Called once per entry even when several share one on-disk file.
-function Write-DedupEntry($e, [string]$hash) {
+# downloaded. Called once per entry even when several share one on-disk file. $hashFileName is
+# the disambiguated on-disk name when a collision was tagged (blank when saved as-is). Audit
+# entries carry .MatchCount / .ContentPreview (the per-file content-match count + snippet JSON),
+# which flow to the trailing log columns; plain entries omit them (logged as 0 / '[]').
+function Write-DedupEntry($e, [string]$hash, [string]$hashFileName = '') {
     $sz = if ($e.Size -ge 0) { [long]$e.Size } else { -1 }
+    $mc = -1; if ($e.PSObject.Properties['MatchCount'] -and "$($e.MatchCount)" -match '^\d+$') { $mc = [int]$e.MatchCount }
+    $cp = if ($e.PSObject.Properties['ContentPreview']) { [string]$e.ContentPreview } else { '' }
     Write-DownloadLog $script:OutDir ([string]$e.Name) ([string]$e.Repo) ([string]$e.Path) ([string]$e.Archive) `
-                      $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) ([string]$e.Rule) ([string]$hash)
+                      $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) ([string]$e.Rule) ([string]$hash) `
+                      'download-log.csv' -matchCount $mc -contentPreview $cp -hashFileName $hashFileName
     Mark-Downloaded ([string]$e.VisitKey) ([string]$e.Url)
 }
 
@@ -730,8 +767,9 @@ function Invoke-DedupDownload($entries) {
                     $files++; if ($tagged) { $renamed++ }
                     # Highest severity among the entries sharing this content; size from the actual bytes.
                     $cSev = ''; $cRank = -1
+                    $hfn = if ($tagged) { $destName } else { '' }   # the on-disk name only when collision-tagged
                     foreach ($e in $c.Members) {
-                        Write-DedupEntry $e $c.Hash; $logged++; if ($e.Size -ge 0) { $doneBytes += [long]$e.Size }
+                        Write-DedupEntry $e $c.Hash $hfn; $logged++; if ($e.Size -ge 0) { $doneBytes += [long]$e.Size }
                         $rk = Get-SevRank ([string]$e.Sev); if ($rk -gt $cRank) { $cRank = $rk; $cSev = [string]$e.Sev }
                     }
                     $cSize = if ($b) { [long]$b.Length } elseif ($primary.Size -ge 0) { [long]$primary.Size } else { -1 }

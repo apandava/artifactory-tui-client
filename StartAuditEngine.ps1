@@ -842,8 +842,8 @@ function Complete-AuditOutput([string]$downloadSpec, [long]$maxBytes = 0) {
     Write-V 1 ('Logged to ' + (Join-Path $script:OutDir 'download-log.csv'))
 }
 
-# Download files listed in a prior audit-log.csv, no auditing. The catalogue left Hash and Timestamp
-# blank; this recomputes them and writes download-log.csv with both filled. $downloadSpec narrows the
+# Download files listed in a prior audit-log.csv, no auditing. The catalogue (scrape format) has no
+# Hash/Timestamp; this computes them and writes download-log.csv with both filled. $downloadSpec narrows the
 # set by severity exactly like the audit path's --download: '' or 'all' = every row; '<sev,...>'
 # (e.g. high,medium) = only those severities; 'count' = print the per-severity breakdown, no download.
 function Invoke-DownloadFromLog([string]$file, [string]$downloadSpec = '', [long]$maxBytes = 0) {
@@ -851,11 +851,14 @@ function Invoke-DownloadFromLog([string]$file, [string]$downloadSpec = '', [long
     $rows = @(Import-Csv -LiteralPath $file)
     $entries = @($rows | ForEach-Object {
         $sz = -1; if ("$($_.SizeBytes)" -match '^\d+$') { $sz = [long]$_.SizeBytes }
+        $mc = 0;  if ("$($_.MatchCount)" -match '^\d+$') { $mc = [int]$_.MatchCount }
+        $cp = if ("$($_.MatchedContentPreview)") { [string]$_.MatchedContentPreview } else { '[]' }
         [PSCustomObject]@{
             Ref = $null; Name = [string]$_.FileName; Url = [string]$_.DownloadUrl; KnownHash = ''
             Repo = [string]$_.Repository; Path = [string]$_.Path; Archive = [string]$_.Archive
             Size = $sz; Modified = [string]$_.Modified
             Sev = [string]$_.Severity; Rule = [string]$_.MatchedRule; VisitKey = [string]$_.DownloadUrl
+            MatchCount = $mc; ContentPreview = $cp   # carry forward into download-log.csv's trailing columns
         }
     })
     if ($entries.Count -eq 0) { Write-V 1 "No rows in $file."; return }

@@ -296,7 +296,10 @@ function Save-AuditFinding($f, [string]$DestName = '') {
         Invoke-WebRequest -Uri $f.Url -Headers (Get-AuthHeaders) -OutFile $dest -ErrorAction Stop
         $len = -1; try { $len = (Get-Item $dest).Length } catch { }
         if (-not $hash) { $hash = Get-FileSha256 $dest }
-        Write-DownloadLog $OutDir $f.Name $f.Repo $f.Path $(if ($f.InArchive) { [string]$f.ArchiveName } else { '' }) $len $f.Modified $f.Url $f.Sev $f.AllRules $hash
+        $hfn = if ($DestName -and $DestName -ne [string]$f.Name) { [string]$DestName } else { '' }
+        $mc  = if ($f.PSObject.Properties['MatchCount']) { [int]$f.MatchCount } else { -1 }
+        $cp  = if ($f.PSObject.Properties['Snippets']) { ConvertTo-AuditJsonArray $f.Snippets } else { '' }
+        Write-DownloadLog $OutDir $f.Name $f.Repo $f.Path $(if ($f.InArchive) { [string]$f.ArchiveName } else { '' }) $len $f.Modified $f.Url $f.Sev $f.AllRules $hash 'download-log.csv' -matchCount $mc -contentPreview $cp -hashFileName $hfn
         Mark-Downloaded $f.Key $f.Url
         # Re-sort so the now-downloaded row drops to the very back (Mark-Downloaded only
         # changed the visited set, not the findings count, so nudge the sort explicitly).

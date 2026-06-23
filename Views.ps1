@@ -882,6 +882,7 @@ function Save-Item([object]$item, [string]$url, [string]$DestName = '') {
     # $DestName is the (possibly hash-tagged) on-disk filename from a bulk download; the
     # CSV still logs $item.Name (the original) plus the hash ('<algo>:<hex>' storage checksum).
     $fn   = if ($DestName) { $DestName } else { [string]$item.Name }
+    $hfn  = if ($DestName -and $DestName -ne [string]$item.Name) { [string]$DestName } else { '' }
     $hash = if ("$($item.Hash)") { [string]$item.Hash }
             elseif ($item.Uri -and $script:MetaCache.ContainsKey($item.Uri) -and
                     $script:MetaCache[$item.Uri].PSObject.Properties['Hash']) { [string]$script:MetaCache[$item.Uri].Hash }
@@ -893,7 +894,7 @@ function Save-Item([object]$item, [string]$url, [string]$DestName = '') {
             [System.IO.File]::WriteAllBytes($dest, $script:MemFiles[$url])
             $len = -1; try { $len = (Get-Item $dest).Length } catch { }
             if (-not $hash) { $hash = 'sha256:' + (Get-BytesSha256 $script:MemFiles[$url]) }
-            Write-DownloadLog $OutDir ([string]$item.Name) ([string]$item.Repo) ([string]$item.Path) (Get-ItemArchiveName $item) $len ([string]$item.Modified) $url '' '' $hash
+            Write-DownloadLog $OutDir ([string]$item.Name) ([string]$item.Repo) ([string]$item.Path) (Get-ItemArchiveName $item) $len ([string]$item.Modified) $url '' '' $hash 'download-log.csv' -hashFileName $hfn
             Mark-Downloaded ([string]$item.Uri) $url
             $sz = if ($len -ge 0) { ' (' + (Format-Size $len) + ')' } else { '' }
             return "${BD}Saved${R} to ${CY}$dest${R}$sz ${DM}(from preview cache)${R}"
@@ -908,7 +909,7 @@ function Save-Item([object]$item, [string]$url, [string]$DestName = '') {
         Invoke-WebRequest -Uri $url -Headers (Get-AuthHeaders) -OutFile $dest -ErrorAction Stop
         $len = -1; try { $len = (Get-Item $dest).Length } catch { }
         if (-not $hash) { $hash = Get-FileSha256 $dest }
-        Write-DownloadLog $OutDir ([string]$item.Name) ([string]$item.Repo) ([string]$item.Path) (Get-ItemArchiveName $item) $len ([string]$item.Modified) $url '' '' $hash
+        Write-DownloadLog $OutDir ([string]$item.Name) ([string]$item.Repo) ([string]$item.Path) (Get-ItemArchiveName $item) $len ([string]$item.Modified) $url '' '' $hash 'download-log.csv' -hashFileName $hfn
         Mark-Downloaded ([string]$item.Uri) $url
         $sz = if ($len -ge 0) { ' (' + (Format-Size $len) + ')' } else { '' }
         return "${BD}Saved${R} to ${CY}$dest${R}$sz"

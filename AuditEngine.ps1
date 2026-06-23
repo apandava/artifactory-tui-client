@@ -710,9 +710,10 @@ function Get-AuditMatchFile([string]$repo) {
     return "$safe-matches.csv"
 }
 # Load prior runs' match identities so re-logging dedupes across sessions. Reads every
-# *-matches.csv in the audit dir; columns are the Write-DownloadLog set
-# (Timestamp,FileName,Hash,Repository,Path,Archive,...) -> FileName=1, Repository=3, Path=4,
-# Archive=5. Needs Core's Read-CsvRow (always loaded with the audit engine).
+# *-matches.csv in the audit dir; columns are the Write-DownloadLog SCRAPE set
+# (FileName,Repository,Path,Archive,SizeBytes,Modified,DownloadUrl,Severity,MatchedRule,...) ->
+# FileName=0, Repository=1, Path=2, Archive=3, Severity=7, MatchedRule=8. Needs Core's
+# Read-CsvRow (always loaded with the audit engine).
 function Ensure-AuditMatchesLoaded {
     if ($script:AuditMatchesLoaded) { return }
     $script:AuditMatchesLoaded = $true
@@ -725,11 +726,11 @@ function Ensure-AuditMatchesLoaded {
                 if ($first) { $first = $false; continue }   # header
                 if (-not "$line".Trim()) { continue }
                 $f = Read-CsvRow $line
-                if ($f.Count -lt 11) { continue }
-                # Seed the (identity, severity, rules) signature - cols: FileName=1, Repository=3,
-                # Path=4, Archive=5, Severity=9, MatchedRule=10 - so prior runs' rows (incl. upgrades)
+                if ($f.Count -lt 9) { continue }
+                # Seed the (identity, severity, rules) signature - cols: FileName=0, Repository=1,
+                # Path=2, Archive=3, Severity=7, MatchedRule=8 - so prior runs' rows (incl. upgrades)
                 # don't re-log.
-                [void]$script:AuditMatchesPersisted.Add((Get-AuditMatchSignature $f[3] $f[4] $f[1] $f[5] $f[9] $f[10]))
+                [void]$script:AuditMatchesPersisted.Add((Get-AuditMatchSignature $f[1] $f[2] $f[0] $f[3] $f[7] $f[8]))
             }
         } catch { }
     }
@@ -770,29 +771,29 @@ function Build-AuditLogFromMatches([string]$outFile) {
                 if ($first) { $first = $false; continue }   # header
                 if (-not "$line".Trim()) { continue }
                 $r = Read-CsvRow $line
-                if ($r.Count -lt 11) { continue }
-                # cols: FileName=1 Repository=3 Path=4 Archive=5 SizeBytes=6 Modified=7 DownloadUrl=8 Severity=9
-                #       MatchedRule=10  MatchCount=11  MatchedContentPreview=12  (11/12 absent on pre-feature rows)
-                $id   = Get-AuditMatchIdentity $r[3] $r[4] $r[1] $r[5]
-                $rank = Get-AuditRank $r[9]
+                if ($r.Count -lt 9) { continue }
+                # scrape cols: FileName=0 Repository=1 Path=2 Archive=3 SizeBytes=4 Modified=5 DownloadUrl=6
+                #       Severity=7 MatchedRule=8  MatchCount=9  MatchedContentPreview=10  (9/10 absent on pre-feature rows)
+                $id   = Get-AuditMatchIdentity $r[1] $r[2] $r[0] $r[3]
+                $rank = Get-AuditRank $r[7]
                 $e = $byId[$id]
                 if ($null -eq $e) {
-                    $e = @{ Repo=$r[3]; Path=$r[4]; Name=$r[1]; Archive=$r[5]; Url=$r[8]; Size=$r[6]; Modified=$r[7]
-                            Rank=$rank; Sev=$r[9]; Rules=(New-Object 'System.Collections.Generic.HashSet[string]')
+                    $e = @{ Repo=$r[1]; Path=$r[2]; Name=$r[0]; Archive=$r[3]; Url=$r[6]; Size=$r[4]; Modified=$r[5]
+                            Rank=$rank; Sev=$r[7]; Rules=(New-Object 'System.Collections.Generic.HashSet[string]')
                             MatchCount=0; Snippets=(New-Object 'System.Collections.Generic.List[string]')
                             SnipSeen=(New-Object 'System.Collections.Generic.HashSet[string]') }
                     $byId[$id] = $e
                 } elseif ($rank -gt $e.Rank) {
                     # Higher-severity row wins for severity + the representative size/modified/url.
-                    $e.Rank = $rank; $e.Sev = $r[9]; $e.Url = $r[8]; $e.Size = $r[6]; $e.Modified = $r[7]
+                    $e.Rank = $rank; $e.Sev = $r[7]; $e.Url = $r[6]; $e.Size = $r[4]; $e.Modified = $r[5]
                 }
-                foreach ($t in (@("$($r[10])" -split '\s*,\s*') | Where-Object { $_ })) { [void]$e.Rules.Add($t) }
+                foreach ($t in (@("$($r[8])" -split '\s*,\s*') | Where-Object { $_ })) { [void]$e.Rules.Add($t) }
                 # MatchCount: SUM per-row contributions (each Tier-1 row + each Tier-2 upgrade row carries
                 # its own tier's instance count), so the total is correct across split/resumed runs.
-                if ($r.Count -ge 12 -and "$($r[11])" -match '^\d+$') { $e.MatchCount += [int]$r[11] }
+                if ($r.Count -ge 10 -and "$($r[9])" -match '^\d+$') { $e.MatchCount += [int]$r[9] }
                 # MatchedContentPreview: union the rows' snippet arrays (order-preserved, deduped), capped.
-                if ($r.Count -ge 13) {
-                    foreach ($sn in (ConvertFrom-AuditJsonArray ([string]$r[12]))) {
+                if ($r.Count -ge 11) {
+                    foreach ($sn in (ConvertFrom-AuditJsonArray ([string]$r[10]))) {
                         if (-not "$sn") { continue }   # skip blanks (e.g. legacy/empty cells)
                         if ($e.Snippets.Count -ge $script:AuditPreviewMax) { break }
                         if ($e.SnipSeen.Add([string]$sn)) { [void]$e.Snippets.Add([string]$sn) }
@@ -1915,6 +1916,10 @@ function Get-AuditDownloadEntries($candidates) {
             Archive = $(if ($_.InArchive) { [string]$_.ArchiveName } else { '' })
             Size = $(if ($_.Size -ge 0) { [long]$_.Size } else { [long]-1 })
             Modified = [string]$_.Modified; Sev = [string]$_.Sev; Rule = [string]$_.AllRules; VisitKey = [string]$_.Key
+            # Carry the per-file content-match count + snippet JSON through to download-log.csv's
+            # trailing MatchCount / MatchedContentPreview columns.
+            MatchCount = $(if ($_.PSObject.Properties['MatchCount']) { [int]$_.MatchCount } else { 0 })
+            ContentPreview = $(if ($_.PSObject.Properties['Snippets']) { ConvertTo-AuditJsonArray $_.Snippets } else { '[]' })
         }
     })
 }
