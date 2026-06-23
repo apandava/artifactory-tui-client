@@ -64,6 +64,10 @@ function Invoke-CSVPrune {
         else { Write-Host "Ignoring stray argument: $a" -ForegroundColor DarkYellow }
     }
     if (-not $file)                          { Write-Host 'ERROR: --file <path> is required.' -ForegroundColor Red; return }
+    # Resolve to a full path FIRST: the [System.IO.File] APIs below resolve relative paths against
+    # .NET's CurrentDirectory (the dir PowerShell launched from), NOT $PWD - so a relative --file
+    # would otherwise be looked up in the wrong folder even though Get-Content/Test-Path find it.
+    $file = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($file)
     if (-not (Test-Path -LiteralPath $file)) { Write-Host "ERROR: file not found: $file"     -ForegroundColor Red; return }
     if ($prune.Count -eq 0)                  { Write-Host 'ERROR: at least one --prune <regex> is required.' -ForegroundColor Red; return }
 
