@@ -111,7 +111,7 @@ function Get-DownloadLogIndex {
         if (Test-Path -LiteralPath $csv) {
             foreach ($row in (Import-Csv -LiteralPath $csv)) {
                 $u = "$($row.DownloadUrl)"
-                if ($u -and $row.Timestamp) { $map[$u] = @{ FileName = "$($row.FileName)"; Hash = "$($row.Hash)" } }
+                if ($u -and $row.Timestamp) { $map[$u] = @{ FileName = "$($row.FileName)"; Hash = "$($row.Hash)"; HashFileName = "$($row.HashFileName)" } }
             }
         }
     } catch { }   # missing/locked/headless-no-OutDir: just yields an empty map (nothing on disk)
@@ -126,6 +126,7 @@ function Get-DownloadedBytes([string]$url) {
     $rec = $idx[$url]
     $cands = [Collections.Generic.List[string]]::new()
     try {
+        if ($rec.HashFileName) { $cands.Add((Join-Path $script:OutDir $rec.HashFileName)) }
         if ($rec.FileName) {
             $cands.Add((Join-Path $script:OutDir $rec.FileName))
             if ($rec.Hash) { $cands.Add((Join-Path $script:OutDir (Add-NameTag $rec.FileName (Get-DedupTag $rec.Hash $url)))) }
@@ -398,24 +399,39 @@ function Resolve-OutputPaths {
     $script:AuditDir = Join-Path $root 'audit'
 }
 
+function Format-LogHash([string]$hash) {
+    if (-not $hash) { return '' }
+    $i = $hash.IndexOf(':')
+    if ($i -lt 0) { return $hash.ToUpper() }
+    return $hash.Substring(0, $i + 1) + $hash.Substring($i + 1).ToUpper()
+}
+
 function Write-DownloadLog([string]$dir, [string]$name, [string]$repo, [string]$path, [string]$archive,
                            [long]$sizeBytes, [string]$modified, [string]$url,
                            [string]$severity, [string]$rule, [string]$hash = '',
                            [string]$fileName = 'download-log.csv', [switch]$Scrape,
-                           [int]$matchCount = -1, [string]$contentPreview = '') {
+                           [int]$matchCount = -1, [string]$contentPreview = '', [string]$hashFileName = '') {
     try {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $csv  = Join-Path $dir $fileName
         $q    = { param($v) '"' + ("$v" -replace '"','""') + '"' }
-        $cols = @('Timestamp','FileName','Hash','Repository','Path','Archive','SizeBytes','Modified','DownloadUrl','Severity','MatchedRule')
         $sz   = if ($sizeBytes -ge 0) { "$sizeBytes" } else { '' }
-        $ts   = if ($Scrape) { '' } else { (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') }
-        $hsh  = if ($Scrape) { '' } else { $hash }
-        $row  = @($ts, $name, $hsh, $repo, $path, $archive, $sz, $modified, $url,
-                  $(if ($severity) { $severity } else { 'N/A' }), $(if ($rule) { $rule } else { 'N/A' }))
-        if ($matchCount -ge 0) {
+        $sevV = if ($severity) { $severity } else { 'N/A' }
+        $rulV = if ($rule) { $rule } else { 'N/A' }
+        if ($Scrape) {
+            $cols = @('FileName','Repository','Path','Archive','SizeBytes','Modified','DownloadUrl','Severity','MatchedRule')
+            $row  = @($name, $repo, $path, $archive, $sz, $modified, $url, $sevV, $rulV)
+        } else {
+            $cols = @('Timestamp','FileName','HashFileName','Hash','Repository','Path','Archive','SizeBytes','Modified','DownloadUrl','Severity','MatchedRule')
+            $row  = @((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $name, $hashFileName, (Format-LogHash $hash),
+                      $repo, $path, $archive, $sz, $modified, $url, $sevV, $rulV)
+        }
+        $mc = $matchCount
+        if (-not $Scrape -and $mc -lt 0) { $mc = 0 }
+        if ($mc -ge 0) {
+            $cp = if ($contentPreview) { $contentPreview } else { '[]' }
             $cols += @('MatchCount','MatchedContentPreview')
-            $row  += @("$matchCount", $contentPreview)
+            $row  += @("$mc", $cp)
         }
         $new = -not (Test-Path -LiteralPath $csv)
         $sb  = [Text.StringBuilder]::new()
@@ -459,10 +475,13 @@ function Save-DedupFile([string]$dest, [byte[]]$bytes) {
     try { [System.IO.File]::WriteAllBytes($dest, $bytes); return $true } catch { return $false }
 }
 
-function Write-DedupEntry($e, [string]$hash) {
+function Write-DedupEntry($e, [string]$hash, [string]$hashFileName = '') {
     $sz = if ($e.Size -ge 0) { [long]$e.Size } else { -1 }
+    $mc = -1; if ($e.PSObject.Properties['MatchCount'] -and "$($e.MatchCount)" -match '^\d+$') { $mc = [int]$e.MatchCount }
+    $cp = if ($e.PSObject.Properties['ContentPreview']) { [string]$e.ContentPreview } else { '' }
     Write-DownloadLog $script:OutDir ([string]$e.Name) ([string]$e.Repo) ([string]$e.Path) ([string]$e.Archive) `
-                      $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) ([string]$e.Rule) ([string]$hash)
+                      $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) ([string]$e.Rule) ([string]$hash) `
+                      'download-log.csv' -matchCount $mc -contentPreview $cp -hashFileName $hashFileName
     Mark-Downloaded ([string]$e.VisitKey) ([string]$e.Url)
 }
 
@@ -534,8 +553,9 @@ function Invoke-DedupDownload($entries) {
                 if (Save-DedupFile (Join-Path $script:OutDir $destName) $b) {
                     $files++; if ($tagged) { $renamed++ }
                     $cSev = ''; $cRank = -1
+                    $hfn = if ($tagged) { $destName } else { '' }   # the on-disk name only when collision-tagged
                     foreach ($e in $c.Members) {
-                        Write-DedupEntry $e $c.Hash; $logged++; if ($e.Size -ge 0) { $doneBytes += [long]$e.Size }
+                        Write-DedupEntry $e $c.Hash $hfn; $logged++; if ($e.Size -ge 0) { $doneBytes += [long]$e.Size }
                         $rk = Get-SevRank ([string]$e.Sev); if ($rk -gt $cRank) { $cRank = $rk; $cSev = [string]$e.Sev }
                     }
                     $cSize = if ($b) { [long]$b.Length } elseif ($primary.Size -ge 0) { [long]$primary.Size } else { -1 }
@@ -2745,8 +2765,8 @@ function Ensure-AuditMatchesLoaded {
                 if ($first) { $first = $false; continue }   # header
                 if (-not "$line".Trim()) { continue }
                 $f = Read-CsvRow $line
-                if ($f.Count -lt 11) { continue }
-                [void]$script:AuditMatchesPersisted.Add((Get-AuditMatchSignature $f[3] $f[4] $f[1] $f[5] $f[9] $f[10]))
+                if ($f.Count -lt 9) { continue }
+                [void]$script:AuditMatchesPersisted.Add((Get-AuditMatchSignature $f[1] $f[2] $f[0] $f[3] $f[7] $f[8]))
             }
         } catch { }
     }
@@ -2777,23 +2797,23 @@ function Build-AuditLogFromMatches([string]$outFile) {
                 if ($first) { $first = $false; continue }   # header
                 if (-not "$line".Trim()) { continue }
                 $r = Read-CsvRow $line
-                if ($r.Count -lt 11) { continue }
-                $id   = Get-AuditMatchIdentity $r[3] $r[4] $r[1] $r[5]
-                $rank = Get-AuditRank $r[9]
+                if ($r.Count -lt 9) { continue }
+                $id   = Get-AuditMatchIdentity $r[1] $r[2] $r[0] $r[3]
+                $rank = Get-AuditRank $r[7]
                 $e = $byId[$id]
                 if ($null -eq $e) {
-                    $e = @{ Repo=$r[3]; Path=$r[4]; Name=$r[1]; Archive=$r[5]; Url=$r[8]; Size=$r[6]; Modified=$r[7]
-                            Rank=$rank; Sev=$r[9]; Rules=(New-Object 'System.Collections.Generic.HashSet[string]')
+                    $e = @{ Repo=$r[1]; Path=$r[2]; Name=$r[0]; Archive=$r[3]; Url=$r[6]; Size=$r[4]; Modified=$r[5]
+                            Rank=$rank; Sev=$r[7]; Rules=(New-Object 'System.Collections.Generic.HashSet[string]')
                             MatchCount=0; Snippets=(New-Object 'System.Collections.Generic.List[string]')
                             SnipSeen=(New-Object 'System.Collections.Generic.HashSet[string]') }
                     $byId[$id] = $e
                 } elseif ($rank -gt $e.Rank) {
-                    $e.Rank = $rank; $e.Sev = $r[9]; $e.Url = $r[8]; $e.Size = $r[6]; $e.Modified = $r[7]
+                    $e.Rank = $rank; $e.Sev = $r[7]; $e.Url = $r[6]; $e.Size = $r[4]; $e.Modified = $r[5]
                 }
-                foreach ($t in (@("$($r[10])" -split '\s*,\s*') | Where-Object { $_ })) { [void]$e.Rules.Add($t) }
-                if ($r.Count -ge 12 -and "$($r[11])" -match '^\d+$') { $e.MatchCount += [int]$r[11] }
-                if ($r.Count -ge 13) {
-                    foreach ($sn in (ConvertFrom-AuditJsonArray ([string]$r[12]))) {
+                foreach ($t in (@("$($r[8])" -split '\s*,\s*') | Where-Object { $_ })) { [void]$e.Rules.Add($t) }
+                if ($r.Count -ge 10 -and "$($r[9])" -match '^\d+$') { $e.MatchCount += [int]$r[9] }
+                if ($r.Count -ge 11) {
+                    foreach ($sn in (ConvertFrom-AuditJsonArray ([string]$r[10]))) {
                         if (-not "$sn") { continue }   # skip blanks (e.g. legacy/empty cells)
                         if ($e.Snippets.Count -ge $script:AuditPreviewMax) { break }
                         if ($e.SnipSeen.Add([string]$sn)) { [void]$e.Snippets.Add([string]$sn) }
@@ -3679,6 +3699,8 @@ function Get-AuditDownloadEntries($candidates) {
             Archive = $(if ($_.InArchive) { [string]$_.ArchiveName } else { '' })
             Size = $(if ($_.Size -ge 0) { [long]$_.Size } else { [long]-1 })
             Modified = [string]$_.Modified; Sev = [string]$_.Sev; Rule = [string]$_.AllRules; VisitKey = [string]$_.Key
+            MatchCount = $(if ($_.PSObject.Properties['MatchCount']) { [int]$_.MatchCount } else { 0 })
+            ContentPreview = $(if ($_.PSObject.Properties['Snippets']) { ConvertTo-AuditJsonArray $_.Snippets } else { '[]' })
         }
     })
 }
@@ -4498,11 +4520,14 @@ function Invoke-DownloadFromLog([string]$file, [string]$downloadSpec = '', [long
     $rows = @(Import-Csv -LiteralPath $file)
     $entries = @($rows | ForEach-Object {
         $sz = -1; if ("$($_.SizeBytes)" -match '^\d+$') { $sz = [long]$_.SizeBytes }
+        $mc = 0;  if ("$($_.MatchCount)" -match '^\d+$') { $mc = [int]$_.MatchCount }
+        $cp = if ("$($_.MatchedContentPreview)") { [string]$_.MatchedContentPreview } else { '[]' }
         [PSCustomObject]@{
             Ref = $null; Name = [string]$_.FileName; Url = [string]$_.DownloadUrl; KnownHash = ''
             Repo = [string]$_.Repository; Path = [string]$_.Path; Archive = [string]$_.Archive
             Size = $sz; Modified = [string]$_.Modified
             Sev = [string]$_.Severity; Rule = [string]$_.MatchedRule; VisitKey = [string]$_.DownloadUrl
+            MatchCount = $mc; ContentPreview = $cp   # carry forward into download-log.csv's trailing columns
         }
     })
     if ($entries.Count -eq 0) { Write-V 1 "No rows in $file."; return }
