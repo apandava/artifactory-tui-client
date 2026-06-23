@@ -4657,6 +4657,11 @@ function Initialize-AuditBaseConfig([hashtable]$O, [bool]$requireBaseUrl = $true
     if ($O.ContainsKey('SkipGlobs') -and $O['SkipGlobs']) { Set-SkipRecommendedGlobs ([string]$O['SkipGlobs']) }
 }
 
+function Resolve-AuditInputPath([string]$path) {
+    if (-not $path) { return $path }
+    try { return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($path) } catch { return $path }
+}
+
 function Invoke-AuditCore {
     param(
         [string]$Repos, [string]$RepoTypes,
@@ -4674,16 +4679,17 @@ function Invoke-AuditCore {
 
     if ($O.ContainsKey('FromLog') -and $O['FromLog']) {
         Initialize-AuditBaseConfig $O $true
-        Invoke-DownloadFromLog ([string]$O['FromLog']) ([string]$Download) $maxBytes
+        Invoke-DownloadFromLog (Resolve-AuditInputPath ([string]$O['FromLog'])) ([string]$Download) $maxBytes
         return
     }
 
     if ($O.ContainsKey('Tier2Resume') -and $O['Tier2Resume']) {
         Initialize-AuditBaseConfig $O $true
         $script:AuditEmitSkipped = $false
-        Write-V 1 "Resuming Tier-2 over worklist $($O['Tier2Resume'])..."
-        if (-not (Start-AuditTier2List ([string]$O['Tier2Resume']))) {
-            throw "Worklist not found or empty: $($O['Tier2Resume'])"
+        $resumePath = Resolve-AuditInputPath ([string]$O['Tier2Resume'])
+        Write-V 1 "Resuming Tier-2 over worklist $resumePath..."
+        if (-not (Start-AuditTier2List $resumePath)) {
+            throw "Worklist not found or empty: $resumePath"
         }
         if ($O.ContainsKey('Exclude')) { Set-AuditExcludes ([string]$O['Exclude']) }
         Invoke-AuditPumpToDone
