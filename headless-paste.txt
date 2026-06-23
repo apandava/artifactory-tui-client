@@ -2954,16 +2954,31 @@ $script:AuditWkScript = {
             $cache[$key] = [PSCustomObject]@{ Ok=$true; Size=$size; Modified=$modified; Text=$null; TooBig=$true; Error='' }
             return
         }
-        $resp  = Invoke-WebRequest -Uri $downloadUrl -Headers $headers -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
-        $bytes = if ($resp.RawContentStream) { $resp.RawContentStream.ToArray() }
-                 elseif ($resp.Content -is [byte[]]) { [byte[]]$resp.Content }
-                 else { [Text.Encoding]::UTF8.GetBytes([string]$resp.Content) }
+        $req = [System.Net.WebRequest]::Create($downloadUrl)
+        $req.Method = 'GET'
+        $req.Timeout = 120000; $req.ReadWriteTimeout = 60000
+        if ($headers) { foreach ($hk in $headers.Keys) { try { $req.Headers[[string]$hk] = [string]$headers[$hk] } catch { } } }
+        try { $req.AddRange(0, [long]$cap) } catch { }   # ask for the first cap+1 bytes (best-effort)
+        $ms = New-Object System.IO.MemoryStream
+        $resp = $req.GetResponse()
+        try {
+            $rs  = $resp.GetResponseStream()
+            $buf = New-Object byte[] 65536
+            $tot = 0L
+            while ($tot -lt $cap) {
+                $want = [int][Math]::Min([long]$buf.Length, ($cap - $tot))
+                $n = $rs.Read($buf, 0, $want)
+                if ($n -le 0) { break }
+                $ms.Write($buf, 0, $n); $tot += $n
+            }
+        } finally { try { $resp.Close() } catch { } }
+        $bytes = $ms.ToArray()
         $full = $bytes.Length
         $len  = if ($full -gt $cap) { $cap } else { $full }
         $start = 0
         if ($len -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $start = 3 }
         $text = [Text.Encoding]::UTF8.GetString($bytes, $start, $len - $start)
-        if ($size -lt 0) { $size = $full }
+        if ($size -lt 0) { $size = $full }   # unknown size: best-effort (the scanned amount, capped at $cap)
         $cache[$key] = [PSCustomObject]@{ Ok=$true; Size=$size; Modified=$modified; Text=$text; TooBig=$false; Error='' }
     } catch {
         $we = Get-WkError $_
