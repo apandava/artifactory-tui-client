@@ -1,3 +1,4 @@
+
 function Format-Size([object]$bytes) {
     if ($null -eq $bytes -or "$bytes" -eq '') { return '' }
     $b = [double]$bytes
@@ -8,11 +9,13 @@ function Format-Size([object]$bytes) {
     if ($i -eq 0) { return "$([int]$b) B" }
     return ('{0:0.0} {1}' -f $b, $units[$i])
 }
+
 function Get-Ext([string]$name) {
     $dot = $name.LastIndexOf('.')
     if ($dot -gt 0 -and $dot -lt $name.Length - 1) { return $name.Substring($dot + 1) }
     return ''
 }
+
 $script:PvErrFn = @'
 function Get-WkError($e) {
     $code = 0
@@ -41,14 +44,18 @@ function Get-WkError($e) {
 }
 
 '@
+
 $script:Visited      = New-Object 'System.Collections.Generic.HashSet[string]'
-$script:MemFiles     = @{}
-$script:MemOrder     = [Collections.Generic.List[string]]::new()
-$script:MemFilesCap  = 32
+$script:MemFiles     = @{}                                              # url -> [byte[]]
+$script:MemOrder     = [Collections.Generic.List[string]]::new()        # insertion order, for eviction
+$script:MemFilesCap  = 32                                               # max files held for download reuse
+
 $script:Downloaded = New-Object 'System.Collections.Generic.HashSet[string]'
+
 function Mark-Visited([string]$key) { if ($key) { [void]$script:Visited.Add($key) } }
 function Test-Visited([string]$key) { return ($key -and $script:Visited.Contains($key)) }
 function Test-Downloaded([string]$k) { return ($k -and $script:Downloaded.Contains($k)) }
+
 function Add-MemFile([string]$url, [byte[]]$bytes) {
     if (-not $url -or $null -eq $bytes -or $script:MemFiles.ContainsKey($url)) { return }
     $script:MemFiles[$url] = $bytes
@@ -58,6 +65,7 @@ function Add-MemFile([string]$url, [byte[]]$bytes) {
         [void]$script:MemFiles.Remove($old)
     }
 }
+
 function Clear-PreviewMem([string]$url) {
     if (-not $url) { return }
     if ($script:MemFiles.ContainsKey($url)) {
@@ -69,6 +77,7 @@ function Clear-PreviewMem([string]$url) {
         if ($script:PreviewCache -and $script:PreviewCache.ContainsKey($pk)) { [void]$script:PreviewCache.Remove($pk) }
     }
 }
+
 function Mark-Downloaded([string]$key, [string]$url) {
     Mark-Visited $key
     if ($key) { [void]$script:Downloaded.Add($key) }
@@ -77,10 +86,12 @@ function Mark-Downloaded([string]$key, [string]$url) {
         Clear-PreviewMem $url
     }
 }
+
 function Unmark-Downloaded([string]$key, [string]$url) {
     if ($key) { [void]$script:Visited.Remove($key); [void]$script:Downloaded.Remove($key) }
     if ($url) { [void]$script:Downloaded.Remove($url) }
 }
+
 $script:OfflineMode = ''
 function Set-OfflineMode([string]$m) {
     $v = "$m".Trim().ToLower()
@@ -90,6 +101,7 @@ function Set-OfflineMode([string]$m) {
 function Get-OfflineMode      { return $script:OfflineMode }
 function Test-SearchLocalOnly { return ($script:OfflineMode -eq 'index' -or $script:OfflineMode -eq 'all') }
 function Test-NetworkBlocked  { return ($script:OfflineMode -eq 'all') }
+
 $script:DownloadLogIndex       = $null
 function Get-DownloadLogIndex {
     if ($null -ne $script:DownloadLogIndex) { return $script:DownloadLogIndex }
@@ -102,7 +114,7 @@ function Get-DownloadLogIndex {
                 if ($u -and $row.Timestamp) { $map[$u] = @{ FileName = "$($row.FileName)"; Hash = "$($row.Hash)" } }
             }
         }
-    } catch { }
+    } catch { }   # missing/locked/headless-no-OutDir: just yields an empty map (nothing on disk)
     $script:DownloadLogIndex = $map
     return $map
 }
@@ -124,6 +136,7 @@ function Get-DownloadedBytes([string]$url) {
     }
     return $null
 }
+
 $script:TextExts = @(
     'txt','text','log','md','markdown','rst','adoc','asciidoc','me','readme','nfo',
     'html','htm','xhtml','xml','xsl','xslt','svg','rss','atom','wsdl','plist',
@@ -147,6 +160,7 @@ $script:TextExts = @(
     'pom','sbt','lock','sum','mod','gradle','npmrc','yarnrc','babelrc','eslintrc',
     'prettierrc','dockerfile','procfile','makefile','jenkinsfile','vagrantfile','gemfile'
 )
+
 function Get-IsPreviewable([string]$name) {
     $ext = (Get-Ext $name).ToLower()
     if ($ext -and ($script:TextExts -contains $ext)) { return $true }
@@ -155,6 +169,7 @@ function Get-IsPreviewable([string]$name) {
              'license','readme','changelog','authors','notice','copying','install',
              'manifest','rakefile','gemfile.lock') -contains $bare
 }
+
 function Get-ItemUrl($item) {
     if ($item.PSObject.Properties['InArchive'] -and $item.InArchive -and
         $item.PSObject.Properties['EntryUrl'] -and "$($item.EntryUrl)") { return [string]$item.EntryUrl }
@@ -162,17 +177,20 @@ function Get-ItemUrl($item) {
     $seg  = if ($item.Path) { "$($item.Path)/" } else { '' }
     return "$(Get-ArtBase)/$repo/$seg$($item.Name)"
 }
+
 function Get-ItemArchiveName($item) {
     if ($null -eq $item) { return '' }
     if ($item.PSObject.Properties['InArchive'] -and $item.InArchive -and
         $item.PSObject.Properties['ArchiveName']) { return [string]$item.ArchiveName }
     return ''
 }
+
 function Test-ItemBrowsableArchive($item) {
     if ($null -eq $item) { return $false }
     if (Get-ItemArchiveName $item) { return $false }
     return (Get-IsArchive ([string]$item.Name))
 }
+
 function Get-FileBytes([string]$url) {
     if (Test-NetworkBlocked) { return (Get-DownloadedBytes $url) }
     $old = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
@@ -184,12 +202,15 @@ function Get-FileBytes([string]$url) {
     } catch { return $null }
     finally { $ProgressPreference = $old }
 }
+
 $script:ArchiveExts = @('zip','jar','war','ear','aar','tar','gz','tgz','rar','7z',
                          'apk','ipa','nupkg','whl','egg')
+
 function Get-IsArchive([string]$name) {
     $ext = (Get-Ext $name).ToLower()
     return $script:ArchiveExts -contains $ext
 }
+
 function Get-UiHeaders {
     $h = Get-AuthHeaders
     $origin = $BaseUrl.TrimEnd('/')
@@ -200,12 +221,14 @@ function Get-UiHeaders {
     $h['Accept-Encoding']  = 'identity'
     return $h
 }
+
 function Get-NodeName($n) {
     if ($null -eq $n) { return '' }
     if ($n.PSObject.Properties['text'] -and "$($n.text)") { return "$($n.text)" }
     if ($n.PSObject.Properties['name'] -and "$($n.name)") { return "$($n.name)" }
     return ''
 }
+
 function Get-NodeIsFolder($n) {
     if ($null -eq $n) { return $false }
     if ($n.PSObject.Properties['folder'])   { return [bool]$n.folder }
@@ -215,6 +238,7 @@ function Get-NodeIsFolder($n) {
     }
     return $false
 }
+
 function Get-NodeChildren($n) {
     if ($null -eq $n) { return @() }
     if ($n.PSObject.Properties['children']) {
@@ -223,11 +247,13 @@ function Get-NodeChildren($n) {
     }
     return @()
 }
+
 function Get-NodeIsArchive($n) {
     if ($null -eq $n) { return $false }
     if (Get-NodeIsFolder $n) { return $false }
     return Get-IsArchive (Get-NodeName $n)
 }
+
 function Get-NodeInfo($n) {
     if ($null -eq $n) { return $null }
     if ($n.PSObject.Properties['tabs']) {
@@ -239,17 +265,20 @@ function Get-NodeInfo($n) {
     }
     return $null
 }
+
 function Get-NodeDownloadPath($n) {
     if ($null -eq $n) { return '' }
     if ($n.PSObject.Properties['downloadPath'] -and "$($n.downloadPath)") { return "$($n.downloadPath)" }
     return ''
 }
+
 function Format-Epoch($ms) {
     $s = "$ms"
     if ($s -notmatch '^\d+$') { if ($s -match '\d{4}-\d{2}-\d{2}') { return $s }; return '' }
     try { return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$s).LocalDateTime.ToString('yyyy-MM-dd HH:mm') }
     catch { return '' }
 }
+
 function Get-EntryUrl($n) {
     if ($null -eq $n) { return '' }
     $dp = Get-NodeDownloadPath $n
@@ -257,6 +286,7 @@ function Get-EntryUrl($n) {
     $repo = if ($n.PSObject.Properties['repoKey']) { "$($n.repoKey)" } else { '' }
     return "$(Get-ArtBase)/$repo/$dp"
 }
+
 function Get-EntryArchiveName($n) {
     $url = Get-EntryUrl $n
     if (-not $url) { return '' }
@@ -265,6 +295,7 @@ function Get-EntryArchiveName($n) {
     $before = $url.Substring(0, $i)
     return ($before -split '/')[-1]
 }
+
 function Get-NodeInternalPath($n) {
     if ($null -eq $n) { return '' }
     $np = if ($n.PSObject.Properties['path'])        { "$($n.path)" }        else { '' }
@@ -272,6 +303,7 @@ function Get-NodeInternalPath($n) {
     if ($ap -and $np.StartsWith($ap)) { return $np.Substring($ap.Length).TrimStart('/') }
     return $np
 }
+
 function Get-RepoTypeForUI([string]$repo) {
     switch ((Resolve-Repo $repo).Type.ToUpper()) {
         'LOCAL'   { return 'local'   }
@@ -281,6 +313,7 @@ function Get-RepoTypeForUI([string]$repo) {
         default   { return 'local'   }
     }
 }
+
 function Get-TreeBrowseRequest([string]$repoKey, [string]$repoType, [string]$repoPkgType,
                                [string]$path, [string]$text) {
     $body = [ordered]@{
@@ -305,10 +338,13 @@ function Get-TreeBrowseRequest([string]$repoKey, [string]$repoType, [string]$rep
         Ua      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/151.0'
     }
 }
+
 $script:DownloadProgress = $null
+$script:DownloadProgressData = $null
 function Report-DownloadProgress([string[]]$lines) {
     if ($script:DownloadProgress) { & $script:DownloadProgress $lines }
 }
+
 function Format-CsvRow([object[]]$fields) {
     $sb = [Text.StringBuilder]::new()
     for ($i = 0; $i -lt $fields.Count; $i++) {
@@ -323,15 +359,15 @@ function Read-CsvRow([string]$line) {
     $n = $line.Length; $i = 0
     $sb = [Text.StringBuilder]::new()
     while ($i -lt $n) {
-        while ($i -lt $n -and $line[$i] -ne '"') { $i++ }
+        while ($i -lt $n -and $line[$i] -ne '"') { $i++ }   # skip to opening quote
         if ($i -ge $n) { break }
-        $i++
+        $i++                                                 # past opening quote
         [void]$sb.Clear()
         while ($i -lt $n) {
             $ch = $line[$i]
             if ($ch -eq '"') {
                 if ($i + 1 -lt $n -and $line[$i + 1] -eq '"') { [void]$sb.Append('"'); $i += 2; continue }
-                $i++; break
+                $i++; break                                  # closing quote
             }
             [void]$sb.Append($ch); $i++
         }
@@ -340,9 +376,11 @@ function Read-CsvRow([string]$line) {
     }
     return $out
 }
-$script:OutputBase     = ''
-$script:OutDirExplicit = $false
-$script:AuditDir       = ''
+
+$script:OutputBase     = ''       # base 'output' dir; default ./output (override via Set-OutputBase)
+$script:OutDirExplicit = $false   # user passed -OutDir/-o; keep it as given
+$script:AuditDir       = ''       # <root>/audit, resolved per instance
+
 function Set-OutputBase([string]$dir) { $script:OutputBase = $dir }
 function Get-InstanceHostSafe {
     $hn = ''
@@ -359,10 +397,12 @@ function Resolve-OutputPaths {
     if (-not $script:OutDirExplicit) { $script:OutDir = Join-Path $root 'downloads' }
     $script:AuditDir = Join-Path $root 'audit'
 }
+
 function Write-DownloadLog([string]$dir, [string]$name, [string]$repo, [string]$path, [string]$archive,
                            [long]$sizeBytes, [string]$modified, [string]$url,
                            [string]$severity, [string]$rule, [string]$hash = '',
-                           [string]$fileName = 'download-log.csv', [switch]$Scrape) {
+                           [string]$fileName = 'download-log.csv', [switch]$Scrape,
+                           [int]$matchCount = -1, [string]$contentPreview = '') {
     try {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $csv  = Join-Path $dir $fileName
@@ -373,6 +413,10 @@ function Write-DownloadLog([string]$dir, [string]$name, [string]$repo, [string]$
         $hsh  = if ($Scrape) { '' } else { $hash }
         $row  = @($ts, $name, $hsh, $repo, $path, $archive, $sz, $modified, $url,
                   $(if ($severity) { $severity } else { 'N/A' }), $(if ($rule) { $rule } else { 'N/A' }))
+        if ($matchCount -ge 0) {
+            $cols += @('MatchCount','MatchedContentPreview')
+            $row  += @("$matchCount", $contentPreview)
+        }
         $new = -not (Test-Path -LiteralPath $csv)
         $sb  = [Text.StringBuilder]::new()
         if ($new) { [void]$sb.AppendLine((@($cols | ForEach-Object { & $q $_ }) -join ',')) }
@@ -380,9 +424,11 @@ function Write-DownloadLog([string]$dir, [string]$name, [string]$repo, [string]$
         [System.IO.File]::AppendAllText($csv, $sb.ToString(), [Text.UTF8Encoding]::new($false))
     } catch { }
 }
+
 function Add-NameTag([string]$name, [string]$tag) {
     return "$tag.$name"
 }
+
 function Get-DedupTag([string]$hash, [string]$fallback) {
     $hex = (("$hash" -split ':')[-1] -replace '[^0-9A-Fa-f]', '')
     if ($hex.Length -ge 7) { return $hex.Substring(0, 7).ToUpper() }
@@ -392,32 +438,46 @@ function Get-DedupTag([string]$hash, [string]$fallback) {
         return ((($h | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 7)).ToUpper()
     } finally { $md5.Dispose() }
 }
+
 function Get-BytesSha256([byte[]]$bytes) {
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '') }
     finally { $sha.Dispose() }
 }
+
 function Get-FileSha256([string]$path) {
     try { return 'sha256:' + ((Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()) }
     catch { return '' }
 }
+
 function Get-DedupBytes($e) {
     if ($script:MemFiles.ContainsKey([string]$e.Url)) { return $script:MemFiles[[string]$e.Url] }
     return Get-FileBytes ([string]$e.Url)
 }
+
 function Save-DedupFile([string]$dest, [byte[]]$bytes) {
     try { [System.IO.File]::WriteAllBytes($dest, $bytes); return $true } catch { return $false }
 }
+
 function Write-DedupEntry($e, [string]$hash) {
     $sz = if ($e.Size -ge 0) { [long]$e.Size } else { -1 }
     Write-DownloadLog $script:OutDir ([string]$e.Name) ([string]$e.Repo) ([string]$e.Path) ([string]$e.Archive) `
                       $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) ([string]$e.Rule) ([string]$hash)
     Mark-Downloaded ([string]$e.VisitKey) ([string]$e.Url)
 }
+
+function Get-SevRank([string]$sev) {
+    switch ("$sev".ToLower()) { 'critical' { 5 } 'high' { 4 } 'medium' { 3 } 'low' { 2 } 'informational' { 1 } default { 0 } }
+}
+
 function Invoke-DedupDownload($entries) {
     $entries = @($entries | Where-Object { $_ })
     $total = $entries.Count
     try { if (-not (Test-Path -LiteralPath $script:OutDir)) { New-Item -ItemType Directory -Path $script:OutDir -Force | Out-Null } } catch { }
+    $dlStart = [DateTime]::UtcNow
+    $totalBytes = 0L; foreach ($e in $entries) { if ($e.Size -ge 0) { $totalBytes += [long]$e.Size } }
+    $doneBytes = 0L
+
     $nameGroups = [Collections.Generic.List[object]]::new()
     $byName = @{}
     foreach ($e in $entries) {
@@ -425,50 +485,73 @@ function Invoke-DedupDownload($entries) {
         if ($byName.ContainsKey($nm)) { [void]$byName[$nm].Add($e) }
         else { $lst = [Collections.Generic.List[object]]::new(); [void]$lst.Add($e); $byName[$nm] = $lst; [void]$nameGroups.Add($lst) }
     }
+
     $files = 0; $renamed = 0; $logged = 0; $failed = 0; $gi = 0
     foreach ($grp in $nameGroups) {
         $gi++
         $members = @($grp)
+        $grpName = [string]$members[0].Name
+        $script:DownloadProgressData = @{ Kind='Saving'; Index=$gi; Total=$nameGroups.Count; Name=$grpName
+            DoneBytes=$doneBytes; TotalBytes=$totalBytes; ElapsedSec=([DateTime]::UtcNow - $dlStart).TotalSeconds }
+        Report-DownloadProgress @("Saving $gi / $($nameGroups.Count)", $grpName)
+        $savedFiles = [Collections.Generic.List[object]]::new()   # {Name;Size;Sev} per DISTINCT file written
+
         if ($members.Count -eq 1) {
             $e = $members[0]
-            Report-DownloadProgress @("Saving $gi / $($nameGroups.Count)", [string]$e.Name)
             $b = Get-DedupBytes $e
             if ($null -eq $b) { $failed++; continue }
             $h = if ("$($e.KnownHash)") { [string]$e.KnownHash } else { 'sha256:' + (Get-BytesSha256 $b) }
-            if (Save-DedupFile (Join-Path $script:OutDir ([string]$e.Name)) $b) { Write-DedupEntry $e $h; $files++; $logged++ } else { $failed++ }
-            continue
-        }
-        $contents = [Collections.Generic.List[object]]::new()
-        $byHash   = @{}
-        $mi = 0
-        foreach ($e in $members) {
-            $mi++
-            Report-DownloadProgress @("Hashing $gi / $($nameGroups.Count)", "$([string]$e.Name)  ($mi/$($members.Count))")
-            $h = [string]$e.KnownHash
-            $b = $null
-            if (-not $h) { $b = Get-DedupBytes $e; if ($b) { $h = 'sha256:' + (Get-BytesSha256 $b) } }
-            $key = if ($h) { 'h:' + $h.ToLower() } else { 'fb:' + [string]$e.Url }
-            if ($byHash.ContainsKey($key)) { [void]$byHash[$key].Members.Add($e) }
-            else {
-                $c = [PSCustomObject]@{ Hash = $h; Key = $key; Bytes = $b; Members = [Collections.Generic.List[object]]::new() }
-                [void]$c.Members.Add($e); $byHash[$key] = $c; [void]$contents.Add($c)
+            if (Save-DedupFile (Join-Path $script:OutDir ([string]$e.Name)) $b) {
+                Write-DedupEntry $e $h; $files++; $logged++; if ($e.Size -ge 0) { $doneBytes += [long]$e.Size }
+                $sz = if ($e.Size -ge 0) { [long]$e.Size } elseif ($b) { [long]$b.Length } else { -1 }
+                [void]$savedFiles.Add(@{ Name=[string]$e.Name; Size=$sz; Sev=[string]$e.Sev })
+            } else { $failed++ }
+        } else {
+            $contents = [Collections.Generic.List[object]]::new()
+            $byHash   = @{}
+            $mi = 0
+            foreach ($e in $members) {
+                $mi++
+                $h = [string]$e.KnownHash
+                $b = $null
+                if (-not $h) { $b = Get-DedupBytes $e; if ($b) { $h = 'sha256:' + (Get-BytesSha256 $b) } }
+                $key = if ($h) { 'h:' + $h.ToLower() } else { 'fb:' + [string]$e.Url }
+                $script:DownloadProgressData = @{ Kind='Hashing'; Index=$gi; Total=$nameGroups.Count
+                    Name=[string]$e.Name; MemberIndex=$mi; MemberCount=$members.Count; Hash=(Get-DedupTag $h ([string]$e.Url)) }
+                Report-DownloadProgress @("Hashing $gi / $($nameGroups.Count)", "$([string]$e.Name)  ($mi/$($members.Count))")
+                if ($byHash.ContainsKey($key)) { [void]$byHash[$key].Members.Add($e) }
+                else {
+                    $c = [PSCustomObject]@{ Hash = $h; Key = $key; Bytes = $b; Members = [Collections.Generic.List[object]]::new() }
+                    [void]$c.Members.Add($e); $byHash[$key] = $c; [void]$contents.Add($c)
+                }
+            }
+            $tagged = ($contents.Count -gt 1)   # >1 distinct content under one name -> disambiguate
+            foreach ($c in $contents) {
+                $primary  = $c.Members[0]
+                $destName = if ($tagged) { Add-NameTag ([string]$primary.Name) (Get-DedupTag $c.Hash $c.Key) } else { [string]$primary.Name }
+                $b = if ($c.Bytes) { $c.Bytes } else { Get-DedupBytes $primary }
+                if ($null -eq $b) { $failed += $c.Members.Count; continue }
+                if (Save-DedupFile (Join-Path $script:OutDir $destName) $b) {
+                    $files++; if ($tagged) { $renamed++ }
+                    $cSev = ''; $cRank = -1
+                    foreach ($e in $c.Members) {
+                        Write-DedupEntry $e $c.Hash; $logged++; if ($e.Size -ge 0) { $doneBytes += [long]$e.Size }
+                        $rk = Get-SevRank ([string]$e.Sev); if ($rk -gt $cRank) { $cRank = $rk; $cSev = [string]$e.Sev }
+                    }
+                    $cSize = if ($b) { [long]$b.Length } elseif ($primary.Size -ge 0) { [long]$primary.Size } else { -1 }
+                    [void]$savedFiles.Add(@{ Name=$destName; Size=$cSize; Sev=$cSev })
+                } else { $failed += $c.Members.Count }
             }
         }
-        $tagged = ($contents.Count -gt 1)
-        foreach ($c in $contents) {
-            $primary  = $c.Members[0]
-            $destName = if ($tagged) { Add-NameTag ([string]$primary.Name) (Get-DedupTag $c.Hash $c.Key) } else { [string]$primary.Name }
-            Report-DownloadProgress @("Saving $gi / $($nameGroups.Count)", $destName)
-            $b = if ($c.Bytes) { $c.Bytes } else { Get-DedupBytes $primary }
-            if ($null -eq $b) { $failed += $c.Members.Count; continue }
-            if (Save-DedupFile (Join-Path $script:OutDir $destName) $b) {
-                $files++; if ($tagged) { $renamed++ }
-                foreach ($e in $c.Members) { Write-DedupEntry $e $c.Hash; $logged++ }
-            } else { $failed += $c.Members.Count }
+        if ($savedFiles.Count -gt 0) {
+            $script:DownloadProgressData = @{ Kind='Saved'; BaseName=$grpName; Files=@($savedFiles.ToArray()) }
+            Report-DownloadProgress @("Saved", $grpName)
         }
     }
+    $script:DownloadProgressData = $null
     return [PSCustomObject]@{ Files = $files; Entries = $total; Renamed = $renamed; Failed = $failed; Identical = ($logged - $files) }
 }
+
 function Get-DedupDoneLine($res) {
     $extra = @()
     if ($res.Identical -gt 0) { $extra += "$($res.Identical) duplicate$(if ($res.Identical -ne 1){'s'}) merged" }
@@ -477,7 +560,6 @@ function Get-DedupDoneLine($res) {
     $tail = if ($extra.Count -gt 0) { ' (' + ($extra -join ', ') + ')' } else { '' }
     return "Done.  Saved $($res.Files) file$(if ($res.Files -ne 1){'s'}) from $($res.Entries) entr$(if ($res.Entries -ne 1){'ies'}else{'y'})$tail."
 }
-
 function Get-HttpErrorDetail($err) {
     $ex   = $err.Exception
     $code = 0
@@ -504,6 +586,7 @@ function Get-HttpErrorDetail($err) {
     if ($code -gt 0) { return "HTTP $code - $msg" }
     return $msg
 }
+
 function Get-AuthHeaders {
     $h = @{}
     if     ($ApiKey) { $h['X-JFrog-Art-Api'] = $ApiKey }
@@ -514,21 +597,26 @@ function Get-AuthHeaders {
     }
     return $h
 }
+
 function Get-ArtBase {
     $b = "$BaseUrl".TrimEnd('/')
     if ($b -match '/artifactory$') { return $b }
     return "$b/artifactory"
 }
+
 $script:RepoMap       = @{}
 $script:RepoMapLoaded = $false
-$script:MetaCache     = [hashtable]::Synchronized(@{})
+$script:MetaCache     = [hashtable]::Synchronized(@{})   # written by background prefetch threads
+
 $script:Alert    = [hashtable]::Synchronized(@{ Message = ''; At = [DateTime]::MinValue })
 $script:QueryMax = @{}
+
 $script:Flash = @{ Message = ''; At = [DateTime]::MinValue }
+
 function Initialize-RepoMap {
     if ($script:RepoMapLoaded) { return }
     if (Test-NetworkBlocked) { $script:RepoMapLoaded = $true; return }
-    $script:RepoMapLoaded = $true
+    $script:RepoMapLoaded = $true   # only attempt once, even if it fails
     $script:RepoMap = @{}
     try {
         $repos = Invoke-RestMethod -Uri "$(Get-ArtBase)/api/repositories" `
@@ -539,8 +627,9 @@ function Initialize-RepoMap {
                 PackageType = "$($r.packageType)"
             }
         }
-    } catch { }
+    } catch { }   # anonymous instances may deny this; columns degrade to '?'
 }
+
 function Resolve-Repo([string]$repo) {
     if ($script:RepoMap.ContainsKey($repo)) { return $script:RepoMap[$repo] }
     if ($repo -match '^(.*)-cache$' -and $script:RepoMap.ContainsKey($Matches[1])) {
@@ -549,7 +638,9 @@ function Resolve-Repo([string]$repo) {
     }
     return [PSCustomObject]@{ Type = '?'; PackageType = '?' }
 }
-$script:RepoTypeScope = @('local')
+
+$script:RepoTypeScope = @('local')   # lowercased rclass names, or the sentinel '*' = all (non-virtual)
+
 function Set-RepoTypeScope([string]$spec) {
     if (-not "$spec".Trim()) { $script:RepoTypeScope = @('local'); return }
     $s = "$spec".ToLower().Trim()
@@ -557,6 +648,7 @@ function Set-RepoTypeScope([string]$spec) {
     $list = @($s -split '[,\s]+' | Where-Object { $_ })
     $script:RepoTypeScope = if (@($list).Count -gt 0) { $list } else { @('local') }
 }
+
 function Test-RepoTypeInScope([string]$repo) {
     $t = "$((Resolve-Repo $repo).Type)".ToLower()
     if ($t -eq 'virtual')        { return $false }
@@ -565,6 +657,7 @@ function Test-RepoTypeInScope([string]$repo) {
     if ($script:RepoTypeScope -contains $t)  { return $true }
     return ($t -eq 'cache' -and ($script:RepoTypeScope -contains 'remote'))
 }
+
 function Get-RepoScopeDiagnostic {
     Initialize-RepoMap
     $scope = ($script:RepoTypeScope -join ',')
@@ -575,6 +668,7 @@ function Get-RepoScopeDiagnostic {
                 Sort-Object Count -Descending | ForEach-Object { "$($_.Count) $($_.Name)" })
     return "/api/repositories returned $($script:RepoMap.Count) repo(s) (types: $($byType -join ', ')), but 0 are in the active type scope '$scope' (virtual repos are always excluded). Widen with --all-repos (or --repo-types local,remote,...), or name repos with -r/--repos."
 }
+
 function Apply-Meta([object[]]$Items) {
     if ($null -eq $Items) { return }
     foreach ($it in $Items) {
@@ -585,25 +679,29 @@ function Apply-Meta([object[]]$Items) {
         }
     }
 }
+
 function Get-MissingMeta([object[]]$Items) {
     if ($null -eq $Items) { return 0 }
     @($Items | Where-Object { $_ -and -not $script:MetaCache.ContainsKey($_.Uri) }).Count
 }
+
 function Get-LoadingMeta([object[]]$Items) {
     if ($null -eq $Items) { return 0 }
     @($Items | Where-Object {
         $_ -and -not $script:MetaCache.ContainsKey($_.Uri) -and $script:PfQueued.ContainsKey($_.Uri)
     }).Count
 }
+
 function Wait-Meta([object[]]$Items, [int]$TimeoutMs) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
     while ((Get-MissingMeta $Items) -gt 0 -and [DateTime]::UtcNow -lt $deadline) {
         Receive-Prefetch
-        if ((Get-LoadingMeta $Items) -eq 0) { Start-Prefetch $Items }
+        if ((Get-LoadingMeta $Items) -eq 0) { Start-Prefetch $Items }   # retry stragglers
         Start-Sleep -Milliseconds 60
     }
     Apply-Meta $Items
 }
+
 function Convert-UriToItem([string]$uri) {
     $marker = '/api/storage/'
     $idx    = $uri.IndexOf($marker)
@@ -621,15 +719,17 @@ function Convert-UriToItem([string]$uri) {
         Path     = $path
         Uri      = $uri
         FileType = Get-Ext $name
-        Size     = ''
+        Size     = ''           # size + modified + hash filled lazily from storage metadata
         Modified = ''
-        Hash     = ''
+        Hash     = ''           # content identity as '<algo>:<hex>' (sha256/sha1/md5)
     }
 }
+
 function Search-Artifacts([string]$Query) {
     if (Test-SearchLocalOnly) { return [PSCustomObject]@{ Items = @(); Total = 0; Error = $null } }
     $uri = "$(Get-ArtBase)/api/search/artifact?name=$([Uri]::EscapeDataString($Query))"
     if ($Repos) { $uri += "&repos=$([Uri]::EscapeDataString($Repos))" }
+
     try {
         $resp  = Invoke-RestMethod -Uri $uri -Method Get -Headers (Get-AuthHeaders) -ErrorAction Stop
         $items = @()
@@ -641,14 +741,16 @@ function Search-Artifacts([string]$Query) {
             $items = @($items | Where-Object { Test-RepoTypeInScope $_.Repo })
         }
         $total = $items.Count
+
         $prev = if ($script:QueryMax.ContainsKey($Query)) { $script:QueryMax[$Query] } else { 0 }
         if ($prev -gt 0 -and $total -lt [int]($prev * 0.8)) {
             $script:Alert.Message = "Results may be incomplete: got $total, but saw $prev earlier for '$Query' - the server may be throttling. Press [s] to search again."
             $script:Alert.At      = [DateTime]::UtcNow
         } else {
-            $script:Alert.Message = ''
+            $script:Alert.Message = ''   # clear any stale notice on a clean result
         }
         if ($total -gt $prev) { $script:QueryMax[$Query] = $total }
+
         return [PSCustomObject]@{ Items = $items; Total = $total; Error = $null }
     }
     catch {
@@ -656,45 +758,56 @@ function Search-Artifacts([string]$Query) {
     }
 }
 
-$script:ArcSearchEnabled = $false
-$script:IndexEnabled     = $true
-$script:IndexPath        = ''
-$script:IndexPathExplicit = $false
-$script:IndexLoaded    = $false
-$script:IndexCount     = 0
-$script:IndexPersisted = New-Object 'System.Collections.Generic.HashSet[string]'
-$script:IndexWroteTick = $false
+
+$script:ArcSearchEnabled = $false   # archive-search WALK off by default; [w] toggles in the TUI
+$script:IndexEnabled     = $true    # local index on by default; [W] toggles in the TUI
+$script:IndexPath        = ''       # resolved per instance by Resolve-IndexPath (host-scoped DIRECTORY of CSV shards)
+$script:IndexPathExplicit = $false  # set when a path was supplied (flag), so Resolve leaves it alone
+
+$script:IndexLoaded    = $false   # lightweight startup ran once this session (migration + skip-set load)
+$script:IndexCount     = 0        # records WRITTEN this session (footer hint; NOT a disk total - we never scan to count)
+$script:IndexPersisted = New-Object 'System.Collections.Generic.HashSet[string]'  # storage uris known on disk THIS SESSION (warmed-from-shard or written): a write-through dedupe guard, bounded by browse volume - no longer the whole instance
+$script:IndexWroteTick = $false   # set when a write happened (drives the TUI '(writing)' hint)
+
 $script:ShardCache        = [Collections.Specialized.OrderedDictionary]::new()
 $script:ShardCacheRows    = 0
 $script:ShardCacheMaxRows = 500000
-$script:IndexManifest     = $null
-$script:ArcIndexedLoaded  = $false
+$script:IndexManifest     = $null   # @{ ByRepo=@{repo->stem}; ByStem=@{stem->repo}; Used=@{stem->1} }, loaded once
+$script:ArcIndexedLoaded  = $false  # _archives.csv has been read into ArcIndexedArchives this session
 $script:MetaOrder         = [Collections.Generic.Queue[string]]::new()
 $script:MetaCacheMax      = 200000
 $script:ArcBucketCount    = 256
-$script:ArcSearchState   = 'idle'
-$script:ArcSearchQuery   = ''
+
+$script:ArcSearchState   = 'idle'   # idle | walking | done
+$script:ArcSearchQuery   = ''       # current query, lowercased, for Contains matching
+
 $script:ArcSearchResults    = [Collections.Generic.List[object]]::new()
 $script:ArcSearchResultKeys = New-Object 'System.Collections.Generic.HashSet[string]'
 $script:ArcSearchDrained    = 0
+
 $script:ArcIndexEntries    = [Collections.Generic.List[object]]::new()
 $script:ArcIndexedArchives = New-Object 'System.Collections.Generic.HashSet[string]'
 $script:ArcAttempted       = New-Object 'System.Collections.Generic.HashSet[string]'
+
 $script:ArcSkipVersions  = $true
 $script:ArcVersionSeen   = New-Object 'System.Collections.Generic.HashSet[string]'
+
 $script:ArcWalkPS     = $null
 $script:ArcWalkHandle = $null
 $script:ArcWalkCancel = $null
 $script:ArcWalkOut    = $null
 $script:ArcWalkReap   = [Collections.Generic.List[object]]::new()
+
 $script:ArcQueue   = [Collections.Generic.Queue[object]]::new()
 $script:ArcPool    = $null
 $script:ArcJobs    = [Collections.Generic.List[object]]::new()
 $script:ArcFetch   = [hashtable]::Synchronized(@{})
 $script:ArcThrottle   = @{ MaxConcurrent = 3; MinIntervalMs = 150 }
 $script:ArcLastLaunch = [DateTime]::MinValue
-$script:ArcMaxWorkers = 20
+$script:ArcMaxWorkers = 20   # raised from 10: the tree now flattens in the worker, not the main thread
+
 $script:ArcSearchDirty = $false
+
 $script:ArcWalkScript = {
     param($artBase, $headers, $repos, $arcSet, $out, $cancel, $paceMs, $maxPending)
     $stack = New-Object 'System.Collections.Generic.Stack[object]'
@@ -722,10 +835,11 @@ $script:ArcWalkScript = {
                     }
                 }
             }
-        } catch { }
+        } catch { }   # denied / unreadable folders are skipped silently
         if ($paceMs -gt 0) { Start-Sleep -Milliseconds $paceMs }
     }
 }
+
 $script:ArcExpandScript = {
     param($key, $uri, $body, $headers, $ua, $cache, $alert)
     $attempt = 0
@@ -769,6 +883,7 @@ $script:ArcExpandScript = {
         }
     }
 }
+
 $script:ArcNodeFns = $null
 function Get-ArcNodeFns {
     if ($null -eq $script:ArcNodeFns) {
@@ -780,16 +895,19 @@ function Get-ArcNodeFns {
     }
     return $script:ArcNodeFns
 }
+
 function Get-ArcSearchWalkRepos {
     if ($Repos) { return @($Repos -split '[,\s]+' | Where-Object { $_ }) }
     Initialize-RepoMap
     return @($script:RepoMap.Keys | Where-Object { Test-RepoTypeInScope $_ })
 }
+
 function Get-ArcExtSet {
     $hs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($e in $script:ArchiveExts) { [void]$hs.Add($e) }
     return $hs
 }
+
 function Get-ArcArchivePath([string]$p, [string]$n) {
     if ($p) { return "$p/$n" }
     return $n
@@ -827,6 +945,7 @@ function Split-ArcInternalPath([string]$ip) {
     if ($slash -ge 0) { return @{ Name = $s.Substring($slash + 1); Dir = $s.Substring(0, $slash) } }
     return @{ Name = $s; Dir = '' }
 }
+
 function Set-IndexPath([string]$path) {
     $script:IndexPath = $path
     $script:IndexPathExplicit = [bool]$path
@@ -835,6 +954,7 @@ function Resolve-IndexPath {
     if ($script:IndexPathExplicit -and $script:IndexPath) { return }
     $script:IndexPath = Join-Path (Get-OutputInstanceRoot) 'index'
 }
+
 function Confirm-IndexDir {
     if (-not $script:IndexPath) { return $false }
     if (-not (Test-Path -LiteralPath $script:IndexPath)) {
@@ -878,7 +998,7 @@ function Get-ArcBucket([string]$s) {
     $h = [uint64]2166136261
     foreach ($ch in $s.ToCharArray()) {
         $h = $h -bxor [uint64][int]$ch
-        $h = ($h * [uint64]16777619) -band [uint64]4294967295
+        $h = ($h * [uint64]16777619) -band [uint64]4294967295   # FNV-1a, low 32 bits
     }
     return [int]($h % [uint64]$script:ArcBucketCount)
 }
@@ -903,6 +1023,7 @@ function Get-IndexedRepos {
     $m = Get-IndexManifest
     return @($m.ByRepo.Keys)
 }
+
 function New-ArcIndexEntry([string]$repo, [string]$archDir, [string]$archName, [string]$internalPath, $size, [string]$modified) {
     $sz = -1; if ("$size" -match '^-?\d+$') { $sz = [long]$size }
     $archPath = Get-ArcArchivePath $archDir $archName
@@ -915,6 +1036,7 @@ function New-ArcIndexEntry([string]$repo, [string]$archDir, [string]$archName, [
         Size=$sz; Modified=$modified
     }
 }
+
 function New-ArcResultItem($e) {
     return [PSCustomObject]@{
         Name        = [string]$e.Name
@@ -930,11 +1052,13 @@ function New-ArcResultItem($e) {
         EntryUrl    = [string]$e.EntryUrl
     }
 }
+
 function New-IndexResultItem([string]$uri) {
     $it = Convert-UriToItem $uri
     Apply-Meta @($it)
     return $it
 }
+
 function Add-ArcSearchMatch($e) {
     $url = [string]$e.EntryUrl
     if (-not $url -or -not $script:ArcSearchResultKeys.Add($url)) { return $false }
@@ -942,10 +1066,12 @@ function Add-ArcSearchMatch($e) {
     $script:ArcSearchDirty = $true
     return $true
 }
+
 function Test-ArcNameMatches([string]$name) {
     if (-not $script:ArcSearchQuery) { return $false }
     return ([string]$name).ToLower().Contains($script:ArcSearchQuery)
 }
+
 function Import-Index([string]$path) {
     if ($script:IndexLoaded) { return }
     $script:IndexLoaded = $true
@@ -954,6 +1080,7 @@ function Import-Index([string]$path) {
     Convert-FlatArchiveShards
     Ensure-ArcIndexedLoaded
 }
+
 function Convert-FlatArchiveShards {
     if (-not $script:IndexPath -or -not (Test-Path -LiteralPath $script:IndexPath)) { return }
     $flat = @(Get-ChildItem -LiteralPath $script:IndexPath -File -ErrorAction SilentlyContinue |
@@ -973,7 +1100,7 @@ function Convert-FlatArchiveShards {
         if (-not (Test-Path -LiteralPath $arcDir)) {
             try { New-Item -ItemType Directory -Path $arcDir -Force | Out-Null } catch { continue }
         }
-        $buf = @{}
+        $buf = @{}            # bucketPath -> StringBuilder
         $buffered = 0
         try {
             foreach ($line in [System.IO.File]::ReadLines($file.FullName)) {
@@ -1000,6 +1127,7 @@ function Save-ArcBucketBuffer($buf) {
         }
     }
 }
+
 function Convert-LegacyIndex {
     if (-not $script:IndexPath) { return }
     $legacy = $script:IndexPath.TrimEnd('\','/') + '.jsonl'
@@ -1029,6 +1157,7 @@ function Convert-LegacyIndex {
     }
     try { Move-Item -LiteralPath $legacy -Destination ($legacy + '.migrated') -Force } catch { }
 }
+
 function Ensure-ArcIndexedLoaded {
     if ($script:ArcIndexedLoaded) { return }
     $script:ArcIndexedLoaded = $true
@@ -1046,6 +1175,7 @@ function Ensure-ArcIndexedLoaded {
         }
     } catch { }
 }
+
 function Write-IndexArtifactRow([string]$repo, [string]$path, [string]$name, $size, [string]$modified) {
     if (-not (Confirm-IndexDir)) { return $false }
     $sz = ''
@@ -1067,10 +1197,12 @@ function Write-IndexArtifactRow([string]$repo, [string]$path, [string]$name, $si
         return $true
     } catch { return $false }
 }
+
 $script:IndexWriteBuffered  = $false
 $script:ShardWriteBuf       = @{}
 $script:ShardWriteBufRows   = @{}
 $script:ShardWriteFlushRows = 256
+
 function Flush-IndexShardBuf([string]$sp) {
     $sb = $script:ShardWriteBuf[$sp]
     if ($null -eq $sb -or $sb.Length -eq 0) { return }
@@ -1078,21 +1210,23 @@ function Flush-IndexShardBuf([string]$sp) {
     [void]$sb.Clear()
     $script:ShardWriteBufRows[$sp] = 0
 }
+
 function Flush-IndexWrites {
     foreach ($sp in @($script:ShardWriteBuf.Keys)) { Flush-IndexShardBuf $sp }
 }
+
 function Save-IndexArchive([string]$arcRepo, [string]$arcDir, [string]$arcName, $entries) {
     if (-not $script:IndexEnabled -or -not (Confirm-IndexDir) -or -not (Confirm-ArchiveDir $arcRepo)) { return }
     try {
         $sb = [Text.StringBuilder]::new()
         $cnt = 0
         foreach ($e in @($entries)) {
-            if ($null -eq $e) { continue }
+            if ($null -eq $e) { continue }   # $entries may be $null (empty-list unroll) -> @($null) yields one null
             $sz = $(if ($e.Size -ge 0) { [long]$e.Size } else { -1 })
             [void]$sb.Append((Format-CsvRow @($arcDir, $arcName, [string]$e.InternalPath, $sz, [string]$e.Modified))).Append("`n")
             $cnt++
         }
-        if ($cnt -eq 0) { [void]$sb.Append((Format-CsvRow @($arcDir, $arcName, '', -1, ''))).Append("`n") }
+        if ($cnt -eq 0) { [void]$sb.Append((Format-CsvRow @($arcDir, $arcName, '', -1, ''))).Append("`n") }   # empty-archive marker
         [System.IO.File]::AppendAllText((Get-ArchiveBucketPath $arcRepo $arcDir $arcName), $sb.ToString(), [Text.UTF8Encoding]::new($false))
         $arcLine = Format-CsvRow @($arcRepo, $arcDir, $arcName)
         [System.IO.File]::AppendAllText((Join-Path $script:IndexPath '_archives.csv'),
@@ -1101,6 +1235,7 @@ function Save-IndexArchive([string]$arcRepo, [string]$arcDir, [string]$arcName, 
         $script:IndexWroteTick = $true
     } catch { }
 }
+
 function Update-IndexFromMeta($items) {
     if (-not $script:IndexEnabled -or -not $script:IndexPath) { return 0 }
     $wrote = 0
@@ -1121,8 +1256,10 @@ function Update-IndexFromMeta($items) {
     if ($wrote -gt 0) { $script:IndexWroteTick = $true }
     return $wrote
 }
+
 $script:IndexSearchTotal = 0
 $script:IndexSearchMax   = 5000
+
 $script:IndexProgress     = $null
 $script:IndexProgressLast = [DateTime]::MinValue
 function Report-IndexProgress([string[]]$lines) {
@@ -1131,6 +1268,7 @@ function Report-IndexProgress([string[]]$lines) {
     $script:IndexProgressLast = [DateTime]::UtcNow
     & $script:IndexProgress $lines
 }
+
 function Search-Index([string]$query, [int]$skip = 0, [int]$take = 0, [switch]$WantTotal) {
     $q = "$query".ToLower()
     $script:IndexSearchTotal = 0
@@ -1140,7 +1278,7 @@ function Search-Index([string]$query, [int]$skip = 0, [int]$take = 0, [switch]$W
     $out     = [Collections.Generic.List[object]]::new()
     $matched = 0
     $limit   = if ($take -gt 0) { $skip + $take } else { [int]::MaxValue }
-    $scanAll = ([bool]$WantTotal -or $take -le 0)
+    $scanAll = ([bool]$WantTotal -or $take -le 0)   # keep counting past the window for the total
     $reposArr   = @($repos)
     $nrepo      = $reposArr.Count
     $ridx       = 0
@@ -1154,7 +1292,7 @@ function Search-Index([string]$query, [int]$skip = 0, [int]$take = 0, [switch]$W
             $en = [System.IO.File]::ReadLines($sp).GetEnumerator()
             try {
                 while ($en.MoveNext()) {
-                    if (-not $scanAll -and $matched -ge $limit) { break scan }
+                    if (-not $scanAll -and $matched -ge $limit) { break scan }   # window built; stop
                     if ($reportProg) {
                         $scanned++
                         if (($scanned % 20000) -eq 0) { Report-IndexProgress @('Loading offline index', "repo $ridx of $nrepo", "$matched match(es) $([char]0x00B7) $scanned rows scanned") }
@@ -1200,9 +1338,10 @@ function Search-Index([string]$query, [int]$skip = 0, [int]$take = 0, [switch]$W
             } catch { } finally { $en.Dispose() }
         }
     }
-    if ($scanAll) { $script:IndexSearchTotal = $matched }
+    if ($scanAll) { $script:IndexSearchTotal = $matched }   # full count (window calls don't clobber it)
     return @($out.ToArray())
 }
+
 function Search-ArcIndex {
     if (-not $script:ArcSearchQuery -or -not $script:IndexPath) { return }
     foreach ($repo in (Get-ArcSearchWalkRepos)) {
@@ -1222,6 +1361,7 @@ function Search-ArcIndex {
         }
     }
 }
+
 function Get-IndexRelKey([string]$path, [string]$name) {
     if ($path) { return "$path/$name" }
     return $name
@@ -1229,7 +1369,7 @@ function Get-IndexRelKey([string]$path, [string]$name) {
 function Get-RepoIndexTable([string]$repo) {
     if ($script:ShardCache.Contains($repo)) {
         $entry = $script:ShardCache[$repo]
-        $script:ShardCache.Remove($repo); $script:ShardCache[$repo] = $entry
+        $script:ShardCache.Remove($repo); $script:ShardCache[$repo] = $entry   # touch -> MRU
         return $entry.Table
     }
     $table = @{}
@@ -1277,7 +1417,7 @@ function Warm-IndexMeta($items) {
         $m = $table[$rk]
         $script:MetaCache[$u] = [PSCustomObject]@{ Size = $m.Size; Modified = $m.Modified; Hash = '' }
         $script:MetaOrder.Enqueue($u)
-        [void]$script:IndexPersisted.Add($u)
+        [void]$script:IndexPersisted.Add($u)   # already on disk - don't write-through again
         $warmed++
     }
     if ($warmed -gt 0) { Limit-MetaCache @($items | ForEach-Object { if ($_) { [string]$_.Uri } }) }
@@ -1297,6 +1437,7 @@ function Limit-MetaCache([string[]]$protect) {
         }
     } finally { [System.Threading.Monitor]::Exit($sr) }
 }
+
 function Start-ArcSearchWalk {
     Stop-ArcSearchWalk
     $repos = Get-ArcSearchWalkRepos
@@ -1313,6 +1454,7 @@ function Start-ArcSearchWalk {
     $script:ArcWalkHandle = $ps.BeginInvoke()
     return $true
 }
+
 function Step-ArcSearchWalk {
     if ($null -eq $script:ArcWalkOut) { return }
     $batch = @()
@@ -1328,6 +1470,7 @@ function Step-ArcSearchWalk {
     foreach ($uri in $batch) { Add-ArcExpandJob ([string]$uri) }
     Receive-ArcWalk
 }
+
 function Receive-ArcWalk {
     if ($script:ArcWalkReap.Count -eq 0) { return }
     $still = [Collections.Generic.List[object]]::new()
@@ -1337,19 +1480,22 @@ function Receive-ArcWalk {
     }
     $script:ArcWalkReap = $still
 }
+
 function Test-ArcSearchWalkActive {
     $running = ($null -ne $script:ArcWalkHandle -and -not $script:ArcWalkHandle.IsCompleted)
     $pending = ($null -ne $script:ArcWalkOut -and $script:ArcWalkOut.Count -gt 0)
     return ($running -or $pending)
 }
+
 function Stop-ArcSearchWalk {
     if ($script:ArcWalkCancel) { $script:ArcWalkCancel.stop = $true }
     if ($script:ArcWalkPS) { $script:ArcWalkReap.Add([PSCustomObject]@{ PS=$script:ArcWalkPS; Handle=$script:ArcWalkHandle }) }
     $script:ArcWalkPS = $null; $script:ArcWalkHandle = $null; $script:ArcWalkCancel = $null; $script:ArcWalkOut = $null
     Receive-ArcWalk
 }
+
 function Add-ArcExpandJob([string]$arcUri) {
-    if (-not $arcUri -or (Test-NetworkBlocked)) { return }
+    if (-not $arcUri -or (Test-NetworkBlocked)) { return }   # offline 'all' issues no expansions
     $item = Convert-UriToItem $arcUri
     $repo = [string]$item.Repo
     $archPath = Get-ArcArchivePath ([string]$item.Path) ([string]$item.Name)
@@ -1357,7 +1503,7 @@ function Add-ArcExpandJob([string]$arcUri) {
     if ($script:ArcIndexedArchives.Contains($canon) -or -not $script:ArcAttempted.Add($canon)) { return }
     if ($script:ArcSkipVersions) {
         $vk = Get-ArcVersionKey $repo ([string]$item.Path) ([string]$item.Name)
-        if (-not $script:ArcVersionSeen.Add($vk)) { return }
+        if (-not $script:ArcVersionSeen.Add($vk)) { return }   # a version of this artifact already taken
     }
     $tbr = Get-TreeBrowseRequest $repo (Get-RepoTypeForUI $repo) `
                ([string](Resolve-Repo $repo).PackageType) $archPath ([string]$item.Name)
@@ -1366,6 +1512,7 @@ function Add-ArcExpandJob([string]$arcUri) {
         Uri=$tbr.Uri; Body=$tbr.Body; Headers=$tbr.Headers; Ua=$tbr.Ua
     })
 }
+
 function Dispatch-ArcExpand {
     $maxc = [Math]::Max(1, [Math]::Min($script:ArcMaxWorkers, [int]$script:ArcThrottle.MaxConcurrent))
     $iv   = [int]$script:ArcThrottle.MinIntervalMs
@@ -1378,16 +1525,17 @@ function Dispatch-ArcExpand {
         }
         $ps = [PowerShell]::Create()
         $ps.RunspacePool = $script:ArcPool
-        [void]$ps.AddScript($script:PvErrFn)
-        [void]$ps.AddScript((Get-ArcNodeFns))
+        [void]$ps.AddScript($script:PvErrFn)        # define Get-WkError in the worker scope
+        [void]$ps.AddScript((Get-ArcNodeFns))       # define the node helpers the worker flattens with
         [void]$ps.AddScript($script:ArcExpandScript).
             AddArgument($rec.Key).AddArgument($rec.Uri).AddArgument($rec.Body).
             AddArgument($rec.Headers).AddArgument($rec.Ua).AddArgument($script:ArcFetch).AddArgument($script:Alert)
         $script:ArcJobs.Add([PSCustomObject]@{ PS=$ps; Handle=$ps.BeginInvoke(); Rec=$rec })
         $script:ArcLastLaunch = [DateTime]::UtcNow
-        if ($iv -gt 0) { break }
+        if ($iv -gt 0) { break }   # paced: one launch per tick
     }
 }
+
 function Receive-ArcExpand {
     if ($script:ArcJobs.Count -eq 0) { return }
     $still = [Collections.Generic.List[object]]::new()
@@ -1400,10 +1548,11 @@ function Receive-ArcExpand {
     }
     $script:ArcJobs = $still
 }
+
 function Build-ArcIndexEntries([string]$repo, [string]$archDir, [string]$archName, $nodes) {
     $entries = [Collections.Generic.List[object]]::new()
     Add-ArcEntriesFromNodes $repo $archDir $archName $nodes $entries
-    return ,$entries
+    return ,$entries   # comma-wrap so an EMPTY list isn't unrolled to $null on return
 }
 function Add-ArcEntriesFromNodes([string]$repo, [string]$archDir, [string]$archName, $nodes, $acc) {
     foreach ($n in @($nodes)) {
@@ -1418,11 +1567,13 @@ function Add-ArcEntriesFromNodes([string]$repo, [string]$archDir, [string]$archN
         $acc.Add((New-ArcIndexEntry $repo $archDir $archName $internalPath $sz $mod))
     }
 }
+
 function Complete-ArcExpand($rec) {
     $key = [string]$rec.Key
     $res = $null
     if ($script:ArcFetch.ContainsKey($key)) { $res = $script:ArcFetch[$key]; [void]$script:ArcFetch.Remove($key) }
     if ($null -eq $res -or -not $res.Ok) { $script:ArcSearchDirty = $true; return }
+
     $entries = @($res.Entries)
     if ($script:ArcSearchQuery) {
         foreach ($t in $entries) {
@@ -1435,6 +1586,7 @@ function Complete-ArcExpand($rec) {
     Save-IndexArchive $rec.ArcRepo $rec.ArcPath $rec.ArcName $entries
     $script:ArcSearchDirty = $true
 }
+
 function Save-BrowsedArchive([object]$item, $nodes) {
     if (-not $script:IndexEnabled -or $null -eq $item) { return }
     $repo = [string]$item.Repo; $archDir = [string]$item.Path; $archName = [string]$item.Name
@@ -1445,6 +1597,7 @@ function Save-BrowsedArchive([object]$item, $nodes) {
     [void]$script:ArcIndexedArchives.Add($canon)
     Save-IndexArchive $repo $archDir $archName $entries
 }
+
 function Confirm-ArcTreeDir([string]$dir, [hashtable]$childrenOf, [hashtable]$folderNodes) {
     if ($childrenOf.ContainsKey($dir)) { return }
     $cur = ''
@@ -1461,6 +1614,7 @@ function Confirm-ArcTreeDir([string]$dir, [hashtable]$childrenOf, [hashtable]$fo
         }
     }
 }
+
 function Build-ArchiveTreeFromIndex($item) {
     $repo    = [string]$item.Repo
     $archDir = [string]$item.Path
@@ -1482,6 +1636,7 @@ function Build-ArchiveTreeFromIndex($item) {
             }
         } catch { }
     }
+
     $childrenOf  = @{ '' = [Collections.Generic.List[object]]::new() }
     $folderNodes = @{}
     foreach ($e in $entries) {
@@ -1498,6 +1653,7 @@ function Build-ArchiveTreeFromIndex($item) {
     foreach ($dir in @($folderNodes.Keys)) { $folderNodes[$dir].children = @($childrenOf[$dir].ToArray()) }
     return [PSCustomObject]@{ Ok = $true; Nodes = @($childrenOf[''].ToArray()); Error = '' }
 }
+
 function Invoke-ArcSearchPump {
     if ($script:ArcSearchState -ne 'walking') { return }
     Receive-ArcExpand
@@ -1507,6 +1663,7 @@ function Invoke-ArcSearchPump {
         $script:ArcSearchState = 'done'; $script:ArcSearchDirty = $true
     }
 }
+
 function Receive-ArcSearchResults {
     $out = @()
     if ($script:ArcSearchDrained -lt $script:ArcSearchResults.Count) {
@@ -1516,6 +1673,7 @@ function Receive-ArcSearchResults {
     }
     return $out
 }
+
 function Start-ArcSearch([string]$query, $restItems) {
     Stop-ArcSearch
     $script:ArcSearchQuery   = ([string]$query).ToLower()
@@ -1531,6 +1689,7 @@ function Start-ArcSearch([string]$query, $restItems) {
     $script:ArcSearchState = 'walking'
     [void](Start-ArcSearchWalk)
 }
+
 function Stop-ArcSearch {
     Stop-ArcSearchWalk
     foreach ($j in $script:ArcJobs) {
@@ -1547,6 +1706,7 @@ function Stop-ArcSearch {
     }
     if ($script:ArcSearchState -eq 'walking') { $script:ArcSearchState = 'idle' }
 }
+
 function Reset-ArcSearch {
     Stop-ArcSearch
     $script:ArcSearchState   = 'idle'; $script:ArcSearchQuery = ''
@@ -1566,12 +1726,13 @@ function Reset-ArcSearch {
     $script:MetaOrder          = [Collections.Generic.Queue[string]]::new()
     $script:IndexCount         = 0
 }
+
 $script:IndexWalkScript = {
     param($artBase, $headers, $folderStack, $out, $cancel, $active, $paceMs, $maxPending)
     $lock = $active.SyncRoot
     while ($true) {
         if ($cancel.stop) { break }
-        [System.Threading.Monitor]::Enter($lock); $active.n++; [System.Threading.Monitor]::Exit($lock)
+        [System.Threading.Monitor]::Enter($lock); $active.n++; [System.Threading.Monitor]::Exit($lock)   # claim a slot before pop (race-free)
         $node = $null
         if (-not $folderStack.TryPop([ref]$node)) {
             [System.Threading.Monitor]::Enter($lock); $active.n--; $a = $active.n; [System.Threading.Monitor]::Exit($lock)
@@ -1594,17 +1755,18 @@ $script:IndexWalkScript = {
                         }
                     }
                 }
-            } catch { }
+            } catch { }   # denied/unreadable folders are skipped silently
         } finally { [System.Threading.Monitor]::Enter($lock); $active.n--; [System.Threading.Monitor]::Exit($lock) }
         if ($paceMs -gt 0) { Start-Sleep -Milliseconds $paceMs }
     }
 }
+
 $script:IdxMetaWorkerScript = {
     param($inQ, $outQ, $ctl, $headers, $ordinal)
     while (-not $ctl.Cancel) {
-        if ($ordinal -ge [int]$ctl.Target) { Start-Sleep -Milliseconds 25; continue }
+        if ($ordinal -ge [int]$ctl.Target) { Start-Sleep -Milliseconds 25; continue }   # parked above target
         $uri = $null
-        if (-not $inQ.TryDequeue([ref]$uri)) { Start-Sleep -Milliseconds 15; continue }
+        if (-not $inQ.TryDequeue([ref]$uri)) { Start-Sleep -Milliseconds 15; continue }  # input empty: wait
         $attempt = 0
         while ($true) {
             try {
@@ -1618,8 +1780,8 @@ $script:IdxMetaWorkerScript = {
                 $code = 0
                 try { if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } } catch { }
                 $throttle  = ($code -eq 429 -or $code -eq 503)
-                $transient = ($throttle -or $code -eq 0 -or $code -eq 502 -or $code -eq 504)
-                if ($throttle) { $ctl.LastThrottle = [DateTime]::UtcNow }
+                $transient = ($throttle -or $code -eq 0 -or $code -eq 502 -or $code -eq 504)   # 0 = timeout / conn reset
+                if ($throttle) { $ctl.LastThrottle = [DateTime]::UtcNow }   # signal the AIMD controller
                 if ($transient -and $attempt -lt 3) {
                     $attempt++
                     Start-Sleep -Milliseconds ([int]([Math]::Pow(2, $attempt) * 150) + (Get-Random -Minimum 0 -Maximum 250))
@@ -1633,31 +1795,35 @@ $script:IdxMetaWorkerScript = {
         if ($d -gt 0) { Start-Sleep -Milliseconds $d }
     }
 }
-$script:IdxBuildState = 'idle'
-$script:IdxBuildArchives = $false
-$script:IdxEnq  = 0
-$script:IdxDone = 0
-$script:IdxSeen = New-Object 'System.Collections.Generic.HashSet[string]'
-$script:IdxResume  = $false
-$script:IdxSkipped = 0
-$script:IdxWalkConcurrency = 8
+
+$script:IdxBuildState = 'idle'    # idle | building | done
+$script:IdxBuildArchives = $false # also expand+index listable archives
+$script:IdxEnq  = 0               # files dispatched for metadata
+$script:IdxDone = 0               # files persisted (or failed)
+$script:IdxSeen = New-Object 'System.Collections.Generic.HashSet[string]'  # uris dispatched this run (intra-run dedupe)
+$script:IdxResume  = $false       # (F) --resume: skip the metadata GET for files already in the shards
+$script:IdxSkipped = 0            # files skipped this run because they were already indexed (resume)
+
+$script:IdxWalkConcurrency = 8    # aggressive default; overridden by --walkers
 $script:IdxWalkPool   = $null
 $script:IdxWalkers    = [Collections.Generic.List[object]]::new()
 $script:IdxWalkCancel = $null
 $script:IdxWalkFolderStack = $null
 $script:IdxWalkActive  = $null
 $script:IdxWalkOut = $null; $script:IdxWalkReap = [Collections.Generic.List[object]]::new()
-$script:IdxMetaQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
-$script:IdxOutQueue  = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+
+$script:IdxMetaQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()   # input: file uris
+$script:IdxOutQueue  = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()   # output: result records
 $script:IdxCtl       = [hashtable]::Synchronized(@{ Cancel = $false; Target = 0; Delay = 0; LastThrottle = [DateTime]::MinValue })
 $script:IdxMetaPool  = $null
-$script:IdxWorkers   = [Collections.Generic.List[object]]::new()
-$script:IdxThrottle  = @{ MaxConcurrent = 32; MinIntervalMs = 0 }
-$script:IdxMaxWorkers = 100
-$script:IdxAimdMaxTarget  = 0
-$script:IdxAimdReactedTo  = [DateTime]::MinValue
-$script:IdxAimdLastChange = [DateTime]::MinValue
+$script:IdxWorkers   = [Collections.Generic.List[object]]::new()   # the long-lived worker {PS;Handle}
+$script:IdxThrottle  = @{ MaxConcurrent = 32; MinIntervalMs = 0 }   # aggressive default: 32 metadata workers
+$script:IdxMaxWorkers = 100   # ceiling for --workers / the metadata runspace pool
+$script:IdxAimdMaxTarget  = 0                   # pool size = Target ceiling; set in Start-IdxMetaPool
+$script:IdxAimdReactedTo  = [DateTime]::MinValue # the LastThrottle stamp we've already reacted to
+$script:IdxAimdLastChange = [DateTime]::MinValue # rate-limits how often AIMD adjusts
 $script:IdxQueueCap  = 8000
+
 function Start-IndexWalk {
     Stop-IndexWalk
     $repos = Get-ArcSearchWalkRepos
@@ -1667,7 +1833,7 @@ function Start-IndexWalk {
     $script:IdxWalkCancel = [hashtable]::Synchronized(@{ stop = $false })
     $script:IdxWalkFolderStack = [System.Collections.Concurrent.ConcurrentStack[object]]::new()
     foreach ($r in @($repos)) { $script:IdxWalkFolderStack.Push([PSCustomObject]@{ Repo = $r; Rel = '' }) }
-    $script:IdxWalkActive = [hashtable]::Synchronized(@{ n = 0 })
+    $script:IdxWalkActive = [hashtable]::Synchronized(@{ n = 0 })   # atomic active-walker counter (Monitor-guarded)
     $script:IdxWalkPool = [RunspaceFactory]::CreateRunspacePool($k, $k)
     $script:IdxWalkPool.Open()
     $artBase = Get-ArtBase; $headers = Get-AuthHeaders
@@ -1682,6 +1848,7 @@ function Start-IndexWalk {
     }
     return $true
 }
+
 function Add-IndexFile([string]$uri) {
     if (-not $uri -or -not $script:IdxSeen.Add($uri)) { return }
     $skipMeta = $false
@@ -1692,7 +1859,7 @@ function Add-IndexFile([string]$uri) {
     }
     if (-not $skipMeta) {
         $script:IdxMetaQueue.Enqueue($uri)
-        $script:IdxEnq++
+        $script:IdxEnq++   # counted as it enters the input queue; completion is IdxEnq == IdxDone (all drained)
     }
     if ($script:IdxBuildArchives) {
         $nm  = ($uri -split '/')[-1]
@@ -1701,12 +1868,14 @@ function Add-IndexFile([string]$uri) {
         if ($ext -and (Get-ArcExtSet).Contains($ext)) { Add-ArcExpandJob $uri }
     }
 }
+
 function Add-IndexItems($items) {
     foreach ($it in @($items)) {
         if ($null -eq $it) { continue }
         Add-IndexFile ([string]$it.Uri)
     }
 }
+
 function Step-IndexWalk {
     if ($null -eq $script:IdxWalkOut) { return }
     if ($script:IdxMetaQueue.Count -ge $script:IdxQueueCap -or $script:ArcQueue.Count -ge $script:IdxQueueCap) {
@@ -1725,6 +1894,7 @@ function Step-IndexWalk {
     foreach ($uri in $batch) { Add-IndexFile ([string]$uri) }
     Receive-IndexWalk
 }
+
 function Receive-IndexWalk {
     if ($script:IdxWalkReap.Count -eq 0) { return }
     $still = [Collections.Generic.List[object]]::new()
@@ -1734,12 +1904,14 @@ function Receive-IndexWalk {
     }
     $script:IdxWalkReap = $still
 }
+
 function Test-IndexWalkActive {
     $running = $false
     foreach ($w in $script:IdxWalkers) { if (-not $w.Handle.IsCompleted) { $running = $true; break } }
     $pending = ($null -ne $script:IdxWalkOut -and $script:IdxWalkOut.Count -gt 0)
     return ($running -or $pending)
 }
+
 function Stop-IndexWalk {
     if ($script:IdxWalkCancel) { $script:IdxWalkCancel.stop = $true }
     foreach ($w in $script:IdxWalkers) {
@@ -1756,13 +1928,14 @@ function Stop-IndexWalk {
     $script:IdxWalkFolderStack = $null; $script:IdxWalkActive = $null
     Receive-IndexWalk
 }
+
 function Start-IdxMetaPool {
     $n = [Math]::Max(1, [Math]::Min($script:IdxMaxWorkers, [int]$script:IdxThrottle.MaxConcurrent))
     $script:IdxCtl.Cancel = $false
     $script:IdxCtl.Target = $n
     $script:IdxCtl.Delay  = [Math]::Max(0, [int]$script:IdxThrottle.MinIntervalMs)
     $script:IdxCtl.LastThrottle = [DateTime]::MinValue
-    $script:IdxAimdMaxTarget  = $n
+    $script:IdxAimdMaxTarget  = $n   # AIMD may lower Target to 1 and ramp it back up to here
     $script:IdxAimdReactedTo  = [DateTime]::MinValue
     $script:IdxAimdLastChange = [DateTime]::MinValue
     if ($null -eq $script:IdxMetaPool) {
@@ -1779,6 +1952,7 @@ function Start-IdxMetaPool {
         $script:IdxWorkers.Add([PSCustomObject]@{ PS = $ps; Handle = $ps.BeginInvoke() })
     }
 }
+
 function Drain-IdxMeta {
     $res = $null
     $n = 0
@@ -1791,9 +1965,10 @@ function Drain-IdxMeta {
         $n++
     }
 }
+
 function Step-IdxAimd {
     $now = [DateTime]::UtcNow
-    if (($now - $script:IdxAimdLastChange).TotalMilliseconds -lt 750) { return }
+    if (($now - $script:IdxAimdLastChange).TotalMilliseconds -lt 750) { return }   # at most ~once/0.75s
     $lt  = [DateTime]$script:IdxCtl.LastThrottle
     $cur = [int]$script:IdxCtl.Target
     if ($lt -gt $script:IdxAimdReactedTo) {
@@ -1805,12 +1980,13 @@ function Step-IdxAimd {
         $script:IdxAimdLastChange = $now
     }
 }
+
 function Invoke-IndexBuildPump {
     if ($script:IdxBuildState -ne 'building') { return }
     if ($script:IdxBuildArchives) { Receive-ArcExpand }
-    Step-IndexWalk
-    Drain-IdxMeta
-    Step-IdxAimd
+    Step-IndexWalk        # feeds the input queue via Add-IndexFile (back-pressured)
+    Drain-IdxMeta         # drains worker results -> shard rows
+    Step-IdxAimd          # adjust worker concurrency to server pushback
     if ($script:IdxBuildArchives) { Dispatch-ArcExpand }
     $arcBusy = $script:IdxBuildArchives -and ($script:ArcQueue.Count -gt 0 -or $script:ArcJobs.Count -gt 0)
     if (-not (Test-IndexWalkActive) -and $script:IdxMetaQueue.Count -eq 0 -and
@@ -1818,6 +1994,7 @@ function Invoke-IndexBuildPump {
         $script:IdxBuildState = 'done'
     }
 }
+
 function Start-IndexBuild([bool]$full, [bool]$archives, $items) {
     Stop-IndexBuild
     $script:IdxBuildArchives = $archives
@@ -1825,10 +2002,10 @@ function Start-IndexBuild([bool]$full, [bool]$archives, $items) {
     $script:IdxSeen = New-Object 'System.Collections.Generic.HashSet[string]'
     $script:IdxMetaQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
     $script:IdxOutQueue  = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
-    $script:ShardWriteBuf = @{}; $script:ShardWriteBufRows = @{}; $script:IndexWriteBuffered = $true
-    if ($archives) { Ensure-ArcIndexedLoaded }
+    $script:ShardWriteBuf = @{}; $script:ShardWriteBufRows = @{}; $script:IndexWriteBuffered = $true   # buffer writes (D)
+    if ($archives) { Ensure-ArcIndexedLoaded }   # skip archives already indexed in a prior run
     $script:IdxBuildState = 'building'
-    Start-IdxMetaPool
+    Start-IdxMetaPool   # launch the fixed worker-loop pool (full + location both feed it)
     if ($full) {
         if (-not (Start-IndexWalk)) { $script:IdxBuildState = 'done'; Stop-IndexBuild; return $false }
     } else {
@@ -1836,11 +2013,12 @@ function Start-IndexBuild([bool]$full, [bool]$archives, $items) {
     }
     return $true
 }
+
 function Stop-IndexBuild {
     Stop-IndexWalk
-    $script:IdxCtl.Cancel = $true
+    $script:IdxCtl.Cancel = $true   # signal the worker loops to exit
     foreach ($w in $script:IdxWorkers) {
-        try { [void]$w.PS.Stop() } catch { }
+        try { [void]$w.PS.Stop() } catch { }   # Stop() (not EndInvoke) so a worker mid-GET can't wedge us
         try { $w.PS.Dispose() }    catch { }
     }
     $script:IdxWorkers.Clear()
@@ -1851,11 +2029,12 @@ function Stop-IndexBuild {
     }
     $script:IdxMetaQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
     $script:IdxOutQueue  = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
-    Flush-IndexWrites
-    $script:IndexWriteBuffered = $false
-    if ($script:IdxBuildArchives) { Stop-ArcSearch }
+    Flush-IndexWrites                      # (D) persist any buffered top-level rows before we stop
+    $script:IndexWriteBuffered = $false    # the TUI write-through (if any) goes back to immediate writes
+    if ($script:IdxBuildArchives) { Stop-ArcSearch }   # clean the reused arc-expansion pool
     if ($script:IdxBuildState -eq 'building') { $script:IdxBuildState = 'idle' }
 }
+
 $script:IndexVerbosity = 1
 function Write-IdxV([int]$level, [string]$msg) { if ($script:IndexVerbosity -ge $level) { Write-Host $msg } }
 function Format-Eta([int]$seconds) {
@@ -1865,9 +2044,55 @@ function Format-Eta([int]$seconds) {
     if ($seconds -lt 86400) { return ('{0}h {1}m' -f [int][Math]::Floor($seconds / 3600), [int][Math]::Floor(($seconds % 3600) / 60)) }
     return ('{0}d {1}h' -f [int][Math]::Floor($seconds / 86400), [int][Math]::Floor(($seconds % 86400) / 3600))
 }
+
+$script:IndexColour = $true
+function Write-IdxColor([string]$text, $color = $null, [switch]$NoNewline) {
+    if ($script:IndexColour -and $color) { Write-Host $text -ForegroundColor $color -NoNewline:$NoNewline }
+    else                                 { Write-Host $text -NoNewline:$NoNewline }
+}
+
+function Write-IndexProgressLine([bool]$archives, [datetime]$start, [int]$arcBase) {
+    $done    = $script:IdxDone + $script:IdxSkipped
+    $denom   = $script:IdxSeen.Count
+    $walking = Test-IndexWalkActive
+    $elapsed = ([DateTime]::UtcNow - $start).TotalSeconds
+    $rate    = if ($elapsed -gt 0) { $done / $elapsed } else { 0 }
+    if ($script:IndexVerbosity -ge 5) {
+        $repos  = (Get-IndexManifest).ByRepo.Count
+        $fields = [Collections.Generic.List[string]]::new()
+        $fields.Add("[{0:0.0} files/s]" -f [double]$rate)
+        $fields.Add("[{0} repos indexed]" -f $repos)
+        $fields.Add("[{0} archives indexed]" -f $script:ArcIndexedArchives.Count)
+        $fields.Add(("[meta queue:{0} workers:{1}]" -f $script:IdxMetaQueue.Count, $script:IdxThrottle.MaxConcurrent))
+        if ($archives) { $fields.Add(("[arc queue:{0} workers:{1}]" -f $script:ArcQueue.Count, $script:ArcThrottle.MaxConcurrent)) }
+        Write-IdxColor ("...index populated with {0} files {1}" -f $script:IndexCount, ($fields -join ' ')) DarkGray
+        return
+    }
+    $pct  = if ($denom -gt 0) { [int][Math]::Floor($done * 100.0 / $denom) } else { 0 }
+    $arcBusy = $archives -and ($script:ArcQueue.Count -gt 0 -or $script:ArcJobs.Count -gt 0)
+    $status =
+        if ($walking)                              { 'walking - discovered total still rising' }
+        elseif ($done -lt $denom -and $rate -gt 0) { 'ETA ' + (Format-Eta ([int][Math]::Ceiling(($denom - $done) / $rate))) }
+        elseif ($arcBusy) {
+            $arcLeft  = $script:ArcQueue.Count + $script:ArcJobs.Count
+            $arcDone2 = $script:ArcIndexedArchives.Count - $arcBase
+            $arcRate  = if ($elapsed -gt 0) { $arcDone2 / $elapsed } else { 0 }
+            $arcEta   = if ($arcRate -gt 0) { ' ETA ' + (Format-Eta ([int][Math]::Ceiling($arcLeft / $arcRate))) } else { '' }
+            "expanding archives $arcDone2/$($arcDone2 + $arcLeft)$arcEta"
+        }
+        else { '' }
+    $fields = [Collections.Generic.List[string]]::new()
+    $fields.Add("[{0} index rows]" -f $script:IndexCount)
+    if ($rate -gt 0)             { $fields.Add("[{0:0.0} files/s]" -f $rate) }
+    if ($script:IdxSkipped -gt 0) { $fields.Add("[{0} already-indexed skipped]" -f $script:IdxSkipped) }
+    if ($status)                 { $fields.Add("[{0}]" -f $status) }
+    Write-IdxColor ("...metadata fetched for {0}/{1} discovered files ({2}%) {3}" -f $done, $denom, $pct, ($fields -join ' ')) DarkGray
+}
+
 function Invoke-IndexBuildRun {
     param([bool]$Full, [bool]$Archives, [string]$Query = '', [bool]$AllVersions = $false, [bool]$Resume = $false,
           [int]$Workers = 0, [int]$Walkers = 0, [int]$ArcWorkers = 0, [int]$DelayMs = -1)
+
     $script:IndexEnabled = $true
     $script:IdxThrottle.MaxConcurrent = if ($Workers -gt 0)    { [Math]::Max(1, [Math]::Min(100, $Workers)) }    else { 50 }
     $script:IdxWalkConcurrency        = if ($Walkers -gt 0)    { [Math]::Max(1, [Math]::Min(32,  $Walkers)) }    else { 20 }
@@ -1876,11 +2101,13 @@ function Invoke-IndexBuildRun {
     $script:IdxThrottle.MinIntervalMs = $d; $script:ArcThrottle.MinIntervalMs = $d
     $script:ArcSkipVersions = -not $AllVersions
     $script:IdxResume = $Resume
+
     $scopeLabel = if ($Full) { 'entire instance' } else { "search: $Query" }
     $arcLabel   = if ($Archives) { ' (+ listable archives)' } else { '' }
     Write-IdxV 1 "Building index for $scopeLabel$arcLabel"
     Write-IdxV 2 "  index dir: $($script:IndexPath)"
     Write-IdxV 5 ("  settings: archives=$Archives skip-versions=$($script:ArcSkipVersions) resume=$($script:IdxResume) workers=$($script:IdxThrottle.MaxConcurrent) walkers=$($script:IdxWalkConcurrency) arc-workers=$($script:ArcThrottle.MaxConcurrent) delay=$($script:IdxThrottle.MinIntervalMs)ms queue-cap=$($script:IdxQueueCap) repos='$($script:Repos)' repo-types='$($script:RepoTypeScope -join ",")'")
+
     if ($Full) {
         $walkRepos = @(Get-ArcSearchWalkRepos)
         if ($walkRepos.Count -eq 0) {
@@ -1898,6 +2125,7 @@ function Invoke-IndexBuildRun {
         Write-IdxV 2 "  $($res.Total) result(s) from the REST quick-search"
         [void](Start-IndexBuild $false $Archives $res.Items)
     }
+
     $start = [DateTime]::UtcNow; $lastTick = [DateTime]::MinValue; $lastGc = [DateTime]::UtcNow; $lastFlush = [DateTime]::UtcNow
     $arcBase = $script:ArcIndexedArchives.Count
     while ($script:IdxBuildState -ne 'done') {
@@ -1905,37 +2133,13 @@ function Invoke-IndexBuildRun {
         if (([DateTime]::UtcNow - $lastGc).TotalSeconds -ge 20) { [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers(); $lastGc = [DateTime]::UtcNow }
         if (([DateTime]::UtcNow - $lastFlush).TotalSeconds -ge 5) { Flush-IndexWrites; $lastFlush = [DateTime]::UtcNow }
         if ($script:IndexVerbosity -ge 2 -and ([DateTime]::UtcNow - $lastTick).TotalSeconds -ge 1) {
-            $done    = $script:IdxDone + $script:IdxSkipped
-            $denom   = $script:IdxSeen.Count
-            $walking = Test-IndexWalkActive
-            $arcBusy = $Archives -and ($script:ArcQueue.Count -gt 0 -or $script:ArcJobs.Count -gt 0)
-            $elapsed = ([DateTime]::UtcNow - $start).TotalSeconds
-            $rate    = if ($elapsed -gt 0) { $done / $elapsed } else { 0 }
-            $pct     = if ($denom -gt 0) { [int][Math]::Floor($done * 100.0 / $denom) } else { 0 }
-            $status =
-                if ($walking)                              { '(walking - discovered total still rising)' }
-                elseif ($done -lt $denom -and $rate -gt 0) { 'ETA ' + (Format-Eta ([int][Math]::Ceiling(($denom - $done) / $rate))) }
-                elseif ($arcBusy) {
-                    $arcLeft  = $script:ArcQueue.Count + $script:ArcJobs.Count
-                    $arcDone2 = $script:ArcIndexedArchives.Count - $arcBase
-                    $arcRate  = if ($elapsed -gt 0) { $arcDone2 / $elapsed } else { 0 }
-                    $arcEta   = if ($arcRate -gt 0) { ', ETA ' + (Format-Eta ([int][Math]::Ceiling($arcLeft / $arcRate))) } else { '' }
-                    "(expanding archives $arcDone2/$($arcDone2 + $arcLeft)$arcEta)"
-                }
-                else { '' }
-            $rateStr = if ($rate -gt 0) { ' | {0:0.0} files/s' -f $rate } else { '' }
-            $arc  = if ($Archives -and $script:IndexVerbosity -ge 4) { " | archives expanded=$($script:ArcIndexedArchives.Count)" } else { '' }
-            $dbg  = if ($script:IndexVerbosity -ge 5) {
-                $aq = if ($Archives) { " | arc-expand queued=$($script:ArcQueue.Count) active=$($script:ArcJobs.Count)" } else { '' }
-                "  [meta-fetch queued=$($script:IdxMetaQueue.Count) workers=$($script:IdxCtl.Target)/$($script:IdxWorkers.Count)$aq]"
-            } else { '' }
-            $skip = if ($script:IdxSkipped -gt 0) { " | $($script:IdxSkipped) already-indexed skipped" } else { '' }
-            Write-Host ("  ...metadata fetched for $done/$denom discovered files ($pct%), $($script:IndexCount) index rows$rateStr$skip $status$arc$dbg".TrimEnd())
+            Write-IndexProgressLine $Archives $start $arcBase
             $lastTick = [DateTime]::UtcNow
         }
         Start-Sleep -Milliseconds 100
     }
     Stop-IndexBuild
+
     $secs = [int]([DateTime]::UtcNow - $start).TotalSeconds
     $skipNote = if ($script:IdxSkipped -gt 0) { " ($($script:IdxSkipped) already-indexed file(s) skipped via --resume)" } else { '' }
     Write-IdxV 1 ''
@@ -1943,6 +2147,7 @@ function Invoke-IndexBuildRun {
     if ($Archives) { Write-IdxV 1 ("  archives expanded (incl. prior runs): $($script:ArcIndexedArchives.Count)") }
     Write-IdxV 2 "  index: $($script:IndexPath)"
 }
+
 function Write-ArcSearchResults([string]$file, $items) {
     $rows = @($items | Where-Object { $_ })
     try {
@@ -1961,10 +2166,11 @@ function Write-ArcSearchResults([string]$file, $items) {
         [System.IO.File]::WriteAllText($file, $sb.ToString(), [Text.UTF8Encoding]::new($false))
     } catch { }
 }
+
 function Compress-IndexShardFile([string]$path, [switch]$Archive) {
     if (-not (Test-Path -LiteralPath $path)) { return $null }
-    $order = [Collections.Generic.List[string]]::new()
-    $last  = @{}
+    $order = [Collections.Generic.List[string]]::new()    # first-seen key order, for stable output
+    $last  = @{}                                           # key -> raw line (last wins)
     $before = 0
     try {
         $sep = [char]0
@@ -1974,7 +2180,7 @@ function Compress-IndexShardFile([string]$path, [switch]$Archive) {
             $f = Read-CsvRow $line
             $key = $null
             if ($Archive) {
-                if ($f.Count -ge 3) { $key = "$($f[0])$sep$($f[1])$sep$($f[2])" }
+                if ($f.Count -ge 3) { $key = "$($f[0])$sep$($f[1])$sep$($f[2])" }   # archDir|archName|internalPath
             } elseif ($f.Count -ge 2) {
                 $key = Get-IndexRelKey $f[0] $f[1]
             }
@@ -1983,7 +2189,7 @@ function Compress-IndexShardFile([string]$path, [switch]$Archive) {
             $last[$key] = $line
         }
     } catch { return $null }
-    if ($order.Count -eq $before) { return @{ Before = $before; After = $before } }
+    if ($order.Count -eq $before) { return @{ Before = $before; After = $before } }   # no dups
     $tmp = $path + '.tmp'
     try {
         $sb = [Text.StringBuilder]::new()
@@ -2013,6 +2219,7 @@ function Compress-Index {
     }
     return $reclaimed
 }
+
 function Invoke-ArcSearch { }
 
 function Get-AuditRank([string]$sev) {
@@ -2020,25 +2227,30 @@ function Get-AuditRank([string]$sev) {
         'critical' { 5 } 'high' { 4 } 'medium' { 3 } 'low' { 2 } 'informational' { 1 } default { 0 }
     }
 }
+
 function Get-AuditColor([string]$sev) {
     if (-not $script:Vt) { return '' }
     $e = [char]27
     switch ("$sev".ToLower()) {
-        'critical'      { "$e[38;5;203m" }
-        'high'          { "$e[38;5;221m" }
-        'medium'        { "$e[38;5;113m" }
-        'low'           { "$e[38;5;75m"  }
-        'informational' { "$e[38;5;135m" }
+        'critical'      { "$e[38;5;203m" }   # red
+        'high'          { "$e[38;5;221m" }   # yellow
+        'medium'        { "$e[38;5;113m" }   # green
+        'low'           { "$e[38;5;75m"  }   # blue
+        'informational' { "$e[38;5;135m" }   # purple
         default         { '' }
     }
 }
+
 function Get-AuditLetter([string]$sev) {
     switch ("$sev".ToLower()) {
         'critical' { 'C' } 'high' { 'H' } 'medium' { 'M' } 'low' { 'L' } 'informational' { 'I' } default { '?' }
     }
 }
+
 $script:AuditOversizeRule = 'SkippedOversizeText'
+
 $script:AuditSkippedRule = 'SkippedTier2'
+
 function Get-AuditRuleDefs {
     $discard = @(
         @{ Loc='ext'; Match='exact'; Enabled=$true; Values=@(
@@ -2060,6 +2272,7 @@ function Get-AuditRuleDefs {
             'programdata/microsoft/netframework/breadcrumbstore','mssqlserver/mssql/binn/templates') }
         @{ Loc='path'; Match='regex'; Enabled=$true; Values=@('python\d*/lib') }
     )
+
     $meta = @(
         @{ Name='WinHashes';        Sev='Critical'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('NTDS.DIT','SYSTEM','SAM','SECURITY') }
@@ -2144,6 +2357,7 @@ function Get-AuditRuleDefs {
         @{ Name='ShellRcFiles';       Sev='Low'; Loc='name'; Match='exact'; Enabled=$true;
            Values=@('.netrc','_netrc','.exports','.functions','.extra','.npmrc','.env','.bashrc','.profile','.zshrc') }
     )
+
     $content = [ordered]@{
         'InlinePrivateKey' = @{ Sev='High'; Enabled=$true; Patterns=@(
             '-----BEGIN( RSA| OPENSSH| DSA| EC| PGP)? PRIVATE KEY( BLOCK)?-----') }
@@ -2200,6 +2414,7 @@ function Get-AuditRuleDefs {
             '"encryptedPassword":"[A-Za-z0-9+/=]+"') }
         'RdpPasswords' = @{ Sev='High'; Enabled=$true; Patterns=@('password 51:b') }
     }
+
     $genericCode = @('AwsKeys','InlinePrivateKey','PassOrKeyInCode','SlackTokens','SqlAccountCreation','DbConnStringPw')
     $relay = @(
         @{ Loc='ext'; Match='exact'; Enabled=$true;
@@ -2237,15 +2452,20 @@ function Get-AuditRuleDefs {
         @{ Loc='name'; Match='endswith'; Enabled=$true; Values=@('_rsa','_dsa','_ed25519','_ecdsa');
            Rules=@('InlinePrivateKey') }
     )
+
     return @{ Discard=$discard; Meta=$meta; Content=$content; Relay=$relay }
 }
+
 $script:AuditRules = $null
+
 function Build-AuditRegex([string]$pat) {
     return [regex]::new($pat, ([Text.RegularExpressions.RegexOptions]'IgnoreCase, Compiled, CultureInvariant'))
 }
+
 function Get-AuditRuleSet {
     if ($script:AuditRules) { return $script:AuditRules }
     $defs = Get-AuditRuleDefs
+
     $content = @{}
     foreach ($name in $defs.Content.Keys) {
         $c = $defs.Content[$name]
@@ -2253,6 +2473,7 @@ function Get-AuditRuleSet {
         $rx = @(); foreach ($p in $c.Patterns) { $rx += (Build-AuditRegex $p) }
         $content[$name] = @{ Sev = $c.Sev; Regexes = $rx }
     }
+
     $compileSet = {
         param($rule)
         $out = @{ Loc=$rule.Loc; Match=$rule.Match }
@@ -2266,17 +2487,20 @@ function Get-AuditRuleSet {
             $hs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
             foreach ($v in $rule.Values) { [void]$hs.Add($v) }
             $out.Set = $hs
-        } else {
+        } else {   # contains / endswith
             $out.Values = @($rule.Values | ForEach-Object { $_.ToLower() })
         }
         return $out
     }
+
     $discard = @(); foreach ($d in $defs.Discard) { if ($d.Enabled) { $discard += (& $compileSet $d) } }
     $meta    = @(); foreach ($m in $defs.Meta)    { if ($m.Enabled) { $meta    += (& $compileSet $m) } }
     $relay   = @(); foreach ($r in $defs.Relay)   { if ($r.Enabled) { $relay   += (& $compileSet $r) } }
+
     $script:AuditRules = @{ Discard=$discard; Meta=$meta; Content=$content; Relay=$relay }
     return $script:AuditRules
 }
+
 function Test-AuditMatcher($m, [string]$name, [string]$ext, [string]$pathL) {
     switch ($m.Loc) {
         'ext'  { if ($m.Match -eq 'exact') { return $m.Set.Contains($ext) } }
@@ -2297,57 +2521,149 @@ function Test-AuditMatcher($m, [string]$name, [string]$ext, [string]$pathL) {
     }
     return $false
 }
+
 function Test-AuditMeta([string]$name, [string]$path) {
     $rs    = Get-AuditRuleSet
     $ext   = (Get-Ext $name).ToLower()
     $pathL = ('/' + ("$path" -replace '\\','/').Trim('/') + '/').ToLower()
+
     foreach ($d in $rs.Discard) {
         if (Test-AuditMatcher $d $name $ext $pathL) { return @{ Discard=$true; Findings=@(); ContentRules=@() } }
     }
+
     $findings = [Collections.Generic.List[object]]::new()
     foreach ($m in $rs.Meta) {
         if (Test-AuditMatcher $m $name $ext $pathL) { $findings.Add(@{ Rule=$m.Name; Sev=$m.Sev }) }
     }
+
     $crules = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($r in $rs.Relay) {
         if (Test-AuditMatcher $r $name $ext $pathL) { foreach ($cn in $r.Rules) { [void]$crules.Add($cn) } }
     }
     return @{ Discard=$false; Findings=@($findings.ToArray()); ContentRules=@($crules) }
 }
+
+function Get-AuditSnippet([string]$text, [int]$idx, [int]$len, [int]$window) {
+    if ($window -lt 0) { $window = 0 }
+    if ($len -lt 0)    { $len = 0 }
+    $half   = [int][Math]::Floor($window / 2)
+    $start  = [Math]::Max(0, $idx - $half)
+    $mStart = [Math]::Min($text.Length, $idx)
+    $mEnd   = [Math]::Min($text.Length, $idx + $len)
+    $end    = [Math]::Min($text.Length, $mEnd + ($window - $half))
+    if ($mStart -lt $start) { $mStart = $start }
+    if ($end -lt $mEnd)     { $end = $mEnd }
+    $norm  = { param($x) ($x -replace '[\r\n\t]+', ' ') -replace ' {2,}', ' ' }
+    $pre   = (& $norm $text.Substring($start, $mStart - $start)).TrimStart()
+    $match =  & $norm $text.Substring($mStart, $mEnd - $mStart)
+    $post  = (& $norm $text.Substring($mEnd, $end - $mEnd)).TrimEnd()
+    $mMax = $window + 120
+    if ($match.Length -gt $mMax) { $match = $match.Substring(0, $mMax) + '...' }
+    return @{ Pre = $pre; Match = $match; Post = $post; Text = ($pre + $match + $post) }
+}
+
+function ConvertTo-AuditJsonArray($items) {
+    $items = @($items | Where-Object { $null -ne $_ })
+    $sb = [Text.StringBuilder]::new()
+    [void]$sb.Append('[')
+    $first = $true
+    foreach ($it in $items) {
+        $s = if ($it -is [string]) { $it } elseif ($it.PSObject.Properties['Text']) { [string]$it.Text } else { [string]$it }
+        if (-not $first) { [void]$sb.Append(',') }
+        $first = $false
+        [void]$sb.Append('"')
+        foreach ($ch in $s.ToCharArray()) {
+            $code = [int]$ch
+            if     ($ch -eq '"')    { [void]$sb.Append('\"') }
+            elseif ($ch -eq '\')    { [void]$sb.Append('\\') }
+            elseif ($code -lt 0x20) { [void]$sb.Append('\u'); [void]$sb.Append($code.ToString('x4')) }
+            else                    { [void]$sb.Append($ch) }
+        }
+        [void]$sb.Append('"')
+    }
+    [void]$sb.Append(']')
+    return $sb.ToString()
+}
+
+function ConvertFrom-AuditJsonArray([string]$json) {
+    $t = "$json".Trim()
+    if ($t -eq '' -or $t -eq '[]') { return @() }
+    try { return @($t | ConvertFrom-Json) } catch { return @() }
+}
+
 function Test-AuditContent([string]$text, [string[]]$contentRules) {
-    if (-not $text -or $null -eq $contentRules -or $contentRules.Count -eq 0) { return @() }
-    $rs = Get-AuditRuleSet
-    $out = [Collections.Generic.List[object]]::new()
+    if (-not $text -or $null -eq $contentRules -or $contentRules.Count -eq 0) {
+        return @{ Findings=@(); Count=0; Snippets=@(); SevCounts=@{} }
+    }
+    $rs    = Get-AuditRuleSet
+    $win   = [int]$script:AuditPreviewWindow
+    $capN  = [int]$script:AuditPreviewMax
+    $ceil  = [int]$script:AuditPreviewCountCeil
+    $out   = [Collections.Generic.List[object]]::new()
+    $snips = [Collections.Generic.List[object]]::new()
+    $sevCounts = @{}
+    $total = 0
     foreach ($cn in $contentRules) {
         if (-not $rs.Content.ContainsKey($cn)) { continue }
         $c = $rs.Content[$cn]
+        $ruleHit = $false
         foreach ($rx in $c.Regexes) {
-            if ($rx.IsMatch($text)) { $out.Add(@{ Rule=$cn; Sev=$c.Sev }); break }
+            $m = $rx.Match($text)
+            $iter = 0
+            while ($m.Success) {
+                $ruleHit = $true
+                $total++
+                $sevCounts[$c.Sev] = 1 + $(if ($sevCounts.ContainsKey($c.Sev)) { $sevCounts[$c.Sev] } else { 0 })
+                if ($snips.Count -lt $capN) {
+                    $sp = Get-AuditSnippet $text $m.Index $m.Length $win
+                    [void]$snips.Add([PSCustomObject]@{ Pre=$sp.Pre; Match=$sp.Match; Post=$sp.Post; Text=$sp.Text; Rule=$cn; Sev=$c.Sev })
+                }
+                $iter++
+                if ($iter -ge $ceil) { break }   # safety ceiling: don't scan a regex-bomb forever
+                $m = $m.NextMatch()               # .NET guarantees forward progress (incl. zero-width)
+            }
         }
+        if ($ruleHit) { $out.Add(@{ Rule=$cn; Sev=$c.Sev }) }
     }
-    return @($out.ToArray())
+    return @{ Findings=@($out.ToArray()); Count=$total; Snippets=@($snips.ToArray()); SevCounts=$sevCounts }
 }
-function Resolve-AuditFindings($findings) {
+
+function Resolve-AuditFindings($findings, $snippets = @(), [int]$countOverride = -1, $sevCounts = $null) {
     $findings = @($findings)
     if ($findings.Count -eq 0) { return $null }
     $best = $findings[0]; $bestRank = Get-AuditRank $best.Sev
     foreach ($f in $findings) { $rk = Get-AuditRank $f.Sev; if ($rk -gt $bestRank) { $best = $f; $bestRank = $rk } }
     $rules = @($findings | ForEach-Object { $_.Rule } | Select-Object -Unique)
-    return @{ Sev=$best.Sev; Rule=$best.Rule; Rank=$bestRank; AllRules=($rules -join ', '); Count=$findings.Count }
+    $cnt   = if ($countOverride -ge 0) { $countOverride } else { $findings.Count }
+    $sc = if ($null -ne $sevCounts) { $sevCounts } else {
+        $h = @{}; foreach ($f in $findings) { $s = [string]$f.Sev; $h[$s] = 1 + $(if ($h.ContainsKey($s)) { $h[$s] } else { 0 }) }; $h
+    }
+    return @{ Sev=$best.Sev; Rule=$best.Rule; Rank=$bestRank; AllRules=($rules -join ', '); Count=$cnt; Snippets=@($snippets); SevCounts=$sc }
 }
-$script:AuditCap = 2097152
-$script:AuditState   = 'idle'
-$script:AuditMode    = ''
-$script:AuditScope   = ''
-$script:AuditDirty   = $false
+
+$script:AuditCap = 2097152   # 2 MB for automatic audits
+
+$script:AuditPreviewMax       = 10
+$script:AuditPreviewWindow    = 40
+$script:AuditPreviewCountCeil = 100000
+
+$script:AuditState   = 'idle'   # idle | passive | running | paused | done | cancelled
+$script:AuditMode    = ''       # passive | location | full
+$script:AuditScope   = ''       # human-readable description of what's being audited
+$script:AuditDirty   = $false   # set when flags/findings/state change (drives redraw)
+
 $script:AuditWalkArchives = $false
+
 $script:AuditTier2 = $false
+
 $script:AuditEmitSkipped = $true
+
 $script:AuditTier2ListPath  = ''
 $script:AuditTier2ListBuf   = $null
 $script:AuditTier2ListRows  = 0
-$script:AuditTier2ListTotal = 0
+$script:AuditTier2ListTotal = 0     # rows written this run (reported by the launcher)
 $script:AuditTier2ListFlush = 512
+
 function Open-AuditTier2List([string]$path) {
     $script:AuditTier2ListPath  = $path
     $script:AuditTier2ListBuf   = [Text.StringBuilder]::new()
@@ -2376,17 +2692,20 @@ function Close-AuditTier2List {
     Flush-AuditTier2List
     $script:AuditTier2ListPath = ''; $script:AuditTier2ListBuf = $null; $script:AuditTier2ListRows = 0
 }
+
 $script:AuditFlags   = [hashtable]::Synchronized(@{})
+
 $script:AuditFindings    = [Collections.Generic.List[object]]::new()
 $script:AuditFindingIdx  = @{}
-$script:AuditSeen        = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'
-$script:AuditDecided     = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'
+$script:AuditSeen        = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'  # key hashes already enqueued
+$script:AuditDecided     = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'  # key hashes fully scanned (drives the passive * / ? glyph)
 $script:AuditSeenPath    = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'
 function Get-AuditPathIdentity($rec) {
     $base = "$($rec.Repo)|$($rec.Path)|$($rec.Name)"
     if ($rec.IsArchiveEntry) { return "$($rec.ArchiveName)!$base" }
     return $base
 }
+
 $script:AuditHasher = [System.Security.Cryptography.MD5]::Create()
 function Get-AuditHash128([string]$s) {
     $b = $script:AuditHasher.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s))
@@ -2395,8 +2714,10 @@ function Get-AuditHash128([string]$s) {
 }
 function Get-AuditKeyHash([string]$key) { return (Get-AuditHash128 $key) }
 function Get-AuditPathHash($rec) { return (Get-AuditHash128 ((Get-AuditPathIdentity $rec).ToLower())) }
+
 $script:AuditMatchesPersisted = New-Object 'System.Collections.Generic.HashSet[string]'
 $script:AuditMatchesLoaded    = $false
+
 function Get-AuditMatchIdentity([string]$repo, [string]$path, [string]$name, [string]$archive) {
     $z = [char]0
     return "$repo$z$path$z$name$z$archive"
@@ -2421,7 +2742,7 @@ function Ensure-AuditMatchesLoaded {
         $first = $true
         try {
             foreach ($line in [System.IO.File]::ReadLines($file.FullName)) {
-                if ($first) { $first = $false; continue }
+                if ($first) { $first = $false; continue }   # header
                 if (-not "$line".Trim()) { continue }
                 $f = Read-CsvRow $line
                 if ($f.Count -lt 11) { continue }
@@ -2430,7 +2751,7 @@ function Ensure-AuditMatchesLoaded {
         } catch { }
     }
 }
-function Save-AuditMatch($f) {
+function Save-AuditMatch($f, [int]$matchCount = 0, [string]$contentPreview = '[]') {
     if (-not $script:AuditDir -or $null -eq $f) { return }
     $rule = [string]$f.Rule
     if ($rule -eq $script:AuditOversizeRule -or $rule -eq $script:AuditSkippedRule) { return }
@@ -2441,17 +2762,19 @@ function Save-AuditMatch($f) {
     if (-not $script:AuditMatchesPersisted.Add($sig)) { return }
     $sz = if ($f.Size -ge 0) { [long]$f.Size } else { -1 }
     Write-DownloadLog $script:AuditDir ([string]$f.Name) $repo ([string]$f.Path) $arch `
-        $sz ([string]$f.Modified) ([string]$f.Url) ([string]$f.Sev) ([string]$f.AllRules) '' (Get-AuditMatchFile $repo) -Scrape
+        $sz ([string]$f.Modified) ([string]$f.Url) ([string]$f.Sev) ([string]$f.AllRules) '' (Get-AuditMatchFile $repo) -Scrape `
+        -matchCount $matchCount -contentPreview $contentPreview
 }
+
 function Build-AuditLogFromMatches([string]$outFile) {
     if (-not $script:AuditDir -or -not (Test-Path -LiteralPath $script:AuditDir)) { return 0 }
-    $byId = @{}
+    $byId = @{}   # identity -> @{ Repo;Path;Name;Archive;Url;Size;Modified;Rank;Sev; Rules=HashSet }
     foreach ($file in (Get-ChildItem -LiteralPath $script:AuditDir -File -ErrorAction SilentlyContinue |
                         Where-Object { $_.Name -like '*-matches.csv' })) {
         $first = $true
         try {
             foreach ($line in [System.IO.File]::ReadLines($file.FullName)) {
-                if ($first) { $first = $false; continue }
+                if ($first) { $first = $false; continue }   # header
                 if (-not "$line".Trim()) { continue }
                 $r = Read-CsvRow $line
                 if ($r.Count -lt 11) { continue }
@@ -2460,12 +2783,22 @@ function Build-AuditLogFromMatches([string]$outFile) {
                 $e = $byId[$id]
                 if ($null -eq $e) {
                     $e = @{ Repo=$r[3]; Path=$r[4]; Name=$r[1]; Archive=$r[5]; Url=$r[8]; Size=$r[6]; Modified=$r[7]
-                            Rank=$rank; Sev=$r[9]; Rules=(New-Object 'System.Collections.Generic.HashSet[string]') }
+                            Rank=$rank; Sev=$r[9]; Rules=(New-Object 'System.Collections.Generic.HashSet[string]')
+                            MatchCount=0; Snippets=(New-Object 'System.Collections.Generic.List[string]')
+                            SnipSeen=(New-Object 'System.Collections.Generic.HashSet[string]') }
                     $byId[$id] = $e
                 } elseif ($rank -gt $e.Rank) {
                     $e.Rank = $rank; $e.Sev = $r[9]; $e.Url = $r[8]; $e.Size = $r[6]; $e.Modified = $r[7]
                 }
                 foreach ($t in (@("$($r[10])" -split '\s*,\s*') | Where-Object { $_ })) { [void]$e.Rules.Add($t) }
+                if ($r.Count -ge 12 -and "$($r[11])" -match '^\d+$') { $e.MatchCount += [int]$r[11] }
+                if ($r.Count -ge 13) {
+                    foreach ($sn in (ConvertFrom-AuditJsonArray ([string]$r[12]))) {
+                        if (-not "$sn") { continue }   # skip blanks (e.g. legacy/empty cells)
+                        if ($e.Snippets.Count -ge $script:AuditPreviewMax) { break }
+                        if ($e.SnipSeen.Add([string]$sn)) { [void]$e.Snippets.Add([string]$sn) }
+                    }
+                }
             }
         } catch { }
     }
@@ -2477,22 +2810,29 @@ function Build-AuditLogFromMatches([string]$outFile) {
         $rules = ((@($e.Rules) | Sort-Object) -join ', ')
         $sz = -1; if ("$($e.Size)" -match '^\d+$') { $sz = [long]$e.Size }
         Write-DownloadLog $dir ([string]$e.Name) ([string]$e.Repo) ([string]$e.Path) ([string]$e.Archive) `
-            $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) $rules '' $name -Scrape
+            $sz ([string]$e.Modified) ([string]$e.Url) ([string]$e.Sev) $rules '' $name -Scrape `
+            -matchCount ([int]$e.MatchCount) -contentPreview (ConvertTo-AuditJsonArray $e.Snippets)
         $n++
     }
     return $n
 }
-$script:AuditExcludes = @()
+
+$script:AuditExcludes = @()   # array of @{ Text; Rx=[regex] }
+
 $script:AuditMetaTried = New-Object 'System.Collections.Generic.HashSet[string]'
+
 $script:AuditQueue   = [Collections.Generic.Queue[object]]::new()
 $script:AuditPool    = $null
 $script:AuditJobs    = [Collections.Generic.List[object]]::new()
-$script:AuditFetch   = [hashtable]::Synchronized(@{})
+$script:AuditFetch   = [hashtable]::Synchronized(@{})   # key -> worker result (drained+dropped by pump)
 $script:AuditPendingNodes = [Collections.Generic.Queue[object]]::new()
+
 $script:AuditThrottle = @{ MaxConcurrent = 3; MinIntervalMs = 150 }
 $script:AuditLastLaunch = [DateTime]::MinValue
-$script:AuditMaxWorkers = 50
+$script:AuditMaxWorkers = 50   # ceiling for the w/W worker control (and the runspace pool); the
+
 $script:AuditDelayLadder = @(0,10,25,50,75,100,150,200,300,400,500,750,1000,1500,2000,3000,4000,5000)
+
 function Step-AuditDelay([int]$dir) {
     $ladder = $script:AuditDelayLadder
     $cur = [int]$script:AuditThrottle.MinIntervalMs
@@ -2504,14 +2844,16 @@ function Step-AuditDelay([int]$dir) {
     $script:AuditThrottle.MinIntervalMs = $ladder[$idx]
 }
 $script:AuditWalkPending = $false
-$script:AuditEnq      = 0
+
+$script:AuditEnq      = 0    # accepted for audit (not discarded/dup); grows during full walk
 $script:AuditEnqTotal = 0
-$script:AuditDone     = 0
-$script:AuditLaunched = 0
-$script:AuditBytes    = 0L
+$script:AuditDone     = 0    # fully processed
+$script:AuditLaunched = 0    # content workers started (~requests)
+$script:AuditBytes    = 0L   # content bytes scanned
 $script:AuditRate     = @{ QPS = 0.0; FPS = 0.0; BPS = 0.0 }
 $script:AuditRateSnap = @{ At = [DateTime]::UtcNow; Done = 0; Launched = 0; Bytes = 0L }
 $script:AuditStartedAt = [DateTime]::UtcNow
+
 $script:AuditWkScript = {
     param($key, $storageUri, $downloadUrl, $headers, $cap, $knownSize, $cache, $alert)
     $old = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
@@ -2553,6 +2895,7 @@ $script:AuditWkScript = {
         $cache[$key] = [PSCustomObject]@{ Ok=$false; Size=-1; Modified=''; Text=$null; TooBig=$false; Error=$we.Message }
     } finally { $ProgressPreference = $old }
 }
+
 $script:AuditArcScript = {
     param($key, $uri, $body, $headers, $ua, $cache, $alert)
     try {
@@ -2566,9 +2909,13 @@ $script:AuditArcScript = {
         $cache[$key] = [PSCustomObject]@{ Ok=$false; Nodes=@(); Error=$we.Message }
     }
 }
+
 function Add-AuditFinding($rec, $resolved, [long]$size = -1, [string]$modified = '') {
     if ($null -eq $resolved) { return }
     $key = $rec.Key
+    $rCount = if ($resolved.ContainsKey('Count')) { [int]$resolved.Count } else { 1 }
+    $rSnips = if ($resolved.ContainsKey('Snippets')) { @($resolved.Snippets) } else { @() }
+    $rSevC  = if ($resolved.ContainsKey('SevCounts') -and $resolved.SevCounts) { $resolved.SevCounts } else { @{} }
     if ($script:AuditFindingIdx.ContainsKey($key)) {
         $f = $script:AuditFindingIdx[$key]
         if ($resolved.Rank -gt $f.Rank) { $f.Sev = $resolved.Sev; $f.Rank = $resolved.Rank; $f.Rule = $resolved.Rule }
@@ -2579,6 +2926,7 @@ function Add-AuditFinding($rec, $resolved, [long]$size = -1, [string]$modified =
             if ($modified)          { $f.Modified = $modified }
             elseif ($rec.KnownModified) { $f.Modified = [string]$rec.KnownModified }
         }
+        $f.MatchCount += $rCount
     } else {
         $f = [PSCustomObject]@{
             Key=$key; Name=$rec.Name; Repo=$rec.Repo; Path=$rec.Path; Uri=$rec.Uri; Url=$rec.Url
@@ -2588,15 +2936,22 @@ function Add-AuditFinding($rec, $resolved, [long]$size = -1, [string]$modified =
             Sev=$resolved.Sev; Rank=$resolved.Rank; Rule=$resolved.Rule; AllRules=$resolved.AllRules
             Included=(($resolved.Rule -ne $script:AuditOversizeRule) -and ($resolved.Rule -ne $script:AuditSkippedRule) -and -not (Test-AuditExcluded ([string]$rec.Name)))
             InArchive=[bool]$rec.IsArchiveEntry; ArchiveName=$rec.ArchiveName
+            MatchCount=$rCount; Snippets=(New-Object 'System.Collections.Generic.List[object]'); MatchSev=@{}
         }
         $script:AuditFindings.Add($f)
         $script:AuditFindingIdx[$key] = $f
     }
+    foreach ($sk in $rSevC.Keys) { $f.MatchSev[$sk] = [int]$rSevC[$sk] + $(if ($f.MatchSev.ContainsKey($sk)) { [int]$f.MatchSev[$sk] } else { 0 }) }
+    foreach ($sn in $rSnips) {
+        if ($f.Snippets.Count -ge $script:AuditPreviewMax) { break }
+        [void]$f.Snippets.Add($sn)
+    }
     $cur = if ($script:AuditFlags.ContainsKey($key)) { $script:AuditFlags[$key] } else { '' }
     if ((Get-AuditRank $resolved.Sev) -ge (Get-AuditRank $cur)) { $script:AuditFlags[$key] = $f.Sev }
-    Save-AuditMatch $f
+    Save-AuditMatch $f $rCount (ConvertTo-AuditJsonArray $rSnips)
     $script:AuditDirty = $true
 }
+
 function New-AuditWorkItem($item) {
     $known = -1
     $kmod  = ''
@@ -2617,6 +2972,7 @@ function New-AuditWorkItem($item) {
         IsArchive=(Get-IsArchive ([string]$item.Name))
     }
 }
+
 function New-AuditWorkNode($n, [string]$arcName) {
     $url  = Get-EntryUrl $n
     $info = Get-NodeInfo $n
@@ -2629,9 +2985,10 @@ function New-AuditWorkNode($n, [string]$arcName) {
         Key=$url; Name=(Get-NodeName $n); Repo=$(if ($n.PSObject.Properties['repoKey']) { "$($n.repoKey)" } else { '' })
         Path=(Get-NodeInternalPath $n); Uri=''; Url=$url; KnownSize=$known; KnownModified=$kmod
         IsArchiveEntry=$true; ArchiveName=$arcName
-        IsArchive=$false
+        IsArchive=$false   # nested sub-archives can't be listed (treated as plain files)
     }
 }
+
 function New-AuditWorkArcItem($it) {
     $known = -1
     if ("$($it.Size)" -match '^-?\d+$') { try { $known = [long]$it.Size } catch { $known = -1 } }
@@ -2643,6 +3000,7 @@ function New-AuditWorkArcItem($it) {
         IsArchive=$false
     }
 }
+
 function Add-AuditRecord($rec) {
     if (-not $rec.Key) { return }
     $kh = Get-AuditKeyHash $rec.Key
@@ -2662,7 +3020,7 @@ function Add-AuditRecord($rec) {
         $rec.ContentRules  = $m.ContentRules
         $rec.HasMetaFinding = ($m.Findings.Count -gt 0)
         $rec.Previewable    = (Get-IsPreviewable $rec.Name)
-        $script:AuditQueue.Enqueue($rec)
+        $script:AuditQueue.Enqueue($rec)   # decided once its content fetch completes
     } elseif (-not $expand) {
         if ($script:AuditTier2ListPath -and $m.ContentRules.Count -gt 0) { Write-AuditTier2ListRow $rec }
         elseif ($script:AuditEmitSkipped -and $m.ContentRules.Count -gt 0 -and $m.Findings.Count -eq 0) {
@@ -2673,6 +3031,7 @@ function Add-AuditRecord($rec) {
     }
     if ($expand) { Add-AuditArchiveJob $rec }
 }
+
 function Add-AuditArchiveJob($rec) {
     $akey = Get-AuditKeyHash "ARC|$($rec.Uri)"
     if ($script:AuditSeen.Contains($akey)) { return }
@@ -2686,6 +3045,7 @@ function Add-AuditArchiveJob($rec) {
         Uri=$tbr.Uri; Body=$tbr.Body; Headers=$tbr.Headers; Ua=$tbr.Ua
     })
 }
+
 function Get-AuditFlatEntries($nodes, $acc) {
     foreach ($n in @($nodes)) {
         if ($null -eq $n) { continue }
@@ -2693,6 +3053,7 @@ function Get-AuditFlatEntries($nodes, $acc) {
         else { $acc.Add($n) }
     }
 }
+
 function Add-AuditWork($items) {
     foreach ($it in @($items)) { if ($it) { Add-AuditRecord (New-AuditWorkItem $it) } }
     $script:AuditDirty = $true
@@ -2701,6 +3062,7 @@ function Add-AuditWorkNodes($nodes, [string]$arcName) {
     foreach ($n in @($nodes)) { if ($n) { Add-AuditRecord (New-AuditWorkNode $n $arcName) } }
     $script:AuditDirty = $true
 }
+
 function Receive-AuditJobs {
     if ($script:AuditJobs.Count -eq 0) { return }
     $still = [Collections.Generic.List[object]]::new()
@@ -2713,6 +3075,7 @@ function Receive-AuditJobs {
     }
     $script:AuditJobs = $still
 }
+
 function Complete-ArchiveJob($rec) {
     $key = $rec.Key
     $res = $null
@@ -2726,6 +3089,7 @@ function Complete-ArchiveJob($rec) {
     }
     $script:AuditDirty = $true
 }
+
 function Step-AuditEntries {
     $n = 0
     while ($script:AuditPendingNodes.Count -gt 0 -and $n -lt 300) {
@@ -2735,6 +3099,7 @@ function Step-AuditEntries {
     }
     if ($n -gt 0) { $script:AuditDirty = $true }
 }
+
 function Complete-AuditJob($rec) {
     $key = $rec.Key
     $res = $null
@@ -2744,8 +3109,8 @@ function Complete-AuditJob($rec) {
     if ($null -eq $res) { return }
     if ($res.Ok -and $res.Text) {
         $cf = Test-AuditContent $res.Text $rec.ContentRules
-        if (@($cf).Count -gt 0) {
-            Add-AuditFinding $rec (Resolve-AuditFindings $cf) $res.Size $res.Modified
+        if (@($cf.Findings).Count -gt 0) {
+            Add-AuditFinding $rec (Resolve-AuditFindings $cf.Findings $cf.Snippets $cf.Count $cf.SevCounts) $res.Size $res.Modified
             $script:AuditBytes += [long]$res.Text.Length
             return
         }
@@ -2755,6 +3120,7 @@ function Complete-AuditJob($rec) {
         Add-AuditFinding $rec @{ Sev='Informational'; Rank=1; Rule=$script:AuditOversizeRule; AllRules=$script:AuditOversizeRule; Count=1 } $res.Size $res.Modified
     }
 }
+
 function Dispatch-AuditWork {
     $maxc  = [Math]::Max(1, [Math]::Min($script:AuditMaxWorkers, [int]$script:AuditThrottle.MaxConcurrent))
     $iv    = [int]$script:AuditThrottle.MinIntervalMs
@@ -2769,7 +3135,7 @@ function Dispatch-AuditWork {
         $kind = if ($rec.ContainsKey('Kind')) { $rec.Kind } else { 'file' }
         $ps = [PowerShell]::Create()
         $ps.RunspacePool = $script:AuditPool
-        [void]$ps.AddScript($script:PvErrFn)
+        [void]$ps.AddScript($script:PvErrFn)   # define Get-WkError in the worker scope
         if ($kind -eq 'archive') {
             [void]$ps.AddScript($script:AuditArcScript).
                 AddArgument($rec.Key).AddArgument($rec.Uri).AddArgument($rec.Body).
@@ -2784,9 +3150,10 @@ function Dispatch-AuditWork {
         $script:AuditJobs.Add([PSCustomObject]@{ PS=$ps; Handle=$ps.BeginInvoke(); Key=$rec.Key; Rec=$rec; Kind=$kind })
         $script:AuditLastLaunch = [DateTime]::UtcNow
         $script:AuditLaunched++
-        if ($iv -gt 0) { break }
+        if ($iv -gt 0) { break }   # paced: one launch per tick
     }
 }
+
 function Update-AuditMetrics {
     $now = [DateTime]::UtcNow
     $dt  = ($now - $script:AuditRateSnap.At).TotalSeconds
@@ -2799,6 +3166,7 @@ function Update-AuditMetrics {
         $script:AuditRateSnap = @{ At=$now; Done=$script:AuditDone; Launched=$script:AuditLaunched; Bytes=$script:AuditBytes }
     }
 }
+
 function Invoke-AuditPump {
     if ($script:AuditState -eq 'idle' -or $script:AuditState -eq 'done' -or $script:AuditState -eq 'cancelled') { return }
     Receive-AuditJobs
@@ -2817,9 +3185,12 @@ function Invoke-AuditPump {
         $script:AuditState = 'done'; $script:AuditDirty = $true
     }
 }
+
 $script:AuditCapActive = $script:AuditCap
+
 function Suspend-AuditEngine { if ($script:AuditState -eq 'running') { $script:AuditState = 'paused'; $script:AuditDirty = $true } }
 function Resume-AuditEngine  { if ($script:AuditState -eq 'paused')  { $script:AuditState = 'running'; $script:AuditDirty = $true } }
+
 function Stop-AuditWork {
     $script:AuditWalkPending = $false
     Stop-AuditWalk
@@ -2839,6 +3210,7 @@ function Stop-AuditWork {
         $script:AuditPool = $null
     }
 }
+
 function Reset-AuditEngine {
     Stop-AuditWork
     $script:AuditState = 'idle'; $script:AuditMode = ''; $script:AuditScope = ''
@@ -2856,11 +3228,13 @@ function Reset-AuditEngine {
     $script:AuditRateSnap = @{ At=[DateTime]::UtcNow; Done=0; Launched=0; Bytes=0L }
     $script:AuditDirty = $true
 }
+
 $script:AuditWalkPS     = $null
 $script:AuditWalkHandle = $null
 $script:AuditWalkCancel = $null
 $script:AuditWalkOut    = $null
 $script:AuditWalkReap   = [Collections.Generic.List[object]]::new()
+
 $script:AuditWalkScript = {
     param($artBase, $headers, $repos, $out, $cancel, $paceMs, $maxPending)
     $stack = New-Object 'System.Collections.Generic.Stack[object]'
@@ -2882,15 +3256,17 @@ $script:AuditWalkScript = {
                     }
                 }
             }
-        } catch { }
+        } catch { }   # denied/!readable folders are skipped silently
         if ($paceMs -gt 0) { Start-Sleep -Milliseconds $paceMs }
     }
 }
+
 function Get-AuditWalkRepos {
     if ($Repos) { return @($Repos -split '[,\s]+' | Where-Object { $_ }) }
     Initialize-RepoMap
     return @($script:RepoMap.Keys | Where-Object { Test-RepoTypeInScope $_ })
 }
+
 function Start-AuditWalk {
     Stop-AuditWalk
     $repos = Get-AuditWalkRepos
@@ -2906,6 +3282,7 @@ function Start-AuditWalk {
     $script:AuditWalkHandle = $ps.BeginInvoke()
     return $true
 }
+
 function Step-AuditWalk {
     if ($null -eq $script:AuditWalkOut) { return }
     $batch = @()
@@ -2922,6 +3299,7 @@ function Step-AuditWalk {
     if (@($batch).Count -gt 0) { $script:AuditDirty = $true }
     Receive-AuditWalk
 }
+
 function Receive-AuditWalk {
     if ($script:AuditWalkReap.Count -eq 0) { return }
     $still = [Collections.Generic.List[object]]::new()
@@ -2931,26 +3309,30 @@ function Receive-AuditWalk {
     }
     $script:AuditWalkReap = $still
 }
+
 function Test-AuditWalkActive {
     $running = ($null -ne $script:AuditWalkHandle -and -not $script:AuditWalkHandle.IsCompleted)
     $pending = ($null -ne $script:AuditWalkOut -and $script:AuditWalkOut.Count -gt 0)
     return ($running -or $pending)
 }
+
 function Stop-AuditWalk {
     if ($script:AuditWalkCancel) { $script:AuditWalkCancel.stop = $true }
     if ($script:AuditWalkPS) { $script:AuditWalkReap.Add([PSCustomObject]@{ PS=$script:AuditWalkPS; Handle=$script:AuditWalkHandle }) }
     $script:AuditWalkPS = $null; $script:AuditWalkHandle = $null; $script:AuditWalkCancel = $null; $script:AuditWalkOut = $null
     Receive-AuditWalk
 }
-$script:AuditIdxActive    = $false
-$script:AuditIdxRepos     = $null
-$script:AuditIdxRepoPos   = 0
-$script:AuditIdxRepo      = ''
-$script:AuditIdxFiles     = $null
-$script:AuditIdxFilePos   = 0
-$script:AuditIdxEnum      = $null
-$script:AuditIdxEnumIsArc = $false
+
+$script:AuditIdxActive    = $false   # feeder has rows left to stream
+$script:AuditIdxRepos     = $null    # [List] repo keys still to process
+$script:AuditIdxRepoPos   = 0        # index into AuditIdxRepos
+$script:AuditIdxRepo      = ''       # current repo key (for building records)
+$script:AuditIdxFiles     = $null    # [List] of @{ Path; IsArc } for the current repo (shard then buckets)
+$script:AuditIdxFilePos   = 0        # index into AuditIdxFiles
+$script:AuditIdxEnum      = $null    # live ReadLines enumerator for the current file
+$script:AuditIdxEnumIsArc = $false   # is the current file an archive bucket (vs the artifact shard)?
 $script:AuditIdxQueueCap  = 2000
+
 function Open-AuditIdxNextFile {
     while ($true) {
         if ($null -ne $script:AuditIdxFiles -and $script:AuditIdxFilePos -lt $script:AuditIdxFiles.Count) {
@@ -2977,6 +3359,7 @@ function Open-AuditIdxNextFile {
         $script:AuditIdxFilePos = 0
     }
 }
+
 function Step-AuditIndexWalk {
     if (-not $script:AuditIdxActive) { return }
     if (($script:AuditQueue.Count + $script:AuditJobs.Count) -ge $script:AuditIdxQueueCap) { return }
@@ -3012,7 +3395,9 @@ function Step-AuditIndexWalk {
     }
     if ($n -gt 0) { $script:AuditDirty = $true }
 }
+
 function Test-AuditIndexWalkActive { return [bool]$script:AuditIdxActive }
+
 function Stop-AuditIndexWalk {
     if ($null -ne $script:AuditIdxEnum) {
         try { $script:AuditIdxEnum.Dispose() } catch { }
@@ -3025,12 +3410,14 @@ function Stop-AuditIndexWalk {
     $script:AuditIdxFilePos = 0
     $script:AuditIdxRepo    = ''
 }
+
 $script:AuditT2Active    = $false
-$script:AuditT2Enum      = $null
-$script:AuditT2Path      = ''
-$script:AuditT2Cursor    = 0
-$script:AuditT2Batch     = 0
+$script:AuditT2Enum      = $null     # ReadLines enumerator over the worklist (positioned past header + cursor)
+$script:AuditT2Path      = ''        # worklist path
+$script:AuditT2Cursor    = 0         # rows committed (persisted to the sidecar)
+$script:AuditT2Batch     = 0         # rows read into the current in-flight batch (not yet committed)
 $script:AuditT2BatchSize = 1000
+
 function Get-AuditT2CursorPath([string]$path) { return "$path.progress" }
 function Read-AuditT2Cursor([string]$path) {
     $cp = Get-AuditT2CursorPath $path
@@ -3048,6 +3435,7 @@ function Save-AuditT2Cursor {
         [System.IO.File]::Copy($tmp, $cp, $true); Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     } catch { }
 }
+
 function New-AuditWorkFromListRow($f) {
     if ($f.Count -lt 3) { return $null }
     $repo = [string]$f[0]; $path = [string]$f[1]; $name = [string]$f[2]
@@ -3067,10 +3455,11 @@ function New-AuditWorkFromListRow($f) {
         IsArchive=(Get-IsArchive $name)
     }
 }
+
 function Start-AuditTier2List([string]$path, [switch]$KeepFindings) {
     if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $false }
     if ($KeepFindings) {
-        Stop-AuditWork
+        Stop-AuditWork   # abort any in-flight Phase-A work, keep findings
         $script:AuditSeen     = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'
         $script:AuditSeenPath = New-Object 'System.Collections.Generic.HashSet[System.ValueTuple[System.UInt64,System.UInt64]]'
         $script:AuditEnq = 0; $script:AuditDone = 0; $script:AuditLaunched = 0; $script:AuditBytes = 0L
@@ -3087,15 +3476,16 @@ function Start-AuditTier2List([string]$path, [switch]$KeepFindings) {
     $script:AuditT2Batch  = 0
     $rows = 0
     try { foreach ($ln in [System.IO.File]::ReadLines($path)) { $rows++ } } catch { }
-    $script:AuditEnqTotal = [Math]::Max(0, ($rows - 1) - $script:AuditT2Cursor)
+    $script:AuditEnqTotal = [Math]::Max(0, ($rows - 1) - $script:AuditT2Cursor)   # minus the header, minus committed
     $script:AuditT2Enum = [System.IO.File]::ReadLines($path).GetEnumerator()
-    $skip = 1 + $script:AuditT2Cursor
+    $skip = 1 + $script:AuditT2Cursor   # header + committed data rows
     $n = 0
     while ($n -lt $skip) { if (-not $script:AuditT2Enum.MoveNext()) { break }; $n++ }
     $script:AuditT2Active = $true
     $script:AuditState = 'paused'
     return $true
 }
+
 function Step-AuditTier2List {
     if (-not $script:AuditT2Active) { return }
     if (($script:AuditQueue.Count + $script:AuditJobs.Count) -gt 0) { return }
@@ -3126,7 +3516,9 @@ function Step-AuditTier2List {
     $script:AuditT2Batch = $read
     $script:AuditDirty = $true
 }
+
 function Test-AuditTier2ListActive { return [bool]$script:AuditT2Active }
+
 function Stop-AuditTier2List {
     if ($null -ne $script:AuditT2Enum) {
         try { $script:AuditT2Enum.Dispose() } catch { }
@@ -3136,22 +3528,25 @@ function Stop-AuditTier2List {
     $script:AuditT2Path   = ''
     $script:AuditT2Batch  = 0
 }
+
 function Start-AuditPassive {
     if ($script:AuditState -ne 'passive') { Reset-AuditEngine }
     $script:AuditMode = 'passive'; $script:AuditScope = 'current view (background)'
-    $script:AuditCapActive = $script:PreviewLimit
+    $script:AuditCapActive = $script:PreviewLimit   # passive matches the preview cap
     $script:AuditStartedAt = [DateTime]::UtcNow
     $script:AuditState = 'passive'
 }
+
 function Start-AuditLocation([string]$label, $items) {
     Reset-AuditEngine
-    Initialize-RepoMap
+    Initialize-RepoMap   # so archive-expansion treebrowser requests get the right repo type
     $script:AuditMode = 'location'; $script:AuditScope = $label
     $script:AuditCapActive = $script:AuditCap
     $script:AuditStartedAt = [DateTime]::UtcNow
     Add-AuditWork $items
     $script:AuditState = 'paused'
 }
+
 function Start-AuditLocationNodes([string]$label, $nodes, [string]$arcName) {
     Reset-AuditEngine
     $script:AuditMode = 'location'; $script:AuditScope = $label
@@ -3160,22 +3555,38 @@ function Start-AuditLocationNodes([string]$label, $nodes, [string]$arcName) {
     Add-AuditWorkNodes $nodes $arcName
     $script:AuditState = 'paused'
 }
+
 function Start-AuditFull {
     Reset-AuditEngine
-    Initialize-RepoMap
+    Initialize-RepoMap   # so archive-expansion treebrowser requests get the right repo type
     $script:AuditMode = 'full'; $script:AuditScope = 'entire instance'
     $script:AuditCapActive = $script:AuditCap
     $script:AuditStartedAt = [DateTime]::UtcNow
     if (@(Get-AuditWalkRepos).Count -eq 0) {
-        $script:AuditState = 'done'
+        $script:AuditState = 'done'   # nothing to enumerate (no repos / denied)
         return
     }
-    $script:AuditWalkPending = $true
+    $script:AuditWalkPending = $true  # walker launches on first resume
     $script:AuditState = 'paused'
 }
+
+function Get-AuditIndexRowCount($repos) {
+    $total = 0L
+    foreach ($repo in @($repos)) {
+        $files = [Collections.Generic.List[string]]::new()
+        $files.Add((Get-ArtifactShardPath $repo))
+        foreach ($ap in (Get-ArchiveBucketFiles $repo)) { $files.Add($ap) }
+        foreach ($path in $files) {
+            if (-not (Test-Path -LiteralPath $path)) { continue }
+            try { $total += [long][System.Linq.Enumerable]::Count([System.IO.File]::ReadLines($path)) } catch { }
+        }
+    }
+    return [long]$total
+}
+
 function Start-AuditIndex {
     Reset-AuditEngine
-    Initialize-RepoMap
+    Initialize-RepoMap   # populate the repo map so Test-RepoTypeInScope can filter to local (graceful if denied)
     $script:AuditMode = 'index'; $script:AuditScope = 'local index'
     $script:AuditCapActive = $script:AuditCap
     $script:AuditStartedAt = [DateTime]::UtcNow
@@ -3188,6 +3599,7 @@ function Start-AuditIndex {
     $list = [Collections.Generic.List[object]]::new()
     foreach ($rk in $repos) { $list.Add($rk) }
     $script:AuditIdxRepos     = $list
+    $script:AuditEnqTotal     = Get-AuditIndexRowCount $repos
     $script:AuditIdxRepoPos   = 0
     $script:AuditIdxRepo      = ''
     $script:AuditIdxFiles     = $null
@@ -3201,7 +3613,7 @@ function Start-AuditIndex {
 $script:AuditSortCount = -1
 $script:AuditSorted    = @()
 $script:AuditSortAt    = [DateTime]::MinValue
-$script:AuditSortDirty = $true
+$script:AuditSortDirty = $true    # set when Included flags change (no count change)
 function Get-AuditSortedFindings {
     $changed = ($script:AuditFindings.Count -ne $script:AuditSortCount) -or $script:AuditSortDirty
     $stale   = (([DateTime]::UtcNow - $script:AuditSortAt).TotalMilliseconds -ge 750)
@@ -3233,6 +3645,7 @@ function ConvertTo-AuditGlobRegex([string]$glob) {
     [void]$sb.Append('$')
     return [regex]::new($sb.ToString(), ([Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'))
 }
+
 function Set-AuditExcludes([string]$terms) {
     $out = @()
     foreach ($t in @("$terms" -split '[,\s]+')) {
@@ -3242,15 +3655,18 @@ function Set-AuditExcludes([string]$terms) {
     }
     $script:AuditExcludes = @($out)
 }
+
 function Test-AuditExcluded([string]$name) {
     if (@($script:AuditExcludes).Count -eq 0) { return $false }
     foreach ($e in $script:AuditExcludes) { if ($e.Rx.IsMatch("$name")) { return $true } }
     return $false
 }
 function Invoke-Audit { }
+
 function Get-AuditIncludedCandidates {
     return @(Get-AuditSortedFindings | Where-Object { $_.Included -and -not (Test-Visited $_.Key) })
 }
+
 function Get-AuditDownloadEntries($candidates) {
     return @(@($candidates | Where-Object { $_ }) | ForEach-Object {
         $kh = ''
@@ -3266,6 +3682,7 @@ function Get-AuditDownloadEntries($candidates) {
         }
     })
 }
+
 function Invoke-AuditDownloadSet($candidates) {
     $entries = Get-AuditDownloadEntries $candidates
     $res = Invoke-DedupDownload $entries
@@ -3275,30 +3692,38 @@ function Invoke-AuditDownloadSet($candidates) {
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-[Net.ServicePointManager]::DefaultConnectionLimit = 256
+
+[Net.ServicePointManager]::DefaultConnectionLimit = 256   # high enough for the aggressive worker + walker pools
 [Net.ServicePointManager]::SecurityProtocol =
     [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
 $R = $BD = $DM = $CY = $MG = $YL = $RD = $HB = $SB = ''
 $script:Vt = $false
 $script:CanRawKey = $false
 $script:ArcGlyph = '+'; $script:PreviewGlyph = [char]0x00B7; $script:Cut = [char]0x2026
+
 $BaseUrl = ''; $ApiKey = ''; $Token = ''; $Basic = ''; $Repos = ''
-$OutDir  = ''
+$OutDir  = ''   # index build doesn't download; resolved for layout consistency only
+
 $script:IndexVerbosity = 1
+
 if ($PSScriptRoot -and -not (Get-Command Invoke-IndexBuildPump -ErrorAction SilentlyContinue)) {
     foreach ($component in 'Core','Api','Index') {
         . (Join-Path $PSScriptRoot "$component.ps1")
     }
 }
+
 function Write-V([int]$level, [string]$msg) {
     if ($script:IndexVerbosity -ge $level) { Write-Host $msg }
 }
+
 function Format-Eta([int]$seconds) {
     if ($seconds -lt 0) { return '?' }
     $ts = [TimeSpan]::FromSeconds($seconds)
     if ($ts.TotalHours -ge 1) { return ('{0}:{1:00}:{2:00}' -f [int][Math]::Floor($ts.TotalHours), $ts.Minutes, $ts.Seconds) }
     return ('{0}:{1:00}' -f $ts.Minutes, $ts.Seconds)
 }
+
 function ConvertFrom-IndexArgv([string[]]$tokens) {
     $p = @{}
     if ($null -eq $tokens) { return $p }
@@ -3311,7 +3736,7 @@ function ConvertFrom-IndexArgv([string[]]$tokens) {
             '^(-a|--archives)$'  { $p.Archives  = $true }
             '^--no-archives$'    { $p.NoArchives = $true }
             '^--all-versions$'   { $p.AllVersions = $true }
-            '^--skip-versions$'  { $p.AllVersions = $false }
+            '^--skip-versions$'  { $p.AllVersions = $false }   # affirms the default (no-op)
             '^--resume$'         { $p.Resume    = $true }
             '^(-r|--repos)$'     { $p.Repos     = $tokens[++$i] }
             '^--repo-types$'     { $p.RepoTypes = $tokens[++$i] }
@@ -3322,6 +3747,7 @@ function ConvertFrom-IndexArgv([string[]]$tokens) {
             '^--arc-workers$'    { $p.ArcWorkers = [int]$tokens[++$i] }
             '^--delay$'          { $p.DelayMs    = [int]$tokens[++$i] }
             '^(-v|--verbose)$'   { $p.Verbosity = [int]$tokens[++$i] }
+            '^--no-?colou?r$'    { $p.NoColour  = $true }
             '^(-u|--base-url)$'  { $p.BaseUrl   = $tokens[++$i] }
             '^(-t|--token)$'     { $p.Token     = $tokens[++$i] }
             '^(-k|--api-key)$'   { $p.ApiKey    = $tokens[++$i] }
@@ -3333,6 +3759,7 @@ function ConvertFrom-IndexArgv([string[]]$tokens) {
     }
     return $p
 }
+
 function Show-IndexUsage {
     Write-Host @'
 ARTCA headless index builder
@@ -3365,6 +3792,7 @@ Options:
       --delay <ms>        per-request politeness delay (default 0; the adaptive throttle backs off
                           automatically on 429/503)
   -v, --verbose <0-5>     0 silent · 1 summary · 2 progress · 3 milestones · 4 detail · 5 debug (default 1)
+      --nocolour          disable coloured (dark-grey) progress output
 
 Auth:
   -u, --base-url <url>    Artifactory base URL (required)
@@ -3372,13 +3800,15 @@ Auth:
   -b, --basic <user:pw>   basic auth
 '@
 }
+
 function Invoke-IndexBuildCore {
     param(
         [switch]$Full, [string]$Query, [switch]$Archives, [switch]$NoArchives, [switch]$AllVersions, [switch]$Resume, [string]$Repos,
         [string]$RepoTypes, [string]$IndexPath, [int]$Workers, [int]$Walkers, [int]$ArcWorkers, [int]$DelayMs, [int]$Verbosity,
-        [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic
+        [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic, [switch]$NoColour
     )
     $O = $PSBoundParameters
+    $script:IndexColour = -not ($O.ContainsKey('NoColour') -and $O['NoColour'])
     if ($O.ContainsKey('Verbosity')) { $script:IndexVerbosity = [int]$O['Verbosity'] }
     if ($O.ContainsKey('BaseUrl'))   { $script:BaseUrl = [string]$O['BaseUrl'] }
     if ($O.ContainsKey('ApiKey'))    { $script:ApiKey  = [string]$O['ApiKey'] }
@@ -3388,17 +3818,20 @@ function Invoke-IndexBuildCore {
     if ($O.ContainsKey('RepoTypes')) { Set-RepoTypeScope ([string]$O['RepoTypes']) }
     if (-not $script:BaseUrl) { throw 'A base URL is required (-u/--base-url).' }
     $script:BaseUrl = $script:BaseUrl.TrimEnd('/')
+
     $hasFull = [bool]($O.ContainsKey('Full') -and $O['Full'])
     $query   = if ($O.ContainsKey('Query')) { [string]$O['Query'] } else { '' }
     if ($hasFull -and $query) { throw 'Choose one scope: -F/--full OR -q/--query, not both.' }
     $full    = $hasFull -or (-not $query)
     $archives = -not ($O.ContainsKey('NoArchives') -and $O['NoArchives'])
+
     $script:OutDirExplicit = $false
     Resolve-OutputPaths
     if ($O.ContainsKey('IndexPath') -and $O['IndexPath']) { Set-IndexPath ([string]$O['IndexPath']) }
     Resolve-IndexPath
-    $script:IndexEnabled = $true
-    Import-Index $script:IndexPath
+    $script:IndexEnabled = $true     # building the index is the whole point
+    Import-Index $script:IndexPath   # migrations + archive skip-set
+
     $workers    = if ($O.ContainsKey('Workers'))    { [int]$O['Workers'] }    else { 0 }
     $walkers    = if ($O.ContainsKey('Walkers'))    { [int]$O['Walkers'] }    else { 0 }
     $arcWorkers = if ($O.ContainsKey('ArcWorkers')) { [int]$O['ArcWorkers'] } else { 0 }
@@ -3408,6 +3841,7 @@ function Invoke-IndexBuildCore {
     Invoke-IndexBuildRun -Full $full -Archives $archives -Query $query -AllVersions $allVers -Resume $resume `
         -Workers $workers -Walkers $walkers -ArcWorkers $arcWorkers -DelayMs $delay
 }
+
 function Invoke-IndexBuild {
     if (@($args).Count -eq 0) { Show-IndexUsage; return }
     try { $splat = ConvertFrom-IndexArgv @($args) }
@@ -3415,6 +3849,7 @@ function Invoke-IndexBuild {
     if ($splat.ContainsKey('Help')) { Show-IndexUsage; return }
     Invoke-IndexBuildCore @splat
 }
+
 if (-not $env:ARTCA_NOMAIN) {
     if (@($args).Count -eq 0) {
         Show-IndexUsage
@@ -3431,24 +3866,31 @@ if (-not $env:ARTCA_NOMAIN) {
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
 [Net.ServicePointManager]::DefaultConnectionLimit = 256
 [Net.ServicePointManager]::SecurityProtocol =
     [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
 $R = $BD = $DM = $CY = $MG = $YL = $RD = $HB = $SB = ''
 $script:Vt = $false
 $script:CanRawKey = $false
 $script:ArcGlyph = '+'; $script:PreviewGlyph = [char]0x00B7; $script:Cut = [char]0x2026
+
 $BaseUrl = ''; $ApiKey = ''; $Token = ''; $Basic = ''; $Repos = ''
-$OutDir  = ''
+$OutDir  = ''   # resolved per instance (output/<host>/downloads) unless -o/--out is given
+
 $script:AuditVerbosity = 1
+
 if ($PSScriptRoot -and -not (Get-Command Invoke-AuditPump -ErrorAction SilentlyContinue)) {
     foreach ($component in 'Core','Api','AuditEngine','Index') {
         . (Join-Path $PSScriptRoot "$component.ps1")
     }
 }
+
 function Write-V([int]$level, [string]$msg) {
     if ($script:AuditVerbosity -ge $level) { Write-Host $msg }
 }
+
 function Format-Duration([int]$secs) {
     if ($secs -lt 0) { $secs = 0 }
     if ($secs -lt 60)    { return "${secs}s" }
@@ -3456,6 +3898,113 @@ function Format-Duration([int]$secs) {
     if ($secs -lt 86400) { return ('{0}h {1}m' -f [int][Math]::Floor($secs / 3600), [int][Math]::Floor(($secs % 3600) / 60)) }
     return ('{0}d {1}h' -f [int][Math]::Floor($secs / 86400), [int][Math]::Floor(($secs % 86400) / 3600))
 }
+
+function Format-DurationCompact([int]$secs) {
+    if ($secs -lt 0) { $secs = 0 }
+    if ($secs -lt 60)    { return "${secs}s" }
+    if ($secs -lt 3600)  { return ('{0}m{1:00}s' -f [int][Math]::Floor($secs / 60), ($secs % 60)) }
+    if ($secs -lt 86400) { return ('{0}h{1:00}m' -f [int][Math]::Floor($secs / 3600), [int][Math]::Floor(($secs % 3600) / 60)) }
+    return ('{0}d{1:00}h' -f [int][Math]::Floor($secs / 86400), [int][Math]::Floor(($secs % 86400) / 3600))
+}
+
+function Format-AuditProgressLine {
+    $den  = if ($script:AuditEnqTotal -gt 0) { $script:AuditEnqTotal } else { $script:AuditEnq }
+    $done = $script:AuditDone
+    $fields = [Collections.Generic.List[string]]::new()
+    $fields.Add("[{0:0.0} files/s]" -f [double]$script:AuditRate.FPS)
+    $fields.Add("[{0} findings]" -f $script:AuditFindings.Count)
+    $elapsed = ([DateTime]::UtcNow - $script:AuditStartedAt).TotalSeconds
+    if ($den -gt 0 -and $done -gt 0 -and $elapsed -ge 1) {
+        $rem = $den - $done; if ($rem -lt 0) { $rem = 0 }
+        $avg = $done / $elapsed
+        if ($avg -gt 0) {
+            $secs = [int][Math]::Ceiling($rem / $avg)
+            $fields.Add(("[ETA {0} ({1})]" -f (Format-DurationCompact $secs), ((Get-Date).AddSeconds($secs).ToString('h:mmtt').ToLower())))
+        }
+    }
+    if ($script:AuditVerbosity -ge 5) {
+        $fields.Add(("[audit queue:{0} jobs:{1} pending:{2} launched:{3}]" -f `
+                    $script:AuditQueue.Count, $script:AuditJobs.Count, $script:AuditPendingNodes.Count, $script:AuditLaunched))
+    }
+    return ("...audited {0}/{1} files {2}" -f $done, $den, ($fields -join ' '))
+}
+
+function ConvertTo-CompactSize([long]$bytes) {
+    if ($bytes -lt 0)          { return '?' }
+    if ($bytes -lt 1024)       { return ("{0}B"    -f $bytes) }
+    if ($bytes -lt 1048576)    { return ("{0:0.#}KB" -f ($bytes / 1024.0)) }
+    if ($bytes -lt 1073741824) { return ("{0:0.#}MB" -f ($bytes / 1048576.0)) }
+    return ("{0:0.#}GB" -f ($bytes / 1073741824.0))
+}
+
+function Write-DownloadSavingLine($d) {
+    if ($script:AuditVerbosity -lt 5) { return }
+    $fields = [Collections.Generic.List[string]]::new()
+    $fields.Add(("[saved {0}/{1}]" -f $d.Index, $d.Total))
+    if ([long]$d.TotalBytes -gt 0 -and [double]$d.ElapsedSec -ge 0.5) {
+        $rate = [long]([double]$d.DoneBytes / [double]$d.ElapsedSec)   # bytes/sec
+        $fields.Add("[{0:0}kbps]" -f ($rate / 1000.0))
+        $fields.Add(("[{0}/{1}]" -f (ConvertTo-CompactSize ([long]$d.DoneBytes)), (ConvertTo-CompactSize ([long]$d.TotalBytes))))
+        if ($rate -gt 0) {
+            $rem = [long]$d.TotalBytes - [long]$d.DoneBytes; if ($rem -lt 0) { $rem = 0 }
+            $secs = [int][Math]::Ceiling($rem / [double]$rate)
+            $fields.Add(("[ETA {0} ({1})]" -f (Format-DurationCompact $secs), ((Get-Date).AddSeconds($secs).ToString('h:mmtt').ToLower())))
+        }
+    }
+    Write-AuditColor ("...saving file {0} {1}" -f $d.Name, ($fields -join ' ')) DarkGray
+}
+
+function Write-DownloadSavedLine($d) {
+    if ($script:AuditVerbosity -lt 4) { return }
+    $files = @($d.Files)
+    if ($files.Count -le 1) {
+        $f = if ($files.Count -eq 1) { $files[0] } else { @{ Name=$d.BaseName; Size=-1; Sev='' } }
+        if ("$($f.Sev)") { Write-AuditColor ("[{0}] " -f $f.Sev) (Get-AuditSevConsoleColor $f.Sev) -NoNewline }
+        Write-AuditColor ([string]$f.Name) White -NoNewline
+        if ([long]$f.Size -ge 0) { Write-AuditColor (" ({0})" -f (Format-Size ([long]$f.Size))) DarkGray -NoNewline }
+        Write-Host ''
+        return
+    }
+    $totalSize = 0L; $haveSize = $true; $hi = ''; $hiRank = -1
+    foreach ($f in $files) {
+        if ([long]$f.Size -ge 0) { $totalSize += [long]$f.Size } else { $haveSize = $false }
+        $rk = Get-SevRank ([string]$f.Sev); if ($rk -gt $hiRank) { $hiRank = $rk; $hi = [string]$f.Sev }
+    }
+    Write-AuditColor '[Multiple]' (Get-AuditSevConsoleColor $hi) -NoNewline
+    Write-AuditColor (" {0}" -f $d.BaseName) White -NoNewline
+    if ($haveSize) { Write-AuditColor (" ({0})" -f (Format-Size $totalSize)) DarkGray -NoNewline }
+    Write-Host ''
+    $cap = [Math]::Min(3, $files.Count); $shown = @{}
+    for ($i = 0; $i -lt $cap; $i++) {
+        $f = $files[$i]
+        Write-AuditColor ("  [{0}]" -f $f.Sev) (Get-AuditSevConsoleColor $f.Sev) -NoNewline
+        Write-AuditColor (" {0}" -f $f.Name) White -NoNewline
+        if ([long]$f.Size -ge 0) { Write-AuditColor (" ({0})" -f (Format-Size ([long]$f.Size))) DarkGray -NoNewline }
+        Write-Host ''
+        $sv = [string]$f.Sev; $shown[$sv] = 1 + $(if ($shown.ContainsKey($sv)) { $shown[$sv] } else { 0 })
+    }
+    $more = $files.Count - $cap
+    if ($more -gt 0) {
+        $allsev = @{}; foreach ($f in $files) { $s = [string]$f.Sev; $allsev[$s] = 1 + $(if ($allsev.ContainsKey($s)) { $allsev[$s] } else { 0 }) }
+        $remain = @{}
+        foreach ($s in $script:AuditSevOrder) { $r = ([int]$(if ($allsev.ContainsKey($s)) { $allsev[$s] } else { 0 })) - ([int]$(if ($shown.ContainsKey($s)) { $shown[$s] } else { 0 })); if ($r -gt 0) { $remain[$s] = $r } }
+        Write-AuditColor ("  {0} more" -f $more) White -NoNewline
+        Write-AuditColor ' unique files saved.' Gray -NoNewline
+        $parts = @($script:AuditSevOrder | Where-Object { $remain.ContainsKey($_) })
+        if ($parts.Count -gt 0) {
+            Write-AuditColor ' [' Gray -NoNewline
+            for ($i = 0; $i -lt $parts.Count; $i++) {
+                $s = $parts[$i]
+                Write-AuditColor ("{0}:" -f $s) Gray -NoNewline
+                Write-AuditColor ([string]$remain[$s]) (Get-AuditSevConsoleColor $s) -NoNewline
+                if ($i -lt $parts.Count - 1) { Write-AuditColor ' ' Gray -NoNewline }
+            }
+            Write-AuditColor ']' Gray -NoNewline
+        }
+        Write-Host ''
+    }
+}
+
 function Convert-ToBytes([string]$s) {
     $t = "$s".Trim()
     if (-not $t) { return 0 }
@@ -3465,6 +4014,7 @@ function Convert-ToBytes([string]$s) {
     }
     throw "Invalid size '$s'. Use bytes or a suffix like 100MB, 1.5G, 500KB."
 }
+
 function Select-WithinSize($items, [long]$maxBytes) {
     if ($maxBytes -le 0) { return @($items) }
     $kept = [Collections.Generic.List[object]]::new()
@@ -3477,10 +4027,21 @@ function Select-WithinSize($items, [long]$maxBytes) {
     if ($skip -gt 0) { Write-V 1 ("Size limit $(Format-Size $maxBytes): skipping $skip file(s) over the limit ($(Format-Size $skipBytes) not downloaded)") }
     return @($kept.ToArray())
 }
+
 $script:DownloadProgress = {
     param($lines)
-    Write-V 4 ('  ' + ((@($lines) | Where-Object { "$_" -ne '' }) -join '  '))
+    $d = $script:DownloadProgressData
+    if ($null -eq $d) {
+        Write-V 4 ('  ' + ((@($lines) | Where-Object { "$_" -ne '' }) -join '  '))
+        return
+    }
+    switch ($d.Kind) {
+        'Hashing' { if ($script:AuditVerbosity -ge 5) { Write-AuditColor ("...comparing hashes for {0} ({1}/{2}) [{3}]" -f $d.Name, $d.MemberIndex, $d.MemberCount, $d.Hash) DarkGray } }
+        'Saved'   { Write-DownloadSavedLine $d }
+        default   { Write-DownloadSavingLine $d }
+    }
 }
+
 function ConvertFrom-AuditArgv([string[]]$tokens) {
     $p = @{}
     if ($null -eq $tokens) { return $p }
@@ -3503,10 +4064,13 @@ function ConvertFrom-AuditArgv([string[]]$tokens) {
             }
             '^(-w|--walk-archives)$' { $p.WalkArchives = $true }
             '^--all-versions$'       { $p.AllVersions  = $true }
-            '^--skip-versions$'      { $p.AllVersions  = $false }
+            '^--skip-versions$'      { $p.AllVersions  = $false }   # affirms the default (no-op)
             '^(-x|--exclude)$'       { $p.Exclude      = $tokens[++$i] }
             '^(-s|--from-log)$'      { $p.FromLog      = $tokens[++$i] }
             '^--max-size$'           { $p.MaxSize      = $tokens[++$i] }
+            '^--preview-count$'      { $p.PreviewCount  = [int]$tokens[++$i] }
+            '^--preview-window$'     { $p.PreviewWindow = [int]$tokens[++$i] }
+            '^--no-?colou?r$'        { $p.NoColour      = $true }
             '^--index$'              { $p.IndexPath    = $tokens[++$i] }
             '^--no-index$'           { $p.NoIndex      = $true }
             '^--offline$'            { $p.Offline      = $tokens[++$i] }
@@ -3525,6 +4089,7 @@ function ConvertFrom-AuditArgv([string[]]$tokens) {
     }
     return $p
 }
+
 function Show-AuditEngineUsage {
     Write-Host @'
 ARTCA headless audit
@@ -3570,6 +4135,12 @@ Audit options (audit verb):
       --repo-types <list> indexed repo rclasses to audit (default: local). e.g. local,remote or
                           'all' (every non-virtual repo). --all-repos is shorthand for 'all'.
   -x, --exclude <globs>   comma/space globs to exclude from the set (e.g. "*.xml,*test*")
+      --preview-count <n> max content-match snippets stored per file in audit-log.csv's
+                          MatchedContentPreview column (JSON array). Default 10; 0 = no snippets
+                          (MatchCount still recorded). NOTE: previews contain matched content, which
+                          is often the secret itself - the log then holds live credential material.
+      --preview-window <n> TOTAL context characters captured around each match, split evenly each
+                          side (default 40 -> 20 left + match + 20 right)
       --index <dir>       local index directory to read (default ./output/<host>/index)
       --cap <bytes>       max file size to content-scan (default 2 MB)
       --workers <1-50>    parallel fetch workers (default 15)
@@ -3592,11 +4163,13 @@ Output / auth:
                           ./output/<host>/downloads). Audit catalogues (audit-log.csv,
                           tier2-pending.csv[.progress], <repo>-matches.csv) go to ./output/<host>/audit.
   -v, --verbose <0-5>     0 silent .. 5 debug (default 1)
+      --nocolour          disable coloured console output (severity-tinted tags, grey progress/snippets)
   -u, --base-url <url>    Artifactory base URL (required)
   -t, --token <tok>       bearer token        -k, --api-key <key>   JFrog API key
   -b, --basic <user:pw>   basic auth
 '@
 }
+
 function Resolve-RunOutput([hashtable]$O) {
     if ($O.ContainsKey('OutDir') -and $O['OutDir']) {
         $script:OutDir = [string]$O['OutDir']; $script:OutDirExplicit = $true
@@ -3605,6 +4178,12 @@ function Resolve-RunOutput([hashtable]$O) {
     }
     Resolve-OutputPaths
 }
+
+function Set-AuditPreviewConfig([hashtable]$O) {
+    if ($O.ContainsKey('PreviewCount')  -and [int]$O['PreviewCount']  -ge 0) { $script:AuditPreviewMax    = [int]$O['PreviewCount'] }
+    if ($O.ContainsKey('PreviewWindow') -and [int]$O['PreviewWindow'] -ge 0) { $script:AuditPreviewWindow = [int]$O['PreviewWindow'] }
+}
+
 function Initialize-AuditRunConfig([hashtable]$O) {
     if ($O.ContainsKey('Verbosity')) { $script:AuditVerbosity = [int]$O['Verbosity'] }
     if ($O.ContainsKey('BaseUrl'))   { $script:BaseUrl = [string]$O['BaseUrl'] }
@@ -3616,12 +4195,15 @@ function Initialize-AuditRunConfig([hashtable]$O) {
     if (-not $script:BaseUrl) { throw 'A base URL is required (-u/--base-url).' }
     $script:BaseUrl = $script:BaseUrl.TrimEnd('/')
     Resolve-RunOutput $O
+
     $script:IndexEnabled = $true
     if ($O.ContainsKey('IndexPath') -and $O['IndexPath']) { Set-IndexPath ([string]$O['IndexPath']) }
     Resolve-IndexPath
+
     $script:AuditTier2        = $false
     $script:AuditWalkArchives = $false
     $script:AuditEmitSkipped  = $false
+    Set-AuditPreviewConfig $O
     if ($O.ContainsKey('Cap') -and [long]$O['Cap'] -gt 0)        { $script:AuditCap = [long]$O['Cap'] }
     $script:AuditThrottle.MaxConcurrent =
         if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { [Math]::Max(1, [Math]::Min($script:AuditMaxWorkers, [int]$O['Workers'])) }
@@ -3629,12 +4211,109 @@ function Initialize-AuditRunConfig([hashtable]$O) {
     $script:AuditThrottle.MinIntervalMs =
         if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { [int]$O['DelayMs'] } else { 0 }
 }
+
 function Update-AuditExcludedHeadless {
     foreach ($f in $script:AuditFindings) {
         if (Test-AuditExcluded ([string]$f.Name)) { $f.Included = $false }
     }
     $script:AuditSortDirty = $true
 }
+
+$script:AuditColour = $true
+
+function Get-AuditSevConsoleColor([string]$sev) {
+    switch ("$sev".ToLower()) {
+        'critical'      { 'Red' }
+        'high'          { 'Yellow' }
+        'medium'        { 'Green' }
+        'low'           { 'Cyan' }
+        'informational' { 'Magenta' }
+        default         { 'Gray' }
+    }
+}
+
+function Write-AuditColor([string]$text, $color = $null, [switch]$NoNewline) {
+    if ($script:AuditColour -and $color) { Write-Host $text -ForegroundColor $color -NoNewline:$NoNewline }
+    else                                 { Write-Host $text -NoNewline:$NoNewline }
+}
+
+$script:AuditRuleSevMap = $null
+function Get-AuditRuleConsoleColor([string]$ruleName) {
+    if ($null -eq $script:AuditRuleSevMap) {
+        $map = @{}
+        $rs = Get-AuditRuleSet
+        foreach ($mr in $rs.Meta) { if ($mr.ContainsKey('Name') -and $mr.ContainsKey('Sev')) { $map[[string]$mr.Name] = [string]$mr.Sev } }
+        foreach ($k in $rs.Content.Keys) { $map[[string]$k] = [string]$rs.Content[$k].Sev }
+        $script:AuditRuleSevMap = $map
+    }
+    $sev = if ($script:AuditRuleSevMap.ContainsKey($ruleName)) { $script:AuditRuleSevMap[$ruleName] } else { '' }
+    return (Get-AuditSevConsoleColor $sev)
+}
+
+$script:AuditSevOrder = @('Critical','High','Medium','Low','Informational')
+function Write-AuditFindingLine($f, [string]$tag) {
+    $loc = (@($f.Repo, $f.Path, $f.Name) | Where-Object { "$_" -ne '' }) -join '/'
+    $slash = $loc.LastIndexOf('/')
+    $path  = if ($slash -ge 0) { $loc.Substring(0, $slash + 1) } else { '' }
+    $fname = if ($slash -ge 0) { $loc.Substring($slash + 1) }   else { $loc }
+    $arc   = if ($f.InArchive -and "$($f.ArchiveName)") { " ($($f.ArchiveName))" } else { '' }
+    $rules = @($f.AllRules -split '\s*,\s*' | Where-Object { $_ })
+    if ($tag) {
+        $pp = if ($path) { " [$path]" } else { '' }
+        Write-AuditColor ("[{0}] {1} - {2}{3}{4}{5}" -f $f.Sev, $fname, ($rules -join ' '), $pp, $arc, $tag) DarkGray
+        return
+    }
+    Write-AuditColor ("[{0}] " -f $f.Sev) (Get-AuditSevConsoleColor $f.Sev) -NoNewline
+    Write-AuditColor $fname White -NoNewline
+    Write-AuditColor ' - ' White -NoNewline
+    for ($i = 0; $i -lt $rules.Count; $i++) {
+        Write-AuditColor $rules[$i] (Get-AuditRuleConsoleColor $rules[$i]) -NoNewline
+        if ($i -lt $rules.Count - 1) { Write-AuditColor ' ' White -NoNewline }
+    }
+    if ($path) { Write-AuditColor (" [{0}]" -f $path) Gray -NoNewline }
+    if ($arc)  { Write-AuditColor $arc Gray -NoNewline }
+    Write-Host ''
+    if ($script:AuditVerbosity -ge 5 -and $f.PSObject.Properties['Snippets'] -and $f.Snippets.Count -gt 0) {
+        $cap = [Math]::Min(3, $f.Snippets.Count)
+        $shown = @{}
+        for ($i = 0; $i -lt $cap; $i++) {
+            $sn = $f.Snippets[$i]
+            Write-AuditColor ("  [{0}] " -f $sn.Rule) (Get-AuditSevConsoleColor $sn.Sev) -NoNewline
+            if ($sn.PSObject.Properties['Match']) {
+                Write-AuditColor ([string]$sn.Pre) Gray -NoNewline
+                Write-AuditColor ([string]$sn.Match) White -NoNewline
+                Write-AuditColor ([string]$sn.Post) Gray
+            } else {
+                Write-AuditColor ([string]$sn.Text) Gray
+            }
+            $sv = [string]$sn.Sev; $shown[$sv] = 1 + $(if ($shown.ContainsKey($sv)) { $shown[$sv] } else { 0 })
+        }
+        $more = [int]$f.MatchCount - $cap
+        if ($more -gt 0) {
+            Write-AuditColor ("  {0} more" -f $more) White -NoNewline
+            Write-AuditColor ' matches found.' Gray -NoNewline
+            $ms = if ($f.PSObject.Properties['MatchSev'] -and $f.MatchSev) { $f.MatchSev } else { @{} }
+            $remain = @{}
+            foreach ($s in $script:AuditSevOrder) {
+                $r = ([int]$(if ($ms.ContainsKey($s)) { $ms[$s] } else { 0 })) - ([int]$(if ($shown.ContainsKey($s)) { $shown[$s] } else { 0 }))
+                if ($r -gt 0) { $remain[$s] = $r }
+            }
+            $parts = @($script:AuditSevOrder | Where-Object { $remain.ContainsKey($_) })
+            if ($parts.Count -gt 0) {
+                Write-AuditColor ' [' Gray -NoNewline
+                for ($i = 0; $i -lt $parts.Count; $i++) {
+                    $s = $parts[$i]
+                    Write-AuditColor ("{0}:" -f $s) Gray -NoNewline
+                    Write-AuditColor ([string]$remain[$s]) (Get-AuditSevConsoleColor $s) -NoNewline
+                    if ($i -lt $parts.Count - 1) { Write-AuditColor ' ' Gray -NoNewline }
+                }
+                Write-AuditColor ']' Gray -NoNewline
+            }
+            Write-Host ''
+        }
+    }
+}
+
 function Invoke-AuditPumpToDone {
     if ($script:AuditState -eq 'paused') { $script:AuditState = 'running' }
     $printed  = 0
@@ -3649,24 +4328,11 @@ function Invoke-AuditPumpToDone {
                 $f = $script:AuditFindings[$printed]
                 $tag = if ($printed -lt $seenBaseline) { '  (Tier 1 - Seen)' } else { '' }
                 $printed++
-                $loc = (@($f.Repo, $f.Path, $f.Name) | Where-Object { "$_" -ne '' }) -join '/'
-                Write-Host ("  [{0}] {1} - {2}{3}" -f $f.Sev, $loc, $f.AllRules, $tag)
+                Write-AuditFindingLine $f $tag
             }
         }
         if ($script:AuditVerbosity -ge 2 -and ([DateTime]::UtcNow - $lastTick).TotalSeconds -ge 1) {
-            $walk = if ((Test-AuditWalkActive) -or (Test-AuditIndexWalkActive)) { ' (reading index)' } else { '' }
-            $den = if ($script:AuditEnqTotal -gt 0) { $script:AuditEnqTotal } else { $script:AuditEnq }
-            $eta = ''
-            $rem = $den - $script:AuditDone
-            $elapsed = ([DateTime]::UtcNow - $script:AuditStartedAt).TotalSeconds
-            if ($script:AuditEnqTotal -gt 0 -and $rem -gt 0 -and $script:AuditDone -gt 0 -and $elapsed -ge 1) {
-                $avg = $script:AuditDone / $elapsed
-                if ($avg -gt 0) { $eta = "  ETA $(Format-Duration ([int][Math]::Ceiling($rem / $avg)))" }
-            }
-            Write-Host ("  ...audited $($script:AuditDone)/$den at $($script:AuditRate.FPS)/s, found $($script:AuditFindings.Count)$eta$walk")
-            if ($script:AuditVerbosity -ge 5) {
-                Write-Host ("    queue=$($script:AuditQueue.Count) jobs=$($script:AuditJobs.Count) pending=$($script:AuditPendingNodes.Count) launched=$($script:AuditLaunched)")
-            }
+            Write-AuditColor (Format-AuditProgressLine) DarkGray
             $lastTick = [DateTime]::UtcNow
         }
         Start-Sleep -Milliseconds 100
@@ -3676,11 +4342,11 @@ function Invoke-AuditPumpToDone {
             $f = $script:AuditFindings[$printed]
             $tag = if ($printed -lt $seenBaseline) { '  (Tier 1 - Seen)' } else { '' }
             $printed++
-            $loc = (@($f.Repo, $f.Path, $f.Name) | Where-Object { "$_" -ne '' }) -join '/'
-            Write-Host ("  [{0}] {1} - {2}{3}" -f $f.Sev, $loc, $f.AllRules, $tag)
+            Write-AuditFindingLine $f $tag
         }
     }
 }
+
 function Write-AuditSummary {
     if ($script:AuditVerbosity -lt 1) { return }
     $counts = @{}
@@ -3688,17 +4354,27 @@ function Write-AuditSummary {
         $s = [string]$f.Sev
         $counts[$s] = 1 + $(if ($counts.ContainsKey($s)) { $counts[$s] } else { 0 })
     }
-    $parts = @()
-    foreach ($s in 'Critical','High','Medium','Low','Informational') {
-        if ($counts.ContainsKey($s)) { $parts += "$s=$($counts[$s])" }
-    }
-    $brk = if ($parts.Count -gt 0) { ' [' + ($parts -join ' ') + ']' } else { '' }
+    $present = @(@('Critical','High','Medium','Low','Informational') | Where-Object { $counts.ContainsKey($_) })
     Write-Host ''
-    Write-Host ("Audit complete: $($script:AuditFindings.Count) finding(s)$brk")
+    Write-AuditColor 'Audit complete: ' -NoNewline
+    Write-AuditColor ([string]$script:AuditFindings.Count) White -NoNewline
+    Write-AuditColor ' finding(s)' -NoNewline
+    if ($present.Count -gt 0) {
+        Write-AuditColor ' [' -NoNewline
+        for ($i = 0; $i -lt $present.Count; $i++) {
+            $s = $present[$i]
+            Write-AuditColor ("{0}:" -f $s) -NoNewline
+            Write-AuditColor ([string]$counts[$s]) (Get-AuditSevConsoleColor $s) -NoNewline
+            if ($i -lt $present.Count - 1) { Write-AuditColor ' ' -NoNewline }
+        }
+        Write-AuditColor ']' -NoNewline
+    }
+    Write-Host ''
 }
+
 function Invoke-HeadlessAudit([hashtable]$O, [bool]$emitList = $false) {
     Initialize-AuditRunConfig $O
-    Write-V 5 ("Settings: tier=1$(if ($emitList) { '+worklist' } else { '' }) cap=$script:AuditCap workers=$($script:AuditThrottle.MaxConcurrent) delay=$($script:AuditThrottle.MinIntervalMs)ms index=$script:IndexPath out=$script:OutDir")
+
     Import-Index $script:IndexPath
     $haveIndex = (Test-Path -LiteralPath $script:IndexPath) -and ([bool]$script:Repos -or @(Get-IndexedRepos).Count -gt 0)
     if (-not $haveIndex) {
@@ -3714,18 +4390,26 @@ function Invoke-HeadlessAudit([hashtable]$O, [bool]$emitList = $false) {
             throw "Index build produced nothing to audit at $($script:IndexPath): $(Get-RepoScopeDiagnostic)"
         }
     }
-    Write-V 1 'Auditing the local index...'
+
+    Write-V 1 'Auditing from local index'
+    Write-V 2 "  index dir: $script:IndexPath"
+    Write-V 2 ("  settings: tier=1$(if ($emitList) { '+worklist' } else { '' }) cap=$script:AuditCap workers=$($script:AuditThrottle.MaxConcurrent) delay=$($script:AuditThrottle.MinIntervalMs)ms")
+    Write-V 2 "  output dir: $script:AuditDir"
     if (-not (Start-AuditIndex)) {
         Write-V 1 'No in-scope indexed repos to audit.'
     }
+
     $wl = ''
     if ($emitList) { $wl = Join-Path $script:AuditDir 'tier2-pending.csv'; Open-AuditTier2List $wl }
+
     if ($O.ContainsKey('Exclude')) { Set-AuditExcludes ([string]$O['Exclude']) }
+
     Invoke-AuditPumpToDone
     Update-AuditExcludedHeadless
     if ($emitList) { Close-AuditTier2List }
     return $wl
 }
+
 function Resolve-AuditSev([string]$tok) {
     switch ("$tok".Trim().ToLower()) {
         'critical'      { 'Critical' }      'crit' { 'Critical' }      'c' { 'Critical' }
@@ -3746,6 +4430,13 @@ function Resolve-AuditSevSet([string]$spec) {
     }
     return $set
 }
+function Write-DownloadStartHeader([string]$auditLog, [string]$settings, [string]$downloadDir) {
+    Write-V 1 'Starting downloads'
+    if ($auditLog) { Write-V 2 "  audit log: $auditLog" }
+    Write-V 2 "  settings: $settings"
+    Write-V 2 "  download dir: $downloadDir"
+}
+
 function Write-AuditDownloadBreakdown($cands) {
     $order = 'Critical','High','Medium','Low','Informational'
     $cnt = @{}; $bytes = @{}; $unk = @{}
@@ -3756,38 +4447,52 @@ function Write-AuditDownloadBreakdown($cands) {
         if ($f.Size -ge 0) { $bytes[$s] += [long]$f.Size } else { $unk[$s]++ }
     }
     Write-Host ''
-    Write-Host 'Download set (included, not yet downloaded):'
+    Write-AuditColor 'Pending downloads:' Gray
     $tc = 0; $tb = 0L; $tu = 0
     foreach ($s in $order) {
         if (-not $cnt.ContainsKey($s) -or $cnt[$s] -eq 0) { continue }
-        $u = if ($unk[$s] -gt 0) { " (+$($unk[$s]) unknown size)" } else { '' }
-        Write-Host ("  {0,-14} {1,7}   {2}{3}" -f $s, $cnt[$s], (Format-Size $bytes[$s]), $u)
+        Write-AuditColor ("  {0,-14} " -f $s) Gray -NoNewline
+        Write-AuditColor ("{0,7}" -f $cnt[$s]) (Get-AuditSevConsoleColor $s) -NoNewline
+        Write-AuditColor ("   {0}" -f (Format-Size $bytes[$s])) Gray -NoNewline
+        if ($unk[$s] -gt 0) { Write-AuditColor (" (+{0} unknown size)" -f $unk[$s]) DarkGray -NoNewline }
+        Write-Host ''
         $tc += $cnt[$s]; $tb += $bytes[$s]; $tu += $unk[$s]
     }
-    $u = if ($tu -gt 0) { " (+$tu unknown size)" } else { '' }
-    Write-Host ("  {0,-14} {1,7}   {2}{3}" -f 'Total', $tc, (Format-Size $tb), $u)
+    Write-AuditColor ("  {0,-14} " -f 'Total') Gray -NoNewline
+    Write-AuditColor ("{0,7}" -f $tc) White -NoNewline
+    Write-AuditColor ("   {0}" -f (Format-Size $tb)) Gray -NoNewline
+    if ($tu -gt 0) { Write-AuditColor (" (+{0} unknown size)" -f $tu) DarkGray -NoNewline }
+    Write-Host ''
 }
 function Complete-AuditOutput([string]$downloadSpec, [long]$maxBytes = 0) {
     $cands = @(Get-AuditIncludedCandidates)
     Write-AuditSummary
+
     $logPath = Join-Path $script:AuditDir 'audit-log.csv'
     $n = Build-AuditLogFromMatches $logPath
-    Write-V 1 "Consolidated $n finding(s) -> $logPath"
+    if ($script:AuditVerbosity -ge 1) { Write-AuditColor "Consolidated $n finding(s) -> $logPath" DarkGray }
+
     $spec = "$downloadSpec".Trim().ToLower()
     if (-not $spec) { return }
     if ($spec -eq 'count') { Write-AuditDownloadBreakdown (Select-WithinSize $cands $maxBytes); return }
+
     $sel = $cands
     if ($spec -ne 'all') {
         $set = Resolve-AuditSevSet $spec
         $sel = @($cands | Where-Object { $set.Contains([string]$_.Sev) })
     }
-    $sel = @(Select-WithinSize $sel $maxBytes)
+    $sel = @(Select-WithinSize $sel $maxBytes)   # drop files over the per-file size limit (if any)
+    if ($sel.Count -eq 0) { Write-AuditDownloadBreakdown $sel; Write-V 1 'No findings to download.'; return }
+    $dlSettings = "severity=$(if ($spec) { $spec } else { 'all' })" + $(if ($maxBytes -gt 0) { " max-size=$(Format-Size $maxBytes)" } else { '' })
+    Write-DownloadStartHeader $logPath $dlSettings $script:OutDir
     Write-AuditDownloadBreakdown $sel
-    if ($sel.Count -eq 0) { Write-V 1 'No findings to download.'; return }
+    Write-Host ''
+    if ($script:AuditVerbosity -ge 1) { Write-AuditColor ("Downloading {0} file{1}." -f $sel.Count, $(if ($sel.Count -ne 1) { 's' } else { '' })) }
     $res = Invoke-AuditDownloadSet $sel
     Write-V 1 (Get-DedupDoneLine $res)
     Write-V 1 ('Logged to ' + (Join-Path $script:OutDir 'download-log.csv'))
 }
+
 function Invoke-DownloadFromLog([string]$file, [string]$downloadSpec = '', [long]$maxBytes = 0) {
     if (-not (Test-Path -LiteralPath $file)) { throw "Audit-log file not found: $file" }
     $rows = @(Import-Csv -LiteralPath $file)
@@ -3801,6 +4506,7 @@ function Invoke-DownloadFromLog([string]$file, [string]$downloadSpec = '', [long
         }
     })
     if ($entries.Count -eq 0) { Write-V 1 "No rows in $file."; return }
+
     $spec = "$downloadSpec".Trim().ToLower()
     if ($spec -eq 'count') { Write-AuditDownloadBreakdown (Select-WithinSize $entries $maxBytes); return }
     $sel = $entries
@@ -3808,14 +4514,18 @@ function Invoke-DownloadFromLog([string]$file, [string]$downloadSpec = '', [long
         $set = Resolve-AuditSevSet $spec
         $sel = @($entries | Where-Object { $set.Contains([string]$_.Sev) })
     }
-    $sel = @(Select-WithinSize $sel $maxBytes)
+    $sel = @(Select-WithinSize $sel $maxBytes)   # drop rows over the per-file size limit (if any)
     if ($sel.Count -eq 0) { Write-V 1 "No rows in $file to download (after severity/size filters)."; return }
+    $dlSettings = "severity=$(if ($spec -and $spec -ne 'all') { $spec } else { 'all' })" + $(if ($maxBytes -gt 0) { " max-size=$(Format-Size $maxBytes)" } else { '' })
+    Write-DownloadStartHeader $file $dlSettings $script:OutDir
     Write-AuditDownloadBreakdown $sel
-    Write-V 1 "Downloading $($sel.Count) file(s) listed in $file ..."
+    Write-Host ''
+    if ($script:AuditVerbosity -ge 1) { Write-AuditColor ("Downloading {0} file{1}." -f $sel.Count, $(if ($sel.Count -ne 1) { 's' } else { '' })) }
     $res = Invoke-DedupDownload $sel
     Write-V 1 (Get-DedupDoneLine $res)
     Write-V 1 ('Logged to ' + (Join-Path $script:OutDir 'download-log.csv'))
 }
+
 function Initialize-AuditBaseConfig([hashtable]$O, [bool]$requireBaseUrl = $true) {
     if ($O.ContainsKey('Verbosity')) { $script:AuditVerbosity = [int]$O['Verbosity'] }
     if ($O.ContainsKey('BaseUrl'))   { $script:BaseUrl = ([string]$O['BaseUrl']).TrimEnd('/') }
@@ -3826,10 +4536,12 @@ function Initialize-AuditBaseConfig([hashtable]$O, [bool]$requireBaseUrl = $true
     if ($requireBaseUrl -and -not $script:BaseUrl) { throw 'A base URL is required (-u/--base-url).' }
     if ($script:BaseUrl) { $script:BaseUrl = $script:BaseUrl.TrimEnd('/') }
     Resolve-RunOutput $O
+    Set-AuditPreviewConfig $O
     if ($O.ContainsKey('Cap') -and [long]$O['Cap'] -gt 0)        { $script:AuditCap = [long]$O['Cap'] }
     if ($O.ContainsKey('Workers') -and [int]$O['Workers'] -gt 0) { $script:AuditThrottle.MaxConcurrent = [Math]::Max(1, [Math]::Min(10, [int]$O['Workers'])) }
     if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { $script:AuditThrottle.MinIntervalMs = [int]$O['DelayMs'] }
 }
+
 function Invoke-AuditCore {
     param(
         [string]$Repos, [string]$RepoTypes,
@@ -3837,15 +4549,19 @@ function Invoke-AuditCore {
         [string]$IndexPath, [long]$Cap, [int]$Workers, [int]$DelayMs,
         [string]$OutDir, [int]$Verbosity,
         [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic,
-        [string]$FromLog, [switch]$DeferTier2, [string]$Tier2Resume, [string]$MaxSize, [switch]$PopulateIndex
+        [string]$FromLog, [switch]$DeferTier2, [string]$Tier2Resume, [string]$MaxSize, [switch]$PopulateIndex,
+        [int]$PreviewCount, [int]$PreviewWindow, [switch]$NoColour
     )
     $O = $PSBoundParameters
+    $script:AuditColour = -not ($O.ContainsKey('NoColour') -and $O['NoColour'])
     $maxBytes = Convert-ToBytes $MaxSize
+
     if ($O.ContainsKey('FromLog') -and $O['FromLog']) {
         Initialize-AuditBaseConfig $O $true
         Invoke-DownloadFromLog ([string]$O['FromLog']) ([string]$Download) $maxBytes
         return
     }
+
     if ($O.ContainsKey('Tier2Resume') -and $O['Tier2Resume']) {
         Initialize-AuditBaseConfig $O $true
         $script:AuditEmitSkipped = $false
@@ -3859,8 +4575,10 @@ function Invoke-AuditCore {
         Complete-AuditOutput $Download $maxBytes
         return
     }
+
     if ($DeferTier2 -and $Tier2) { throw 'Use either -2/--tier2 (scan now) or --defer-tier2 (write the worklist and stop), not both.' }
     $doTier2 = -not $NoTier2
+
     if ($DeferTier2) {
         $wl = Invoke-HeadlessAudit $O $true
         Complete-AuditOutput ('') $maxBytes
@@ -3868,6 +4586,7 @@ function Invoke-AuditCore {
         Write-V 1 ("  resume Tier-2 later with:  audit --tier2-resume `"$wl`" -u $($script:BaseUrl)  (or just re-run with -2)")
         return
     }
+
     if ($doTier2) {
         Initialize-AuditBaseConfig $O $true
         $wlPath = Join-Path $script:AuditDir 'tier2-pending.csv'
@@ -3875,7 +4594,7 @@ function Invoke-AuditCore {
             $cur = Read-AuditT2Cursor $wlPath
             Write-V 1 "Found an existing Tier-2 worklist ($wlPath; $cur row(s) already done) - resuming. Delete it to force a fresh scan."
             $script:AuditEmitSkipped = $false
-            if (Start-AuditTier2List $wlPath) {
+            if (Start-AuditTier2List $wlPath) {   # fresh (no -KeepFindings); cursor honoured
                 if ($O.ContainsKey('Exclude')) { Set-AuditExcludes ([string]$O['Exclude']) }
                 Invoke-AuditPumpToDone
                 Update-AuditExcludedHeadless
@@ -3892,33 +4611,37 @@ function Invoke-AuditCore {
         Complete-AuditOutput $Download $maxBytes
         return
     }
+
     [void](Invoke-HeadlessAudit $O $false)
     Complete-AuditOutput $Download $maxBytes
 }
+
 function Invoke-ArcSearchPumpToDone {
     $lastTick = [DateTime]::MinValue
     while ($script:ArcSearchState -eq 'walking') {
         Invoke-ArcSearchPump
         if ($script:AuditVerbosity -ge 2 -and ([DateTime]::UtcNow - $lastTick).TotalSeconds -ge 1) {
             $walk = if (Test-ArcSearchWalkActive) { ' (walking)' } else { '' }
-            Write-Host ("  ...indexed $($script:ArcIndexedArchives.Count) archive(s), $($script:ArcSearchResults.Count) match(es)$walk")
+            Write-AuditColor ("  ...indexed $($script:ArcIndexedArchives.Count) archive(s), $($script:ArcSearchResults.Count) match(es)$walk") DarkGray
             if ($script:AuditVerbosity -ge 5) {
-                Write-Host ("    queue=$($script:ArcQueue.Count) jobs=$($script:ArcJobs.Count) indexed=$($script:ArcIndexedArchives.Count)")
+                Write-AuditColor ("    queue=$($script:ArcQueue.Count) jobs=$($script:ArcJobs.Count) indexed=$($script:ArcIndexedArchives.Count)") DarkGray
             }
             $lastTick = [DateTime]::UtcNow
         }
         Start-Sleep -Milliseconds 100
     }
 }
+
 function Invoke-SearchCore {
     param(
         [string]$Query, [string]$Repos, [string]$RepoTypes, [switch]$WalkArchives, [switch]$AllVersions,
         [string]$IndexPath, [switch]$NoIndex, [string]$Offline,
         [long]$Cap, [int]$Workers, [int]$DelayMs,
         [string]$OutDir, [int]$Verbosity,
-        [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic
+        [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic, [switch]$NoColour
     )
     $O = $PSBoundParameters
+    $script:AuditColour = -not ($O.ContainsKey('NoColour') -and $O['NoColour'])
     if ($O.ContainsKey('Verbosity')) { $script:AuditVerbosity = [int]$O['Verbosity'] }
     if ($O.ContainsKey('Offline')) { Set-OfflineMode ([string]$O['Offline']) }
     if ($O.ContainsKey('BaseUrl'))   { $script:BaseUrl = ([string]$O['BaseUrl']).TrimEnd('/') }
@@ -3930,6 +4653,7 @@ function Invoke-SearchCore {
     if (-not $script:BaseUrl) { throw 'A base URL is required (-u/--base-url).' }
     if (-not $Query)          { throw 'Specify a query: -q/--query <name>.' }
     Resolve-RunOutput $O
+
     $script:IndexEnabled = -not ($O.ContainsKey('NoIndex') -and $O['NoIndex'])
     if ($O.ContainsKey('IndexPath') -and $O['IndexPath']) { Set-IndexPath ([string]$O['IndexPath']) }
     Resolve-IndexPath
@@ -3937,10 +4661,12 @@ function Invoke-SearchCore {
     if ($O.ContainsKey('DelayMs') -and [int]$O['DelayMs'] -ge 0) { $script:ArcThrottle.MinIntervalMs = [int]$O['DelayMs'] }
     if ($O.ContainsKey('AllVersions')) { $script:ArcSkipVersions = -not [bool]$O['AllVersions'] }
     $walk = [bool]($O.ContainsKey('WalkArchives') -and $O['WalkArchives'])
+
     if ($script:IndexEnabled) {
         Import-Index $script:IndexPath
         Write-V 2 "  using index at $($script:IndexPath) (streamed on demand)"
     }
+
     Write-V 1 "Searching for '$Query'..."
     $res = Search-Artifacts $Query
     if ($res.Error) { throw "Search failed: $($res.Error)" }
@@ -3948,6 +4674,7 @@ function Invoke-SearchCore {
     Write-V 2 "  $($res.Total) result(s) from the REST quick-search"
     $localHits = @(Search-Index $Query)
     if ($localHits.Count -gt 0) { Write-V 2 "  $($localHits.Count) local index match(es)" }
+
     $arcMatches = @()
     if ($walk) {
         Write-V 1 ("Walking listable archives" + $(if ($script:IndexEnabled) { " (index: $script:IndexPath)" } else { ' (indexing off)' }) + '...')
@@ -3956,11 +4683,13 @@ function Invoke-SearchCore {
         $arcMatches = @(Receive-ArcSearchResults)
         Write-V 1 "  $($arcMatches.Count) archive-entry match(es) across $($script:ArcIndexedArchives.Count) archive(s)"
     }
+
     $all  = @($restItems)
     $seen = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($it in $all) { [void]$seen.Add([string]$it.Uri) }
     foreach ($it in (@($localHits) + @($arcMatches))) { if ($it -and $seen.Add([string]$it.Uri)) { $all += $it } }
     $all = @($all)
+
     $outFile = if ($O.ContainsKey('OutDir')) {
         if ([IO.Path]::GetExtension($script:OutDir)) { $script:OutDir } else { Join-Path $script:OutDir 'search-results.csv' }
     } else { Join-Path $script:OutDir 'search-results.csv' }
@@ -3969,6 +4698,7 @@ function Invoke-SearchCore {
     Write-V 1 "Wrote $($all.Count) result(s) to $outFile"
     if ($script:IndexEnabled) { Write-V 1 "Wrote $($script:IndexCount) new record(s) to the index this run ($($script:IndexPath))" }
 }
+
 function Invoke-Audit {
     if (@($args).Count -eq 0) { Show-AuditEngineUsage; return }
     try { $splat = ConvertFrom-AuditArgv @($args) }
@@ -3981,6 +4711,7 @@ function Invoke-Search {
     catch { Write-Host "Error: $($_.Exception.Message)`n"; Show-AuditEngineUsage; return }
     Invoke-SearchCore @splat
 }
+
 if (-not $env:ARTCA_NOMAIN) {
     if (@($args).Count -eq 0) {
         Show-AuditEngineUsage
