@@ -1,0 +1,24 @@
+# delete-tier2-unknown-size.txt  --  remove every row from a Tier-2 worklist (tier2-pending.csv)
+# whose SIZE column is -1 (unknown size). Paste into a console after setting $f below.
+#
+# The worklist columns are: repo,path,name,archive,size,modified,url  (every field quoted), so size
+# is the 5th field. Matching is done on the raw line, so untouched rows are written back byte-for-byte
+# (no-BOM UTF-8, LF) - no Excel-style reformatting, order preserved. The header survives (its 5th
+# field is the literal "size", not "-1").
+#
+# NOTE: since the audit content fetch now caps each read at the scan cap, unknown-size rows no longer
+# stall a run - so deleting them is only needed if you want to SKIP scanning unknown-size files.
+
+$f = '.\output\<host>\audit\tier2-pending.csv'    # <-- set this to your worklist
+
+$enc   = [System.Text.UTF8Encoding]::new($false)
+$lines = [System.IO.File]::ReadAllLines($f, $enc)
+$kept  = @($lines | Where-Object { ($_ -split '","')[4] -ne '-1' })
+[System.IO.File]::WriteAllText($f, ($kept -join "`n") + "`n", $enc)
+Write-Host "removed $($lines.Count - $kept.Count) row(s); $($kept.Count - 1) remain"
+
+# Deleting rows shifts positions, so a positional resume cursor (.progress) is no longer valid. Reset
+# it so the next resume re-scans from the top (safe - already-scanned matches are de-duped in the
+# per-repo <repo>-matches.csv). To delete AND keep the cursor (plus back up the removed rows), use the
+# Invoke-CSVPrune helper instead:  Invoke-CSVPrune --file $f --prune '","-1","'
+Remove-Item -LiteralPath "$f.progress" -ErrorAction SilentlyContinue
