@@ -2938,7 +2938,7 @@ $script:AuditWkScript = {
         $modified = ''
         if ($storageUri) {
             try {
-                $info = Invoke-RestMethod -Uri $storageUri -Headers $headers -ErrorAction Stop
+                $info = Invoke-RestMethod -Uri $storageUri -Headers $headers -TimeoutSec 60 -ErrorAction Stop
                 if ($size -lt 0 -and $info.PSObject.Properties['size']) { $size = [int64]$info.size }
                 if ($info.PSObject.Properties['lastModified'])           { $modified = "$($info.lastModified)" }
             } catch {
@@ -2954,7 +2954,7 @@ $script:AuditWkScript = {
             $cache[$key] = [PSCustomObject]@{ Ok=$true; Size=$size; Modified=$modified; Text=$null; TooBig=$true; Error='' }
             return
         }
-        $resp  = Invoke-WebRequest -Uri $downloadUrl -Headers $headers -UseBasicParsing -ErrorAction Stop
+        $resp  = Invoke-WebRequest -Uri $downloadUrl -Headers $headers -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
         $bytes = if ($resp.RawContentStream) { $resp.RawContentStream.ToArray() }
                  elseif ($resp.Content -is [byte[]]) { [byte[]]$resp.Content }
                  else { [Text.Encoding]::UTF8.GetBytes([string]$resp.Content) }
@@ -2976,7 +2976,7 @@ $script:AuditArcScript = {
     param($key, $uri, $body, $headers, $ua, $cache, $alert)
     try {
         $resp = Invoke-RestMethod -Uri $uri -Method Post -Body $body `
-                    -ContentType 'application/json' -Headers $headers -UserAgent $ua -ErrorAction Stop
+                    -ContentType 'application/json' -Headers $headers -UserAgent $ua -TimeoutSec 60 -ErrorAction Stop
         $data = if ($resp.PSObject.Properties['data'] -and $resp.data) { @(@($resp.data) | Where-Object { $null -ne $_ }) } else { @() }
         $cache[$key] = [PSCustomObject]@{ Ok=$true; Nodes=$data; Error='' }
     } catch {
