@@ -119,7 +119,7 @@ function Get-DownloadLogIndex {
     return $map
 }
 function Reset-DownloadLogIndex { $script:DownloadLogIndex = $null }
-function Get-DownloadedBytes([string]$url) {
+function Resolve-DownloadedFile([string]$url) {
     if (-not $url) { return $null }
     $idx = Get-DownloadLogIndex
     if (-not $idx.ContainsKey($url)) { return $null }
@@ -139,9 +139,13 @@ function Get-DownloadedBytes([string]$url) {
             }
         }
     } catch { return $null }
-    foreach ($p in $cands) {
-        if (Test-Path -LiteralPath $p) { try { return [System.IO.File]::ReadAllBytes($p) } catch { } }
-    }
+    foreach ($p in $cands) { if (Test-Path -LiteralPath $p) { return $p } }
+    return $null
+}
+
+function Get-DownloadedBytes([string]$url) {
+    $p = Resolve-DownloadedFile $url
+    if ($p) { try { return [System.IO.File]::ReadAllBytes($p) } catch { } }
     return $null
 }
 
@@ -218,6 +222,58 @@ function Get-FileBytes([string]$url) {
         return $null
     }
     finally { $ProgressPreference = $old }
+}
+
+$script:StreamMinBytes = 100MB
+function Set-StreamMinBytes([long]$n) { if ($n -gt 0) { $script:StreamMinBytes = $n } }
+
+function Save-UrlToFile([string]$url, [string]$dest, [string]$progressName = '', [long]$expectedSize = -1) {
+    if (Test-NetworkBlocked) {
+        $src = Resolve-DownloadedFile $url
+        if (-not $src) { $script:LastFetchError = 'offline: no previously-downloaded copy on disk'; return $false }
+        try { Copy-Item -LiteralPath $src -Destination $dest -Force -ErrorAction Stop; $script:LastFetchError = ''; return $true }
+        catch { $script:LastFetchError = "$($_.Exception.Message)"; return $false }
+    }
+    $resp = $null; $rs = $null; $fs = $null
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($url)
+        $req.Method = 'GET'
+        $req.Timeout = 100000           # ms to first response
+        $req.ReadWriteTimeout = 600000  # ms of stalled transfer before giving up
+        $req.AllowAutoRedirect = $true
+        foreach ($kv in (Get-AuthHeaders).GetEnumerator()) { $req.Headers[$kv.Key] = $kv.Value }
+        $resp  = $req.GetResponse()
+        $total = if ($expectedSize -ge 0) { $expectedSize } else { try { [long]$resp.ContentLength } catch { -1L } }
+        $rs    = $resp.GetResponseStream()
+        $fs    = [System.IO.File]::Create($dest)
+        $buf   = New-Object byte[] (1MB)
+        $copied = 0L; $start = [DateTime]::UtcNow; $lastTick = $start
+        while (($n = $rs.Read($buf, 0, $buf.Length)) -gt 0) {
+            $fs.Write($buf, 0, $n); $copied += $n
+            $now = [DateTime]::UtcNow
+            if (($now - $lastTick).TotalMilliseconds -ge 1500) {
+                $lastTick = $now
+                $secs = ($now - $start).TotalSeconds; if ($secs -le 0) { $secs = 0.001 }
+                $rate = [long]($copied / $secs)
+                $pct  = if ($total -gt 0) { '  ' + [int](100 * $copied / $total) + '%' } else { '' }
+                $of   = if ($total -ge 0) { ' / ' + (Format-Size $total) } else { '' }
+                $script:DownloadProgressData = $null
+                Report-DownloadProgress @("Downloading $progressName$pct", "$(Format-Size $copied)$of  @ $(Format-Size $rate)/s")
+            }
+        }
+        $fs.Close(); $fs = $null
+        $script:LastFetchError = ''
+        return $true
+    } catch {
+        $script:LastFetchError = try { Get-HttpErrorDetail $_ } catch { "$($_.Exception.Message)" }
+        if ($fs) { try { $fs.Close(); $fs = $null } catch { } }
+        try { if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue } } catch { }
+        return $false
+    } finally {
+        if ($rs)   { try { $rs.Dispose() }   catch { } }
+        if ($resp) { try { $resp.Dispose() } catch { } }
+        if ($fs)   { try { $fs.Dispose() }   catch { } }
+    }
 }
 
 $script:ArchiveExts = @('zip','jar','war','ear','aar','tar','gz','tgz','rar','7z',
@@ -506,6 +562,33 @@ function Resolve-DedupDestination([string]$dir, [string]$name, [string]$hash, [s
     return @{ Path = $tagPath; HashFileName = $tagName; Skip = (Test-DiskContentMatch $tagPath $bytes) }
 }
 
+function Test-DiskContentMatchHash([string]$path, [string]$hex) {
+    if (-not $hex) { return $false }
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    try { return ((Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash -ieq $hex) }
+    catch { return $false }
+}
+
+function Commit-StreamedFile([string]$dir, [string]$name, [string]$tmp, [string]$sha, [string]$hashForTag, [string]$urlKey) {
+    $plain = Join-Path $dir $name
+    if (Test-DiskContentMatchHash $plain $sha) {
+        try { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } catch { }
+        return @{ Path = $plain; HashFileName = ''; Skip = $true }
+    }
+    if (-not (Test-Path -LiteralPath $plain)) {
+        try { Move-Item -LiteralPath $tmp -Destination $plain -Force -ErrorAction Stop } catch { return $null }
+        return @{ Path = $plain; HashFileName = ''; Skip = $false }
+    }
+    $tagName = Add-NameTag $name (Get-DedupTag $hashForTag $urlKey)
+    $tagPath = Join-Path $dir $tagName
+    if (Test-DiskContentMatchHash $tagPath $sha) {
+        try { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } catch { }
+        return @{ Path = $tagPath; HashFileName = $tagName; Skip = $true }
+    }
+    try { Move-Item -LiteralPath $tmp -Destination $tagPath -Force -ErrorAction Stop } catch { return $null }
+    return @{ Path = $tagPath; HashFileName = $tagName; Skip = $false }
+}
+
 function Write-DedupEntry($e, [string]$hash, [string]$hashFileName = '') {
     $sz = if ($e.Size -ge 0) { [long]$e.Size } else { -1 }
     $mc = -1; if ($e.PSObject.Properties['MatchCount'] -and "$($e.MatchCount)" -match '^\d+$') { $mc = [int]$e.MatchCount }
@@ -565,10 +648,11 @@ function Invoke-DedupDownload($entries) {
             $mi++
             $h = [string]$e.KnownHash
             $b = $null; $ferr = ''
-            if (-not $h) { $b = Get-DedupBytes $e; if ($b) { $h = 'sha256:' + (Get-BytesSha256 $b) } else { $ferr = $script:LastFetchError } }
+            $big = ([long]$e.Size -ge $script:StreamMinBytes)
+            if (-not $h -and -not $big) { $b = Get-DedupBytes $e; if ($b) { $h = 'sha256:' + (Get-BytesSha256 $b) } else { $ferr = $script:LastFetchError } }
             $key = if ($h) { 'h:' + $h.ToLower() } else { 'fb:' + [string]$e.Url }
             if ($members.Count -gt 1) {
-                $tag = if ($h) { Get-DedupTag $h ([string]$e.Url) } else { 'fetch failed' }
+                $tag = if ($h) { Get-DedupTag $h ([string]$e.Url) } elseif ($big) { 'streaming' } else { 'fetch failed' }
                 $script:DownloadProgressData = @{ Kind='Hashing'; Index=$gi; Total=$nameGroups.Count
                     Name=[string]$e.Name; MemberIndex=$mi; MemberCount=$members.Count; Hash=$tag }
                 Report-DownloadProgress @("Hashing $gi / $($nameGroups.Count)", "$([string]$e.Name)  ($mi/$($members.Count))")
@@ -581,6 +665,45 @@ function Invoke-DedupDownload($entries) {
         }
         foreach ($c in $contents) {
             $primary = $c.Members[0]
+            $cSev = ''; $cRank = -1
+            foreach ($e in $c.Members) { $rk = Get-SevRank ([string]$e.Sev); if ($rk -gt $cRank) { $cRank = $rk; $cSev = [string]$e.Sev } }
+            $targetDir = Join-Path $script:OutDir (Get-SevFolder $cSev)
+
+            if (-not $c.Bytes -and [long]$primary.Size -ge $script:StreamMinBytes) {
+                try { if (-not (Test-Path -LiteralPath $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null } } catch { }
+                $tmp = Join-Path $targetDir ('.part.' + [Guid]::NewGuid().ToString('N') + '.' + [string]$primary.Name)
+                $okDl = Save-UrlToFile ([string]$primary.Url) $tmp ([string]$primary.Name) ([long]$primary.Size)
+                if (-not $okDl) {
+                    $failed += $c.Members.Count
+                    $err = if ($script:LastFetchError) { $script:LastFetchError } else { 'streamed download failed' }
+                    foreach ($e in $c.Members) {
+                        $script:DownloadProgressData = @{ Kind='Failed'; Name=[string]$e.Name; Url=[string]$e.Url; Error=$err }
+                        Report-DownloadProgress @("Download failed: $([string]$e.Name)", $err)
+                    }
+                    continue
+                }
+                $sha = ''; try { $sha = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() } catch { }
+                $hh  = if ($c.Hash) { $c.Hash } elseif ($sha) { 'sha256:' + $sha } else { '' }
+                $d   = Commit-StreamedFile $targetDir ([string]$primary.Name) $tmp $sha $hh ([string]$primary.Url)
+                if ($null -eq $d) {
+                    $failed += $c.Members.Count
+                    try { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } } catch { }
+                    foreach ($e in $c.Members) {
+                        $script:DownloadProgressData = @{ Kind='Failed'; Name=[string]$e.Name; Url=[string]$e.Url; Error='could not place downloaded file' }
+                        Report-DownloadProgress @("Download failed: $([string]$e.Name)", 'could not place downloaded file')
+                    }
+                    continue
+                }
+                if (-not $d.Skip) { $files++; if ($d.HashFileName) { $renamed++ } }
+                foreach ($e in $c.Members) {
+                    Write-DedupEntry $e $hh $d.HashFileName; $logged++
+                    if ($e.Size -ge 0) { $doneBytes += [long]$e.Size }
+                }
+                $cSize = if ($primary.Size -ge 0) { [long]$primary.Size } else { -1 }
+                [void]$savedFiles.Add(@{ Name=(Split-Path $d.Path -Leaf); Size=$cSize; Sev=$cSev })
+                continue
+            }
+
             $b = if ($c.Bytes) { $c.Bytes } elseif ($c.Err) { $null } else { Get-DedupBytes $primary }
             if ($null -eq $b) {
                 $failed += $c.Members.Count
@@ -592,9 +715,6 @@ function Invoke-DedupDownload($entries) {
                 continue
             }
             $hh = if ($c.Hash) { $c.Hash } else { 'sha256:' + (Get-BytesSha256 $b) }
-            $cSev = ''; $cRank = -1
-            foreach ($e in $c.Members) { $rk = Get-SevRank ([string]$e.Sev); if ($rk -gt $cRank) { $cRank = $rk; $cSev = [string]$e.Sev } }
-            $targetDir = Join-Path $script:OutDir (Get-SevFolder $cSev)
             try { if (-not (Test-Path -LiteralPath $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null } } catch { }
             $d  = Resolve-DedupDestination $targetDir ([string]$primary.Name) $hh ([string]$primary.Url) $b
             $ok = if ($d.Skip) { $true } else { Save-DedupFile $d.Path $b }
@@ -4269,6 +4389,7 @@ function ConvertFrom-AuditArgv([string[]]$tokens) {
             '^(-x|--exclude)$'       { $p.Exclude      = $tokens[++$i] }
             '^(-s|--from-log)$'      { $p.FromLog      = $tokens[++$i] }
             '^--max-size$'           { $p.MaxSize      = $tokens[++$i] }
+            '^--stream-min$'         { $p.StreamMin    = $tokens[++$i] }
             '^--preview-count$'      { $p.PreviewCount  = [int]$tokens[++$i] }
             '^--preview-window$'     { $p.PreviewWindow = [int]$tokens[++$i] }
             '^--no-?colou?r$'        { $p.NoColour      = $true }
@@ -4779,13 +4900,14 @@ function Invoke-AuditCore {
         [string]$IndexPath, [long]$Cap, [int]$Workers, [int]$DelayMs,
         [string]$OutDir, [int]$Verbosity,
         [string]$BaseUrl, [string]$ApiKey, [string]$Token, [string]$Basic,
-        [string]$FromLog, [switch]$DeferTier2, [string]$Tier2Resume, [string]$MaxSize, [switch]$PopulateIndex,
+        [string]$FromLog, [switch]$DeferTier2, [string]$Tier2Resume, [string]$MaxSize, [string]$StreamMin, [switch]$PopulateIndex,
         [switch]$ScanAll, [string]$SkipGlobs, [switch]$AllVersions,
         [int]$PreviewCount, [int]$PreviewWindow, [switch]$NoColour
     )
     $O = $PSBoundParameters
     $script:AuditColour = -not ($O.ContainsKey('NoColour') -and $O['NoColour'])
     $maxBytes = Convert-ToBytes $MaxSize
+    if ($O.ContainsKey('StreamMin') -and $StreamMin) { Set-StreamMinBytes (Convert-ToBytes $StreamMin) }
 
     if ($O.ContainsKey('FromLog') -and $O['FromLog']) {
         Initialize-AuditBaseConfig $O $true
