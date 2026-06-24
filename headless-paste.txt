@@ -199,15 +199,24 @@ function Test-ItemBrowsableArchive($item) {
     return (Get-IsArchive ([string]$item.Name))
 }
 
+$script:LastFetchError = ''
 function Get-FileBytes([string]$url) {
-    if (Test-NetworkBlocked) { return (Get-DownloadedBytes $url) }
+    if (Test-NetworkBlocked) {
+        $b = Get-DownloadedBytes $url
+        if ($null -eq $b) { $script:LastFetchError = 'offline: no previously-downloaded copy on disk' }
+        return $b
+    }
     $old = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
     try {
         $resp = Invoke-WebRequest -Uri $url -Headers (Get-AuthHeaders) -UseBasicParsing -ErrorAction Stop
+        $script:LastFetchError = ''
         if ($resp.RawContentStream) { return $resp.RawContentStream.ToArray() }
         if ($resp.Content -is [byte[]]) { return [byte[]]$resp.Content }
         return [Text.Encoding]::UTF8.GetBytes([string]$resp.Content)
-    } catch { return $null }
+    } catch {
+        $script:LastFetchError = try { Get-HttpErrorDetail $_ } catch { "$($_.Exception.Message)" }
+        return $null
+    }
     finally { $ProgressPreference = $old }
 }
 
@@ -555,24 +564,33 @@ function Invoke-DedupDownload($entries) {
         foreach ($e in $members) {
             $mi++
             $h = [string]$e.KnownHash
-            $b = $null
-            if (-not $h) { $b = Get-DedupBytes $e; if ($b) { $h = 'sha256:' + (Get-BytesSha256 $b) } }
+            $b = $null; $ferr = ''
+            if (-not $h) { $b = Get-DedupBytes $e; if ($b) { $h = 'sha256:' + (Get-BytesSha256 $b) } else { $ferr = $script:LastFetchError } }
             $key = if ($h) { 'h:' + $h.ToLower() } else { 'fb:' + [string]$e.Url }
             if ($members.Count -gt 1) {
+                $tag = if ($h) { Get-DedupTag $h ([string]$e.Url) } else { 'fetch failed' }
                 $script:DownloadProgressData = @{ Kind='Hashing'; Index=$gi; Total=$nameGroups.Count
-                    Name=[string]$e.Name; MemberIndex=$mi; MemberCount=$members.Count; Hash=(Get-DedupTag $h ([string]$e.Url)) }
+                    Name=[string]$e.Name; MemberIndex=$mi; MemberCount=$members.Count; Hash=$tag }
                 Report-DownloadProgress @("Hashing $gi / $($nameGroups.Count)", "$([string]$e.Name)  ($mi/$($members.Count))")
             }
             if ($byHash.ContainsKey($key)) { [void]$byHash[$key].Members.Add($e) }
             else {
-                $c = [PSCustomObject]@{ Hash = $h; Key = $key; Bytes = $b; Members = [Collections.Generic.List[object]]::new() }
+                $c = [PSCustomObject]@{ Hash = $h; Key = $key; Bytes = $b; Err = $ferr; Members = [Collections.Generic.List[object]]::new() }
                 [void]$c.Members.Add($e); $byHash[$key] = $c; [void]$contents.Add($c)
             }
         }
         foreach ($c in $contents) {
             $primary = $c.Members[0]
-            $b = if ($c.Bytes) { $c.Bytes } else { Get-DedupBytes $primary }
-            if ($null -eq $b) { $failed += $c.Members.Count; continue }
+            $b = if ($c.Bytes) { $c.Bytes } elseif ($c.Err) { $null } else { Get-DedupBytes $primary }
+            if ($null -eq $b) {
+                $failed += $c.Members.Count
+                $err = if ($c.Err) { $c.Err } elseif ($script:LastFetchError) { $script:LastFetchError } else { 'fetch returned no content' }
+                foreach ($e in $c.Members) {
+                    $script:DownloadProgressData = @{ Kind='Failed'; Name=[string]$e.Name; Url=[string]$e.Url; Error=$err }
+                    Report-DownloadProgress @("Download failed: $([string]$e.Name)", $err)
+                }
+                continue
+            }
             $hh = if ($c.Hash) { $c.Hash } else { 'sha256:' + (Get-BytesSha256 $b) }
             $cSev = ''; $cRank = -1
             foreach ($e in $c.Members) { $rk = Get-SevRank ([string]$e.Sev); if ($rk -gt $cRank) { $cRank = $rk; $cSev = [string]$e.Sev } }
@@ -4214,6 +4232,10 @@ $script:DownloadProgress = {
     }
     switch ($d.Kind) {
         'Hashing' { if ($script:AuditVerbosity -ge 5) { Write-AuditColor ("...comparing hashes for {0} ({1}/{2}) [{3}]" -f $d.Name, $d.MemberIndex, $d.MemberCount, $d.Hash) DarkGray } }
+        'Failed'  { if ($script:AuditVerbosity -ge 2) {
+                        Write-AuditColor ("...download FAILED: {0}  ({1})" -f $d.Name, $(if ($d.Error) { $d.Error } else { 'no content returned' })) Red
+                        if ($script:AuditVerbosity -ge 4 -and $d.Url) { Write-AuditColor ("     {0}" -f $d.Url) DarkGray }
+                    } }
         'Saved'   { Write-DownloadSavedLine $d }
         default   { Write-DownloadSavingLine $d }
     }
