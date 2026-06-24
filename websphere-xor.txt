@@ -1,0 +1,17 @@
+function Get-XorSum {
+    param([byte[]]$Val1, [byte[]]$Val2)
+    $out = New-Object byte[] ([Math]::Min($Val1.Length, $Val2.Length))
+    for ($i = 0; $i -lt $out.Length; $i++) {
+        $out[$i] = $Val1[$i] -bxor $Val2[$i]
+    }
+    return $out
+}
+
+function Invoke-WebSphereXOR {
+    param([string]$XorStr)
+    $XorStr = $XorStr -replace '\{xor\}', ''
+    $value1 = [Convert]::FromBase64String($XorStr)
+    $value2 = New-Object byte[] $value1.Length
+    for ($i = 0; $i -lt $value2.Length; $i++) { $value2[$i] = [byte][char]'_' }
+    return [Text.Encoding]::ASCII.GetString((Get-XorSum $value1 $value2))
+}
