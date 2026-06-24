@@ -111,7 +111,7 @@ function Get-DownloadLogIndex {
         if (Test-Path -LiteralPath $csv) {
             foreach ($row in (Import-Csv -LiteralPath $csv)) {
                 $u = "$($row.DownloadUrl)"
-                if ($u -and $row.Timestamp) { $map[$u] = @{ FileName = "$($row.FileName)"; Hash = "$($row.Hash)"; HashFileName = "$($row.HashFileName)" } }
+                if ($u -and $row.Timestamp) { $map[$u] = @{ FileName = "$($row.FileName)"; Hash = "$($row.Hash)"; HashFileName = "$($row.HashFileName)"; Severity = "$($row.Severity)" } }
             }
         }
     } catch { }   # missing/locked/headless-no-OutDir: just yields an empty map (nothing on disk)
@@ -126,10 +126,17 @@ function Get-DownloadedBytes([string]$url) {
     $rec = $idx[$url]
     $cands = [Collections.Generic.List[string]]::new()
     try {
-        if ($rec.HashFileName) { $cands.Add((Join-Path $script:OutDir $rec.HashFileName)) }
-        if ($rec.FileName) {
-            $cands.Add((Join-Path $script:OutDir $rec.FileName))
-            if ($rec.Hash) { $cands.Add((Join-Path $script:OutDir (Add-NameTag $rec.FileName (Get-DedupTag $rec.Hash $url)))) }
+        $bases = [Collections.Generic.List[string]]::new()
+        [void]$bases.Add((Join-Path $script:OutDir (Get-SevFolder $rec.Severity)))
+        foreach ($sf in $script:SevFolders) { [void]$bases.Add((Join-Path $script:OutDir $sf)) }
+        [void]$bases.Add($script:OutDir)
+        $tag = if ($rec.Hash) { Add-NameTag $rec.FileName (Get-DedupTag $rec.Hash $url) } else { '' }
+        foreach ($base in $bases) {
+            if ($rec.HashFileName) { $cands.Add((Join-Path $base $rec.HashFileName)) }
+            if ($rec.FileName) {
+                $cands.Add((Join-Path $base $rec.FileName))
+                if ($tag) { $cands.Add((Join-Path $base $tag)) }
+            }
         }
     } catch { return $null }
     foreach ($p in $cands) {
@@ -475,6 +482,21 @@ function Save-DedupFile([string]$dest, [byte[]]$bytes) {
     try { [System.IO.File]::WriteAllBytes($dest, $bytes); return $true } catch { return $false }
 }
 
+function Test-DiskContentMatch([string]$path, [byte[]]$bytes) {
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    try { return ((Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash -ieq (Get-BytesSha256 $bytes)) }
+    catch { return $false }
+}
+
+function Resolve-DedupDestination([string]$dir, [string]$name, [string]$hash, [string]$urlKey, [byte[]]$bytes) {
+    $plain = Join-Path $dir $name
+    if (-not (Test-Path -LiteralPath $plain)) { return @{ Path = $plain; HashFileName = ''; Skip = $false } }
+    if (Test-DiskContentMatch $plain $bytes)  { return @{ Path = $plain; HashFileName = ''; Skip = $true } }
+    $tagName = Add-NameTag $name (Get-DedupTag $hash $urlKey)
+    $tagPath = Join-Path $dir $tagName
+    return @{ Path = $tagPath; HashFileName = $tagName; Skip = (Test-DiskContentMatch $tagPath $bytes) }
+}
+
 function Write-DedupEntry($e, [string]$hash, [string]$hashFileName = '') {
     $sz = if ($e.Size -ge 0) { [long]$e.Size } else { -1 }
     $mc = -1; if ($e.PSObject.Properties['MatchCount'] -and "$($e.MatchCount)" -match '^\d+$') { $mc = [int]$e.MatchCount }
@@ -487,6 +509,18 @@ function Write-DedupEntry($e, [string]$hash, [string]$hashFileName = '') {
 
 function Get-SevRank([string]$sev) {
     switch ("$sev".ToLower()) { 'critical' { 5 } 'high' { 4 } 'medium' { 3 } 'low' { 2 } 'informational' { 1 } default { 0 } }
+}
+
+$script:SevFolders = @('critical','high','medium','low','informational','unclassified')
+function Get-SevFolder([string]$sev) {
+    switch ("$sev".ToLower()) {
+        'critical'      { 'critical' }
+        'high'          { 'high' }
+        'medium'        { 'medium' }
+        'low'           { 'low' }
+        'informational' { 'informational' }
+        default         { 'unclassified' }
+    }
 }
 
 function Invoke-DedupDownload($entries) {
@@ -515,53 +549,45 @@ function Invoke-DedupDownload($entries) {
         Report-DownloadProgress @("Saving $gi / $($nameGroups.Count)", $grpName)
         $savedFiles = [Collections.Generic.List[object]]::new()   # {Name;Size;Sev} per DISTINCT file written
 
-        if ($members.Count -eq 1) {
-            $e = $members[0]
-            $b = Get-DedupBytes $e
-            if ($null -eq $b) { $failed++; continue }
-            $h = if ("$($e.KnownHash)") { [string]$e.KnownHash } else { 'sha256:' + (Get-BytesSha256 $b) }
-            if (Save-DedupFile (Join-Path $script:OutDir ([string]$e.Name)) $b) {
-                Write-DedupEntry $e $h; $files++; $logged++; if ($e.Size -ge 0) { $doneBytes += [long]$e.Size }
-                $sz = if ($e.Size -ge 0) { [long]$e.Size } elseif ($b) { [long]$b.Length } else { -1 }
-                [void]$savedFiles.Add(@{ Name=[string]$e.Name; Size=$sz; Sev=[string]$e.Sev })
-            } else { $failed++ }
-        } else {
-            $contents = [Collections.Generic.List[object]]::new()
-            $byHash   = @{}
-            $mi = 0
-            foreach ($e in $members) {
-                $mi++
-                $h = [string]$e.KnownHash
-                $b = $null
-                if (-not $h) { $b = Get-DedupBytes $e; if ($b) { $h = 'sha256:' + (Get-BytesSha256 $b) } }
-                $key = if ($h) { 'h:' + $h.ToLower() } else { 'fb:' + [string]$e.Url }
+        $contents = [Collections.Generic.List[object]]::new()
+        $byHash   = @{}
+        $mi = 0
+        foreach ($e in $members) {
+            $mi++
+            $h = [string]$e.KnownHash
+            $b = $null
+            if (-not $h) { $b = Get-DedupBytes $e; if ($b) { $h = 'sha256:' + (Get-BytesSha256 $b) } }
+            $key = if ($h) { 'h:' + $h.ToLower() } else { 'fb:' + [string]$e.Url }
+            if ($members.Count -gt 1) {
                 $script:DownloadProgressData = @{ Kind='Hashing'; Index=$gi; Total=$nameGroups.Count
                     Name=[string]$e.Name; MemberIndex=$mi; MemberCount=$members.Count; Hash=(Get-DedupTag $h ([string]$e.Url)) }
                 Report-DownloadProgress @("Hashing $gi / $($nameGroups.Count)", "$([string]$e.Name)  ($mi/$($members.Count))")
-                if ($byHash.ContainsKey($key)) { [void]$byHash[$key].Members.Add($e) }
-                else {
-                    $c = [PSCustomObject]@{ Hash = $h; Key = $key; Bytes = $b; Members = [Collections.Generic.List[object]]::new() }
-                    [void]$c.Members.Add($e); $byHash[$key] = $c; [void]$contents.Add($c)
-                }
             }
-            $tagged = ($contents.Count -gt 1)   # >1 distinct content under one name -> disambiguate
-            foreach ($c in $contents) {
-                $primary  = $c.Members[0]
-                $destName = if ($tagged) { Add-NameTag ([string]$primary.Name) (Get-DedupTag $c.Hash $c.Key) } else { [string]$primary.Name }
-                $b = if ($c.Bytes) { $c.Bytes } else { Get-DedupBytes $primary }
-                if ($null -eq $b) { $failed += $c.Members.Count; continue }
-                if (Save-DedupFile (Join-Path $script:OutDir $destName) $b) {
-                    $files++; if ($tagged) { $renamed++ }
-                    $cSev = ''; $cRank = -1
-                    $hfn = if ($tagged) { $destName } else { '' }   # the on-disk name only when collision-tagged
-                    foreach ($e in $c.Members) {
-                        Write-DedupEntry $e $c.Hash $hfn; $logged++; if ($e.Size -ge 0) { $doneBytes += [long]$e.Size }
-                        $rk = Get-SevRank ([string]$e.Sev); if ($rk -gt $cRank) { $cRank = $rk; $cSev = [string]$e.Sev }
-                    }
-                    $cSize = if ($b) { [long]$b.Length } elseif ($primary.Size -ge 0) { [long]$primary.Size } else { -1 }
-                    [void]$savedFiles.Add(@{ Name=$destName; Size=$cSize; Sev=$cSev })
-                } else { $failed += $c.Members.Count }
+            if ($byHash.ContainsKey($key)) { [void]$byHash[$key].Members.Add($e) }
+            else {
+                $c = [PSCustomObject]@{ Hash = $h; Key = $key; Bytes = $b; Members = [Collections.Generic.List[object]]::new() }
+                [void]$c.Members.Add($e); $byHash[$key] = $c; [void]$contents.Add($c)
             }
+        }
+        foreach ($c in $contents) {
+            $primary = $c.Members[0]
+            $b = if ($c.Bytes) { $c.Bytes } else { Get-DedupBytes $primary }
+            if ($null -eq $b) { $failed += $c.Members.Count; continue }
+            $hh = if ($c.Hash) { $c.Hash } else { 'sha256:' + (Get-BytesSha256 $b) }
+            $cSev = ''; $cRank = -1
+            foreach ($e in $c.Members) { $rk = Get-SevRank ([string]$e.Sev); if ($rk -gt $cRank) { $cRank = $rk; $cSev = [string]$e.Sev } }
+            $targetDir = Join-Path $script:OutDir (Get-SevFolder $cSev)
+            try { if (-not (Test-Path -LiteralPath $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null } } catch { }
+            $d  = Resolve-DedupDestination $targetDir ([string]$primary.Name) $hh ([string]$primary.Url) $b
+            $ok = if ($d.Skip) { $true } else { Save-DedupFile $d.Path $b }
+            if (-not $ok) { $failed += $c.Members.Count; continue }
+            if (-not $d.Skip) { $files++; if ($d.HashFileName) { $renamed++ } }
+            foreach ($e in $c.Members) {
+                Write-DedupEntry $e $hh $d.HashFileName; $logged++
+                if ($e.Size -ge 0) { $doneBytes += [long]$e.Size }
+            }
+            $cSize = if ($b) { [long]$b.Length } elseif ($primary.Size -ge 0) { [long]$primary.Size } else { -1 }
+            [void]$savedFiles.Add(@{ Name=(Split-Path $d.Path -Leaf); Size=$cSize; Sev=$cSev })
         }
         if ($savedFiles.Count -gt 0) {
             $script:DownloadProgressData = @{ Kind='Saved'; BaseName=$grpName; Files=@($savedFiles.ToArray()) }
